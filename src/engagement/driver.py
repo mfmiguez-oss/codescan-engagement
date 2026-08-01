@@ -142,6 +142,29 @@ def _agent_id(prefix: str, item_id: str) -> str:
     return f"{prefix}-{item_id}-{uuid.uuid4().hex[:12]}"
 
 
+def _declared_needs_context(answer: str) -> ScenarioOutcome | None:
+    """Read a ``needs_context`` conclusion out of an answer the recorder refused.
+
+    Deliberately narrow. It reads only two fields — the declared status and the
+    model's own account of what it lacked — and returns ``None`` for anything
+    else, so a genuinely malformed answer still fails and still retries. The
+    driver is not overriding the recorder's judgement that this is not a valid
+    *result*; it is recognising that "I need more context" is a conclusion the
+    recorder has no shape for, and acting on it.
+    """
+    try:
+        data = unwrap_json(answer)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("status") != "needs_context":
+        return None
+    missing = data.get("missing_context")
+    return ScenarioOutcome(
+        status="needs_context",
+        missing_context=[str(item) for item in missing] if isinstance(missing, list) else [],
+    )
+
+
 def _unfence(answer: str) -> str:
     """Strip a markdown code fence, leaving the JSON a recorder can parse.
 
@@ -275,6 +298,20 @@ class Driver:
             except BudgetExceeded:
                 raise
             except WorkspaceError as exc:
+                # A rejected answer is usually malformed — but not always. A
+                # model that has been shown no source correctly answers
+                # `needs_context` with nothing reviewed, and the result schema
+                # rejects that because it requires non-empty evidence. Retrying
+                # cannot help (the prompt is unchanged) and failing the scenario
+                # discards the model's own statement of what it lacked, which is
+                # the only useful input to an expansion. So a declared
+                # needs_context is routed to the expansion it is asking for.
+                #
+                # Found by a live DSVW run: every scenario reached `failed`
+                # while the model was saying, correctly, that it needed files.
+                declared = _declared_needs_context(answer)
+                if declared is not None:
+                    return self._expand_or_park(ref, scenario, prompt, declared)
                 last = str(exc)
                 continue
             if outcome.status in CONCLUDED_STATUSES:

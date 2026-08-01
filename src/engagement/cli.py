@@ -31,6 +31,8 @@ from .lifecycle import LifecycleError, LifecycleReport, assess, load_feed
 from .models import SingleVendorError, Task, build_plan, check_two_vendor_passes, render_plan
 from .providers import ProviderError, build_provider
 from .report import write as write_report
+from .secrets import SecretError, SecretResolver, resolve_optional
+from .secrets import build_plan as build_secret_plan
 from .siem import FORMATS, summarize
 from .siem import export as siem_export
 from .signals import apply_chaining, apply_exposure, load_boundaries
@@ -191,6 +193,11 @@ def _build_parser() -> argparse.ArgumentParser:
     kev.add_argument("--url", default=CISA_KEV_URL)
     kev.set_defaults(func=_cmd_fetch_kev)
 
+    secrets = sub.add_parser(
+        "secrets", help="Show where each secret comes from, without reading any."
+    )
+    secrets.set_defaults(func=_cmd_secrets)
+
     plan = sub.add_parser("plan", help="Show the model allocation and projected spend.")
     plan.add_argument("--model", default="", help="Deployment for every task.")
     plan.add_argument("--router-model", default="")
@@ -221,6 +228,25 @@ def _cmd_fetch_kev(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     age = catalogue.age_days()
     if age is not None:
         print(f"  age       : {age} day(s)")
+    return EXIT_OK
+
+
+def _cmd_secrets(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """Print the resolution plan. Reads no secret and prints no value."""
+    del args
+    plan = build_secret_plan(env)
+    for line in plan.describe():
+        print(f"  {line}")
+    hosts = plan.vault_hosts
+    print(f"  egress    : {', '.join(hosts) if hosts else 'no vault configured'}")
+    if hosts:
+        allowed = build_policy(env).allowed
+        missing = [h for h in hosts if h not in allowed]
+        print(
+            "  allowlist : ok"
+            if not missing
+            else f"  allowlist : MISSING {', '.join(missing)} — the fetch would be refused"
+        )
     return EXIT_OK
 
 
@@ -298,9 +324,19 @@ def _bound(flag: int | None, env: Mapping[str, str], name: str, default: int) ->
 
 
 def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    # Order matters: the allowlist is built first (it already contains the
+    # vault host, derived from the same configuration), then the secret is
+    # fetched through it, then the provider is built with the resolved key.
     egress = build_policy(env)
+    secret_plan = build_secret_plan(env)
+    resolver = SecretResolver(env)
     try:
-        provider = build_provider(env, egress=egress)
+        api_key = resolve_optional(resolver, secret_plan.refs[0])
+    except SecretError as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        provider = build_provider(env, egress=egress, api_key=api_key or None)
     except ProviderError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -665,9 +701,38 @@ def _print_report(report: RunReport) -> None:
         print(f"  redacted  : {report.redactions} credential-shaped value(s)")
 
 
+def load_dotenv(path: Path, env: Mapping[str, str]) -> dict[str, str]:
+    """Merge a `.env` beside the invocation *under* the real environment.
+
+    **A real environment variable always wins.** An operator who exported a
+    value meant it, and a file that silently overrode it would make the actual
+    configuration of a run unknowable from the outside — the same failure this
+    package refuses a run over when two providers are configured.
+
+    Parsed here rather than with a dependency: the format needed is `KEY=value`
+    with `#` comments, and a short reader is less surface than a package. A
+    malformed line is skipped rather than fatal — a `.env` is an operator
+    convenience, and refusing to start over a stray line would be worse than
+    ignoring it. Nothing read here is ever printed: `engagement secrets` shows
+    where a value comes from, never what it is.
+    """
+    merged = dict(env)
+    if not path.exists():
+        return merged
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key and key not in env:
+            merged[key] = value.strip().strip("\"'")
+    return merged
+
+
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    resolved = env if env is not None else os.environ
+    resolved = env if env is not None else load_dotenv(Path(".env"), os.environ)
     result = args.func(args, resolved)
     return int(result)
 

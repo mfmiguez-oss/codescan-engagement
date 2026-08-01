@@ -15,6 +15,10 @@ dependencies = ["pydantic>=2"]
 foundry = ["httpx>=0.27"]
 bedrock = ["boto3>=1.34"]
 postgres = ["psycopg[binary]>=3.1"]
+# Secrets from Azure Key Vault via managed identity, so a deployment need
+# not hold an API key on disk. Both are on PyPI: the no-private-dependency
+# rule still holds.
+keyvault = ["azure-identity>=1.17", "azure-keyvault-secrets>=4.8"]
 # The deterministic triage backbone is `engagement.backbone`, ported into this
 # package rather than resolved from a private git reference. There is no
 # `triage` extra any more: scoring, lifecycle, chains, PoC drafts and the
@@ -46,7 +50,10 @@ plugins = ["pydantic.mypy"]
 # Provider and storage clients are lazily-imported optional extras; the offline
 # environment deliberately does not install them.
 [[tool.mypy.overrides]]
-module = ["httpx", "boto3", "psycopg", "triagekit.*", "jwt", "jwt.*", "starlette.*"]
+module = [
+  "httpx", "boto3", "psycopg", "triagekit.*", "jwt", "jwt.*", "starlette.*",
+  "azure.*", "azure.identity", "azure.keyvault.secrets",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

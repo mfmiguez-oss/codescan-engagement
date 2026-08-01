@@ -363,7 +363,9 @@ def configured_providers(env: Mapping[str, str]) -> list[str]:
 
 
 def build_provider(
-    env: Mapping[str, str], egress: EgressPolicy | None = None
+    env: Mapping[str, str],
+    egress: EgressPolicy | None = None,
+    api_key: str | None = None,
 ) -> ModelProvider:
     """Build the configured provider, refusing to guess between two.
 
@@ -389,11 +391,16 @@ def build_provider(
         name = found[0]
 
     if name == "foundry":
-        resource, key = env.get("FOUNDRY_RESOURCE"), env.get("FOUNDRY_API_KEY")
+        # `api_key` is whatever the secret resolver produced — a vault value
+        # when one is configured, the environment otherwise. Providers stay
+        # ignorant of where a secret came from.
+        resource = env.get("FOUNDRY_RESOURCE")
+        key = api_key or env.get("FOUNDRY_API_KEY")
         if not resource or not key:
             raise ProviderError(
-                "ENGAGEMENT_PROVIDER=foundry but FOUNDRY_RESOURCE / FOUNDRY_API_KEY "
-                "are not both set."
+                "ENGAGEMENT_PROVIDER=foundry but FOUNDRY_RESOURCE is unset or no "
+                "API key could be resolved (from ENGAGEMENT_KEY_VAULT or the "
+                "environment)."
             )
         return FoundryProvider(
             resource=resource,

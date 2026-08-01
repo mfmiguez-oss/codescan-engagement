@@ -78,6 +78,10 @@ test that exists.
 | R56 | Two passes share one context and are presented as independent reviews | separate runs; agent-id uniqueness enforced across passes, not only within one | mitigated | test_agent_ids_stay_unique_across_passes |
 | R57 | A second pass silently reuses the first pass's model | the second run's policy overrides the expert deployment | mitigated | test_the_second_pass_uses_the_second_vendors_model |
 | R58 | A second pass reviews a different checkout, so corroboration compares two things | the sibling run is created from the first run's own `run-config.yaml` | mitigated | test_a_second_pass_that_cannot_be_created_is_reported |
+| R59 | An API key sits in plaintext on disk, readable by anything running as that user | secrets resolved by name from Key Vault via managed identity | mitigated | test_a_configured_vault_is_read_instead_of_the_environment |
+| R60 | A vault silently falls back to a stale environment value, so rotation does nothing | a configured vault that fails is an error, never a fallback | mitigated | test_a_configured_vault_never_falls_back_to_the_environment |
+| R61 | A secret value reaches a log, an error message or an artifact | failures name the vault and the secret name only; the plan prints no values | mitigated | test_a_failure_names_the_coordinates_and_never_the_value |
+| R62 | The vault fetch is refused by this package's own egress allowlist | the vault host is derived from the same configuration that names the vault | mitigated | test_the_vault_host_is_on_the_egress_allowlist |
 
 ## What is deliberately out of scope
 

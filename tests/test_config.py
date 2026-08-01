@@ -43,3 +43,32 @@ def test_a_ceiling_below_one_is_refused() -> None:
 def test_an_empty_value_falls_back_rather_than_failing() -> None:
     """An unset variable often arrives as an empty string from a template."""
     assert _bound(None, {NAME: "  "}, NAME, DEFAULT) == DEFAULT
+
+
+def test_a_dotenv_supplies_configuration_when_the_environment_does_not(tmp_path):
+    from engagement.cli import load_dotenv
+
+    path = tmp_path / ".env"
+    path.write_text('# comment\nFOUNDRY_RESOURCE="acme"\nMAX=5\n\nbroken line\n', encoding="utf-8")
+    merged = load_dotenv(path, {})
+
+    assert merged["FOUNDRY_RESOURCE"] == "acme"
+    assert merged["MAX"] == "5"
+    assert "broken line" not in merged
+
+
+def test_a_real_environment_variable_always_beats_the_file(tmp_path):
+    """An operator who exported a value meant it. A file that silently
+    overrode it would make a run's actual configuration unknowable."""
+    from engagement.cli import load_dotenv
+
+    path = tmp_path / ".env"
+    path.write_text("FOUNDRY_RESOURCE=from-file\n", encoding="utf-8")
+
+    assert load_dotenv(path, {"FOUNDRY_RESOURCE": "from-env"})["FOUNDRY_RESOURCE"] == "from-env"
+
+
+def test_a_missing_dotenv_is_not_an_error(tmp_path):
+    from engagement.cli import load_dotenv
+
+    assert load_dotenv(tmp_path / "absent", {"A": "1"}) == {"A": "1"}

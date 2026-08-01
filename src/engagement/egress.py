@@ -116,6 +116,13 @@ def build_policy(env: Mapping[str, str]) -> EgressPolicy:
     if endpoint:
         policy.allowed.add(host_of(endpoint))
 
+    vault = (env.get("ENGAGEMENT_KEY_VAULT") or "").strip()
+    if vault:
+        # Reached before any model call, to fetch the key that authenticates
+        # them. Configuration-derived like every other entry.
+        policy.allowed.add(f"{vault}.vault.azure.net")
+        policy.allowed.add("login.microsoftonline.com")  # managed-identity token
+
     snyk = (env.get("SNYK_API_URL") or "").strip()
     policy.allowed.add(host_of(snyk) if snyk else "api.snyk.io")
 

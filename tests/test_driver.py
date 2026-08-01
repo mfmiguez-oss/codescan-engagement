@@ -186,3 +186,49 @@ def test_a_truncated_router_answer_names_the_likely_cause() -> None:
 
     with pytest.raises(WorkspaceError, match="may have been truncated"):
         _unfence('```json\n{"scenarios": [{"id": "S001"')
+
+
+def test_a_declared_needs_context_reaches_expansion_even_if_the_recorder_refuses() -> None:
+    """A live DSVW run failed every scenario here. The model correctly answered
+    `needs_context` with nothing reviewed — it had been shown no source — and the
+    result schema rejects that because it demands non-empty evidence. Retrying
+    cannot help and failing discards the model's own statement of what it lacked,
+    which is the only useful input to an expansion."""
+    from engagement.driver import _declared_needs_context
+
+    declared = _declared_needs_context(
+        '{"status": "needs_context", "missing_context": ["need src/app.py"]}'
+    )
+
+    assert declared is not None
+    assert declared.missing_context == ["need src/app.py"]
+
+
+def test_a_genuinely_malformed_answer_still_fails_rather_than_expanding() -> None:
+    """The narrowness is the point: only a *declared* needs_context is rescued."""
+    from engagement.driver import _declared_needs_context
+
+    assert _declared_needs_context("not json at all") is None
+    assert _declared_needs_context('{"status": "verified"}') is None
+    assert _declared_needs_context('["a", "list"]') is None
+
+
+def test_a_refused_needs_context_scenario_parks_instead_of_failing() -> None:
+    from engagement.budget import Ledger
+    from engagement.contracts import Disposition
+    from engagement.driver import Driver, Policy
+    from engagement.providers import FakeProvider
+
+    answer = '{"status": "needs_context", "missing_context": ["need dsvw.py"]}'
+    workspace = FakeWorkspace(scenarios=scenarios(("S001", Priority.normal)))
+    workspace.reject = {"S001"}  # the recorder refuses it, as the real one does
+    driver = Driver(
+        workspace=workspace,
+        provider=FakeProvider(answers=[answer] * 6),
+        ledger=Ledger(),
+        policy=Policy(model="m", expand_context=False),
+    )
+    report = driver.run(RunRef(target="acme", run_id="run-001"))
+
+    assert [item.disposition for item in report.scenarios] == [Disposition.parked]
+    assert report.parked[0].missing_context == ["need dsvw.py"]

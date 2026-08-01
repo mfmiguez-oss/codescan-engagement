@@ -206,6 +206,21 @@ MUTATIONS: list[Mutation] = [
         "tests/test_signals.py::test_the_chaining_adjustment_is_capped",
     ),
     (
+        # A vault that silently falls back to the environment means rotating
+        # the secret changes nothing, and nothing about it looks wrong.
+        "secrets.py",
+        "        value = self._from_vault(ref) if ref.uses_vault "
+        'else self._env.get(ref.env_var, "")',
+        '        value = self._env.get(ref.env_var, "")',
+        "tests/test_secrets.py::test_a_configured_vault_never_falls_back_to_the_environment",
+    ),
+    (
+        "egress.py",
+        '    vault = (env.get("ENGAGEMENT_KEY_VAULT") or "").strip()\n    if vault:',
+        '    vault = (env.get("ENGAGEMENT_KEY_VAULT") or "").strip()\n    if False:',
+        "tests/test_secrets.py::test_the_vault_host_is_on_the_egress_allowlist",
+    ),
+    (
         # The network boundary. An allowlist that fails open is not one.
         "egress.py",
         "        if self.enforce:\n            raise EgressBlocked(message)",

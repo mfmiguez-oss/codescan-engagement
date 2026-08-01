@@ -293,6 +293,37 @@ recoverable. A path with no boundary is *not* penalised — recon only sees
 boundaries it recognised, so absence is weak evidence, not proof of
 unreachability.
 
+## Secrets, without a key on disk
+
+```bash
+pip install -e ".[keyvault]"
+export ENGAGEMENT_KEY_VAULT=acme-kv        # vault name, not a URL
+engagement secrets                          # shows the plan; reads nothing
+```
+
+Secrets resolve **by name** — from Azure Key Vault via managed identity when a
+vault is configured, and from the environment when one is not. Configure
+nothing and behaviour is exactly as before, so local development is unchanged.
+Secret names default to the environment variable lowercased with hyphens
+(`FOUNDRY_API_KEY` → `foundry-api-key`), which is Key Vault's own naming rule,
+so the common case needs no extra configuration.
+
+Three rules make the indirection worth having:
+
+- **Configured means required.** A configured vault that fails is an error, never
+  a quiet fall back to the environment. A deployment that believes it reads from
+  a vault while actually reading a stale `.env` has the ceremony of a secret
+  store and none of the rotation — and nothing about it looks wrong.
+- **The value is never logged, returned in an error, or written to an artifact.**
+  Failures name the vault and the secret's *name*, never its content.
+- **Fetched once per run**, then cached in memory and never persisted. A vault
+  call per dispatch is a rate limit waiting to happen.
+
+`engagement secrets` prints where each secret would come from and checks the
+vault host is on the egress allowlist — the fetch happens *before* any model
+call and would otherwise be refused by this package's own network boundary. The
+host is added from the same configuration that names the vault.
+
 ## Determinism
 
 `temperature` defaults to `0.0` — a queue that changes between identical runs
