@@ -95,11 +95,20 @@ class Policy(StrictModel):
     max_retries: int = 1
     #: Emit SARIF at the end of a run.
     emit_sarif: bool = True
+    #: Deployment for a second, independent detection pass. Must be a different
+    #: vendor from ``expert_model``: two models from one vendor share training
+    #: data and refusal behaviour, so they miss the same things, and the
+    #: corroboration count would read as evidence without being any. Enforced by
+    #: `models.check_two_vendor_passes` before a run starts.
+    second_expert_model: str = ""
     #: Re-attempt a scenario that ended ``needs_context`` once, with the context
     #: it said it lacked. Distinct from ``max_retries``, which covers rejected
     #: answers; this one costs a call and only fires when the model named a gap.
     expand_context: bool = True
     expansion_bounds: ExpansionBounds = Field(default_factory=ExpansionBounds)
+
+    def has_second_pass(self) -> bool:
+        return bool(self.second_expert_model.strip())
 
     def model_for(self, phase: Phase) -> str:
         chosen = {
@@ -131,6 +140,24 @@ def _agent_id(prefix: str, item_id: str) -> str:
     methodology surviving automation.
     """
     return f"{prefix}-{item_id}-{uuid.uuid4().hex[:12]}"
+
+
+def _unfence(answer: str) -> str:
+    """Strip a markdown code fence, leaving the JSON a recorder can parse.
+
+    Re-serialising through :func:`unwrap_json` rather than slicing the string:
+    a fence is not the only thing a model wraps an answer in, and parsing is the
+    only check that what survives is actually JSON. A truncated answer therefore
+    fails *here*, with a message naming the phase, instead of inside the
+    workspace's file reader where the error says only "Expecting value".
+    """
+    try:
+        return json.dumps(unwrap_json(answer), indent=2, sort_keys=True)
+    except json.JSONDecodeError as exc:
+        raise WorkspaceError(
+            f"router answer was not JSON ({exc}); it was {len(answer)} characters "
+            "and may have been truncated by the output limit"
+        ) from exc
 
 
 def _stamp(answer: str, fields: dict[str, str]) -> str:
@@ -212,7 +239,13 @@ class Driver:
         for _ in range(self._policy.max_retries + 1):
             try:
                 answer = self._ask(Phase.router, ROUTER_SYSTEM, prompt.text)
-                self._workspace.record_backlog(ref, answer)
+                # Unwrap a markdown fence before the recorder sees it. The
+                # scenario and triage paths get this free from `_stamp`, which
+                # parses and re-serialises; the router hands its answer straight
+                # to the workspace, so nothing stripped the fence and
+                # `json.loads` failed at character 0. A live run against DSVW is
+                # what surfaced it — every offline fake answered unfenced.
+                self._workspace.record_backlog(ref, _unfence(answer))
                 return
             except WorkspaceError as exc:
                 # a rejected backlog is usually a coverage failure: the router
@@ -458,6 +491,94 @@ class Driver:
 
         report.model_calls = self._ledger.calls
         self._finish(ref, report, sarif_out)
+        return report
+
+    def run_two_pass(
+        self, ref: RunRef, sarif_out: Path | None = None, suffix: str = "-p2"
+    ) -> RunReport:
+        """Drive two independent detection passes and return one report.
+
+        The second pass is a **separate run**, not a second sweep of the first.
+        That is forced by the methodology rather than chosen for convenience: the
+        workspace treats a scenario as finished once a result is recorded, and
+        both passes recording into one run would produce a single SARIF with no
+        way to tell which pass found what — which is exactly the signal the
+        second pass exists to produce. Separate runs also give each pass its own
+        checkout, its own agent ids and its own context by construction.
+
+        Both passes spend from **this driver's ledger**, so ``--max-calls``
+        bounds the engagement rather than each pass separately. A second pass
+        that could not run is reported, never silently skipped: a queue built
+        from one pass with every finding marked corroborated would be a lie.
+        """
+        report = self.run(ref, sarif_out=sarif_out)
+        second_model = self._policy.second_expert_model.strip()
+        if not second_model:
+            return report
+
+        if not self._ledger.can_afford():
+            report.warnings.append(
+                "detection: the budget was exhausted by the first pass, so the "
+                "second never ran — every finding here is uncorroborated"
+            )
+            return report
+
+        second_ref = RunRef(target=ref.target, run_id=f"{ref.run_id}{suffix}")
+        try:
+            second_ref = self._workspace.create_run(ref, second_ref.run_id)
+        except WorkspaceError as exc:
+            report.warnings.append(
+                f"detection: the second pass could not be created ({exc}); this "
+                "queue comes from one pass and nothing in it is corroborated"
+            )
+            return report
+
+        # A second driver over the *same* ledger and audit sink, differing only
+        # in which model reviews the scenarios. Sharing the ledger is what keeps
+        # one ceiling over the whole engagement; a second driver with its own
+        # would spend the budget twice while both tallies looked healthy.
+        second_policy = self._policy.model_copy(
+            update={"expert_model": second_model, "second_expert_model": ""}
+        )
+        self._audit.record(
+            "second_pass_started",
+            target=second_ref.target,
+            run_id=second_ref.run_id,
+            deployment=second_model,
+        )
+        second = Driver(
+            workspace=self._workspace,
+            provider=self._provider,
+            ledger=self._ledger,
+            policy=second_policy,
+            audit=self._audit,
+        )
+        try:
+            second_report = second.run(second_ref)
+        except WorkspaceError as exc:
+            report.warnings.append(
+                f"detection: the second pass failed ({exc}); this queue comes "
+                "from one pass and nothing in it is corroborated"
+            )
+            return report
+
+        report.second_sarif_path = second_report.sarif_path
+        report.passes = 2
+        report.model_calls = self._ledger.calls
+        report.warnings += [f"pass 2: {w}" for w in second_report.warnings]
+        # The second pass's own coverage matters as much as the first's: a
+        # second pass that reviewed 30% of the backlog corroborates 30% of it.
+        if not second_report.is_complete():
+            report.warnings.append(
+                f"detection: the second pass reviewed "
+                f"{second_report.reviewed_fraction:.0%} of its backlog, so "
+                "corroboration is only available for the part it reached"
+            )
+        if report.second_sarif_path is None:
+            report.warnings.append(
+                "detection: the second pass produced no SARIF, so its findings "
+                "cannot be consolidated with the first"
+            )
         return report
 
     def resume_parked(self, ref: RunRef, sarif_out: Path | None = None) -> RunReport:

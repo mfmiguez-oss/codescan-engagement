@@ -10,7 +10,7 @@ import json
 import pytest
 
 from engagement.budget import Budget, Ledger
-from engagement.contracts import Disposition, Phase, Priority, RunRef
+from engagement.contracts import Disposition, Phase, Priority, RunRef, RunReport
 from engagement.driver import Driver, Policy
 from engagement.providers import FakeProvider
 from fakes import FakeWorkspace, scenarios
@@ -152,3 +152,37 @@ def test_an_export_failure_never_discards_a_completed_run() -> None:
 
     assert report.scenarios_completed == 1
     assert any("SARIF was not written" in warning for warning in report.warnings)
+
+
+def test_a_fenced_router_answer_is_unwrapped_before_the_recorder_sees_it() -> None:
+    """A live DSVW run failed here: the model fenced its JSON in ```json, the
+    router path handed it straight to the workspace, and json.loads died at
+    character 0. The scenario and triage paths never hit it because `_stamp`
+    parses and re-serialises."""
+    from engagement.budget import Ledger
+    from engagement.driver import Driver, Policy
+    from engagement.providers import FakeProvider
+
+    fenced = '```json\n{"scenarios": []}\n```'
+    workspace = FakeWorkspace(scenarios=[], backlog_done=False)
+    driver = Driver(
+        workspace=workspace,
+        provider=FakeProvider(answers=[fenced]),
+        ledger=Ledger(),
+        policy=Policy(model="m"),
+    )
+    driver._do_router(RunRef(target="acme", run_id="run-001"), RunReport(
+        ref=RunRef(target="acme", run_id="run-001"), phase=Phase.router
+    ))
+
+    assert workspace.backlog_json is not None
+    assert not workspace.backlog_json.lstrip().startswith("`")
+    json.loads(workspace.backlog_json)
+
+
+def test_a_truncated_router_answer_names_the_likely_cause() -> None:
+    from engagement.driver import _unfence
+    from engagement.workspace import WorkspaceError
+
+    with pytest.raises(WorkspaceError, match="may have been truncated"):
+        _unfence('```json\n{"scenarios": [{"id": "S001"')

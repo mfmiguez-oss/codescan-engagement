@@ -15,12 +15,12 @@ dependencies = ["pydantic>=2"]
 foundry = ["httpx>=0.27"]
 bedrock = ["boto3>=1.34"]
 postgres = ["psycopg[binary]>=3.1"]
-# The codescan triage backbone. Pinned to a commit rather than named bare:
-# `triagekit` is on no index, so an unqualified requirement resolves to nothing
-# and fails with "no matching distribution" instead of saying where to look.
-triage = [
-  "triagekit @ git+https://github.com/mfmiguez-oss/codescan-triage@8c8f661",
-]
+# The deterministic triage backbone is `engagement.backbone`, ported into this
+# package rather than resolved from a private git reference. There is no
+# `triage` extra any more: scoring, lifecycle, chains, PoC drafts and the
+# worklist are available to every install, and the image is self-sufficient.
+# `tests/test_backbone_conformance.py` holds the port to the original whenever
+# `triagekit` happens to be installed beside it.
 # The control plane: token verification and the HTTP surface.
 api = ["pyjwt[crypto]>=2.8", "starlette>=0.37", "uvicorn>=0.30"]
 dev = ["pytest", "ruff", "mypy"]

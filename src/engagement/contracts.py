@@ -189,11 +189,29 @@ class ScoredFinding(StrictModel):
     #: Points the lifecycle state added to ``risk_score``. Recorded rather than
     #: folded in, so the backbone's own score is always recoverable.
     lifecycle_adjust: float = 0.0
+    #: Reachability, from recon's request boundaries. ``exposure_boundary`` names
+    #: the boundary type that decided it, so the number can be argued with.
+    exposure: float = 0.0
+    exposure_boundary: str = ""
+    exposure_adjust: float = 0.0
+    #: Chain membership, fed back from the chain-discovery stage.
+    chaining: float = 0.0
+    chain_count: int = 0
+    chaining_adjust: float = 0.0
+    #: Which detection passes reported this finding. Two vendors agreeing is
+    #: evidence; one vendor asserting twice is not, which is why the passes are
+    #: refused unless they come from different vendors.
+    detected_by: list[str] = Field(default_factory=list)
+
+    @property
+    def total_adjust(self) -> float:
+        """Every recorded adjustment, so the backbone's score is recoverable."""
+        return self.lifecycle_adjust + self.exposure_adjust + self.chaining_adjust
 
     @property
     def base_score(self) -> float:
-        """The score before any lifecycle adjustment."""
-        return self.risk_score - self.lifecycle_adjust
+        """The score before any adjustment this package applied."""
+        return round(self.risk_score - self.total_adjust, 4)
 
 
 class Chain(StrictModel):
@@ -256,6 +274,10 @@ class RunReport(StrictModel):
     model_calls: int = 0
     warnings: list[str] = Field(default_factory=list)
     sarif_path: str | None = None
+    #: The second detection pass, when one ran. `passes` is what the queue
+    #: reads to decide whether corroboration means anything.
+    second_sarif_path: str | None = None
+    passes: int = 1
     #: Scenarios that ended without a conclusion, with why and what was tried.
     parked: list[ParkedScenario] = Field(default_factory=list)
     parked_path: str | None = None

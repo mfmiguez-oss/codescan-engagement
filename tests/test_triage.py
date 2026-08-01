@@ -24,12 +24,34 @@ class FakePipeline:
     def __init__(self, summary: TriageSummary | None = None) -> None:
         self.summary = summary or TriageSummary(findings=3, kev_findings=1, top_score=85.0)
         self.calls: list[tuple[Path, str]] = []
+        self.extra: dict[str, Path] = {}
 
     def ingest(
-        self, sarif: Path, repo: str, out_dir: Path, feeds: Path | None = None
+        self,
+        sarif: Path,
+        repo: str,
+        out_dir: Path,
+        feeds: Path | None = None,
+        extra_sarif: dict[str, Path] | None = None,
     ) -> TriageSummary:
         self.calls.append((sarif, repo))
+        self.extra = dict(extra_sarif or {})
         return self.summary
+
+
+def test_a_second_pass_reaches_the_pipeline_that_consolidates_it() -> None:
+    """The protocol carries it, so an alternative scorer cannot silently drop
+    the second pass and report single-pass findings as corroborated."""
+    pipeline = FakePipeline()
+    ingest_run(
+        _report(),
+        repo="acme/app",
+        out_dir=Path("out"),
+        pipeline=pipeline,
+        extra_sarif={"pass-2:gpt": Path("second.sarif")},
+    )
+
+    assert pipeline.extra == {"pass-2:gpt": Path("second.sarif")}
 
 
 def _report(**kwargs: object) -> RunReport:
@@ -75,11 +97,18 @@ def test_a_run_with_no_export_is_refused_rather_than_scored_empty() -> None:
         ingest_run(_report(sarif_path=None), repo="acme/app", out_dir=Path("out"))
 
 
-def test_the_engagement_gate_does_not_require_the_triage_backbone() -> None:
-    """The port exists so this package installs and tests without it."""
-    from engagement import triage
+def test_scoring_is_available_without_any_optional_install() -> None:
+    """The backbone is part of this package, not an extra someone may forget.
 
-    assert hasattr(triage, "TriagekitPipeline")
+    Stronger than what this replaced: the old test only asserted the adapter
+    class existed, while the scorer it adapted still had to be fetched from a
+    private repository.
+    """
+    from engagement.backbone import score_finding
+    from engagement.triage import BackbonePipeline
+
+    assert BackbonePipeline().name == "backbone"
+    assert callable(score_finding)
 
 
 def test_a_driver_run_feeds_the_backbone_end_to_end() -> None:

@@ -9,6 +9,9 @@ obligations and independent finding triage stay in the workspace, and so do the
 integrity checks that make an unattended run defensible in the first place.
 
 Architecture and rationale: [docs/DESIGN.md](docs/DESIGN.md).
+Stages, contracts and dataflows: [docs/DATAFLOW.md](docs/DATAFLOW.md) — including
+the [degradation matrix](docs/DATAFLOW.md#degradation-what-happens-when-an-input-is-missing),
+which says what a run still means when a feed or a budget is missing.
 Topology and cloud setup: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 Risk register: [docs/THREATMODEL.md](docs/THREATMODEL.md).
 Framework conformance, dated: [docs/SECURITY_FRAMEWORKS.md](docs/SECURITY_FRAMEWORKS.md).
@@ -91,11 +94,23 @@ engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
   --triage --feeds ./feeds --repo acme/app
 ```
 
-Hands the run's SARIF to the codescan triage backbone — dedup, KEV/EPSS
-enrichment, explainable score, rank, CSV. Needs the `triage` extra
-(`pip install -e ".[triage]"`, which resolves a pinned git reference and so
-needs repository access). Without feeds it still scores, and says so: an
-unexploited finding and an unchecked one otherwise rank the same.
+Hands the run's SARIF to the triage backbone — dedup, KEV/EPSS enrichment,
+explainable score, rank. The backbone is `engagement.backbone`, **part of this
+package**: no extra to install, no credentials, no network. It was ported from
+`triagekit` rather than depended on, because a private git reference put scoring
+— and therefore lifecycle, chains, PoC drafts and the worklist — behind
+credentials, and its absence degraded to a *warning*, so a run that could not
+score looked like a run that found nothing worth scoring.
+
+Fingerprinting and the weakness-synonym table are ported **verbatim**: a
+fingerprint is a finding's identity, and a port that hashed differently would
+orphan every analyst decision and every baseline at the moment of the switch.
+`tests/test_backbone_conformance.py` holds the port byte-for-byte against the
+original whenever `triagekit` happens to be installed beside it, and skips
+cleanly when it is not.
+
+Without feeds it still scores, and says so: an unexploited finding and an
+unchecked one otherwise rank the same.
 
 ## Package lifecycle: deprecation, end of support, end of life
 
@@ -211,6 +226,72 @@ anti-correlated here:
 configured deployment sits below (or wastefully above) its task's tier. A
 deployment with no published rate is reported as **unpriced** rather than
 assigned a guessed one.
+
+## Two detection passes, from two vendors
+
+```bash
+engagement run acme run-001 --workspace ../OpenHack-main \
+  --expert-model claude-opus-5 --second-model gpt-5.6-luna --triage
+```
+
+**The driver drives both passes.** `--second-model` is all it takes: the driver
+creates a sibling run (`run-001-p2`) against the same checkout, reviews the
+whole backlog again with the second vendor's model, and consolidates the two
+SARIFs. `--second-sarif` remains only as an override for a pass produced out of
+band.
+
+The second pass is a *separate run*, not a second sweep of the first. That is
+forced by the methodology rather than chosen for convenience: the workspace
+treats a scenario as finished once a result is recorded, so both passes writing
+into one run would produce a single SARIF with no way to tell which pass found
+what — which is precisely the signal the second pass exists to produce. Separate
+runs also give each pass its own checkout, its own agent ids, and its own
+context by construction.
+
+Both passes spend from **one ledger**, so `--max-calls` bounds the engagement
+rather than each pass separately. A second pass that could not run — budget
+exhausted, run not creatable, pass failed — is **reported**, never silently
+skipped: a queue built from one pass whose findings read as corroborated would
+be worse than no second pass at all.
+
+A second pass is only worth paying for if it can **disagree** with the first.
+Two models from one vendor share training data, tokenizer lineage and refusal
+behaviour, so they miss the same things in the same places — and a second pass
+that agrees for structural reasons produces a corroboration count that reads
+like evidence and is not. **Same-vendor pairs are refused**, not warned about;
+`ENGAGEMENT_ALLOW_SINGLE_VENDOR=1` makes accepting a weaker pair a deliberate
+choice. An unrecognised alias counts as its own vendor, so two unknowns are
+never *assumed* independent.
+
+Consolidation is the dedup that already existed: findings merge on fingerprint
+and `corroboration` counts the passes that reported each one. A finding only one
+pass saw is **kept** and reported as uncorroborated — not false, only
+uncorroborated. Dropping it would be suppression dressed up as precision.
+
+## All four score dimensions are populated
+
+The scorer weights severity 30%, exploitability 35%, exposure 20%, chaining 15%.
+The last two used to be zero, so 35% of the weight did nothing: every blended
+score was dragged down, the KEV floor decided the ranking of every exploited
+finding rather than the blend, and two findings that differ entirely — one on an
+unauthenticated SAML endpoint, one behind three internal hops — scored the same.
+
+Both are now filled from evidence the pipeline already produced:
+
+- **exposure** — OpenHack's recon already walks the source for *request
+  boundaries* (route registrations, webhook handlers, SAML/OIDC callbacks,
+  upload endpoints) and records each with a path and a type. A finding in a
+  boundary file is externally reachable. That fact was being thrown away.
+- **chaining** — the chain-discovery stage was producing exactly the signal the
+  dimension was named for, with nowhere to put it. A hub appearing in three
+  chains now outranks a link in one, capped so overlapping chains cannot inflate
+  a finding past its evidence.
+
+Both are **recorded, reversible adjustments** like the lifecycle bump:
+`base_score` subtracts every one of them, so the backbone's own score is always
+recoverable. A path with no boundary is *not* penalised — recon only sees
+boundaries it recognised, so absence is weak evidence, not proof of
+unreachability.
 
 ## Determinism
 

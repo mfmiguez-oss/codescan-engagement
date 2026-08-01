@@ -95,12 +95,30 @@ def test_the_control_plane_is_opt_in() -> None:
     ), "deployControlPlane must default to false"
 
 
-def test_the_triage_extra_points_somewhere_installable() -> None:
-    """`triagekit` is on no index, so a bare requirement resolves to nothing.
-    A direct reference at least fails with an address rather than a shrug."""
-    triage = EXTRAS["triage"]
-    assert any("@" in dep and "git+" in dep for dep in triage), (
-        f"the triage extra must name a resolvable source, got {triage}"
+def test_no_dependency_resolves_to_a_private_or_network_source() -> None:
+    """Every requirement must come from an index, so an install needs no
+    credentials and the image builds without reaching a private repository.
+
+    This replaces the old `triage` extra, which pointed at a private git
+    reference and so put scoring — and therefore lifecycle, chains, PoC drafts
+    and the worklist — behind credentials. Its absence degraded to a *warning*,
+    which meant a run that could not score looked like a run that found nothing
+    worth scoring. The backbone is now `engagement.backbone`.
+    """
+    # A direct reference is `name @ <url>` or a bare URL — not a package whose
+    # name merely begins with "http" (httpx is an ordinary index requirement).
+    offenders = [
+        dep
+        for deps in EXTRAS.values()
+        for dep in deps
+        if "git+" in dep or "@ http" in dep or dep.strip().startswith(("http://", "https://"))
+    ]
+    assert not offenders, f"these would need network or credentials to install: {offenders}"
+
+
+def test_there_is_no_triage_extra_to_forget_to_install() -> None:
+    assert "triage" not in EXTRAS, (
+        "scoring must reach every install, not whoever remembered an extra"
     )
 
 

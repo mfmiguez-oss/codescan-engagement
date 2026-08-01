@@ -151,6 +151,8 @@ class Workspace(Protocol):
 
     def emit_sarif(self, ref: RunRef, out: Path | None = None) -> Path: ...
 
+    def create_run(self, source: RunRef, run_id: str) -> RunRef: ...
+
 
 class CliWorkspace:
     """Adapter onto a real OpenHack checkout via its CLI.
@@ -401,6 +403,36 @@ class CliWorkspace:
             raise WorkspaceError(f"triage for {candidate_id} was not recorded")
         data = json.loads(decision.read_text(encoding="utf-8"))
         return str(data.get("decision", ""))
+
+    def create_run(self, source: RunRef, run_id: str) -> RunRef:
+        """Create a sibling run against the same target, for a second pass.
+
+        The target's git URL and branch are read from the first run's own
+        ``run-config.yaml`` rather than taken as arguments: a second pass that
+        reviewed a *different* checkout would produce findings that cannot be
+        compared with the first, and the corroboration count would be measuring
+        two different things.
+        """
+        config = self._run_dir(source) / "run-config.yaml"
+        if not config.exists():
+            raise WorkspaceError(
+                f"cannot create a second run: {config} is missing, so the target "
+                "the first pass reviewed cannot be identified"
+            )
+        settings: dict[str, str] = {}
+        for line in config.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if _ and key.strip() in {"git_url", "branch"}:
+                settings[key.strip()] = value.strip().strip("\"'")
+        git_url = settings.get("git_url", "")
+        if not git_url:
+            raise WorkspaceError(f"cannot create a second run: no git_url in {config}")
+
+        args = ["init-run", source.target, git_url, "--run-id", run_id]
+        if settings.get("branch"):
+            args += ["--branch", settings["branch"]]
+        self._run(*args)
+        return RunRef(target=source.target, run_id=run_id)
 
     def emit_sarif(self, ref: RunRef, out: Path | None = None) -> Path:
         args = ["emit-sarif", ref.target, ref.run_id]

@@ -36,6 +36,7 @@ from typing import Any
 from pydantic import Field
 
 from .contracts import StrictModel
+from .egress import EgressPolicy
 
 #: CISA's published catalogue. Stable, unauthenticated, and the authority — a
 #: mirror is a copy of a thing that changes daily.
@@ -130,9 +131,14 @@ def load_kev(path: Path) -> KevCatalogue:
     return parse_kev(payload, source=str(path))
 
 
-def fetch_kev(url: str = CISA_KEV_URL, timeout: float = 60.0) -> KevCatalogue:
-    """Fetch the catalogue from CISA. The only outbound call in this module."""
+def fetch_kev(
+    url: str = CISA_KEV_URL, timeout: float = 60.0, egress: EgressPolicy | None = None
+) -> KevCatalogue:
+    """Fetch the catalogue from CISA, if the allowlist permits that host."""
     import httpx  # lazy: optional extra, and never reached offline
+
+    if egress is not None:
+        egress.check(url, purpose='KEV fetch')
 
     try:
         response = httpx.get(url, timeout=timeout, follow_redirects=True)
@@ -278,9 +284,17 @@ def build_snyk_requests(org_id: str, api_url: str = "https://api.snyk.io") -> di
     }
 
 
-def fetch_snyk(org_id: str, token: str, api_url: str = "https://api.snyk.io") -> Inventory:
+def fetch_snyk(
+    org_id: str,
+    token: str,
+    api_url: str = "https://api.snyk.io",
+    egress: EgressPolicy | None = None,
+) -> Inventory:
     """Pull every project's dependencies for one Snyk organisation."""
     import httpx  # lazy: optional extra
+
+    if egress is not None:
+        egress.check(api_url, purpose='Snyk pull')
 
     shape = build_snyk_requests(org_id, api_url)
     headers = {"authorization": f"token {token}", "content-type": "application/json"}

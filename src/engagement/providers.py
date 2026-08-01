@@ -21,6 +21,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import Field
 
 from .contracts import StrictModel
+from .egress import EgressPolicy
 from .models import sampling_for
 
 PROVIDERS = ("foundry", "bedrock")
@@ -88,9 +89,16 @@ class FoundryProvider:
 
     name = "foundry"
 
-    def __init__(self, resource: str, api_key: str, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        resource: str,
+        api_key: str,
+        base_url: str | None = None,
+        egress: EgressPolicy | None = None,
+    ) -> None:
         self._resource = resource
         self._api_key = api_key
+        self._egress = egress
         root = f"https://{resource}.services.ai.azure.com"
         self._openai_base = (base_url or f"{root}/openai/v1").rstrip("/")
         self._anthropic_base = f"{root}/anthropic/v1"
@@ -172,6 +180,10 @@ class FoundryProvider:
         import httpx  # lazy: optional extra
 
         shape = self.build_request(request)
+        # The last point before bytes leave the process. Checked here rather
+        # than at construction so a base_url changed at runtime cannot slip past.
+        if self._egress is not None:
+            self._egress.check(str(shape["url"]), purpose="model dispatch")
         response = httpx.post(
             shape["url"], headers=shape["headers"], json=shape["body"], timeout=300.0
         )
@@ -237,7 +249,9 @@ class BedrockProvider:
         region: str,
         inference_geo: str | None = None,
         endpoint_url: str | None = None,
+        egress: EgressPolicy | None = None,
     ) -> None:
+        self._egress = egress
         self._region = region
         self._geo = (inference_geo or "").strip().strip(".").lower() or None
         self._endpoint_url = endpoint_url
@@ -287,6 +301,11 @@ class BedrockProvider:
         return self._client
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        if self._egress is not None:
+            self._egress.check(
+                self._endpoint_url or f"bedrock-runtime.{self._region}.amazonaws.com",
+                purpose="model dispatch",
+            )
         data = self._bedrock().converse(**self.build_request(request))
         usage = data.get("usage", {})
         blocks = data.get("output", {}).get("message", {}).get("content", []) or []
@@ -343,7 +362,9 @@ def configured_providers(env: Mapping[str, str]) -> list[str]:
     return found
 
 
-def build_provider(env: Mapping[str, str]) -> ModelProvider:
+def build_provider(
+    env: Mapping[str, str], egress: EgressPolicy | None = None
+) -> ModelProvider:
     """Build the configured provider, refusing to guess between two.
 
     Ambiguity is a refusal rather than a default: two configured providers mean
@@ -375,7 +396,10 @@ def build_provider(env: Mapping[str, str]) -> ModelProvider:
                 "are not both set."
             )
         return FoundryProvider(
-            resource=resource, api_key=key, base_url=env.get("FOUNDRY_BASE_URL") or None
+            resource=resource,
+            api_key=key,
+            base_url=env.get("FOUNDRY_BASE_URL") or None,
+            egress=egress,
         )
     if name == "bedrock":
         region = env.get("BEDROCK_REGION") or env.get("AWS_REGION")
@@ -388,6 +412,7 @@ def build_provider(env: Mapping[str, str]) -> ModelProvider:
             region=region,
             inference_geo=env.get("BEDROCK_INFERENCE_GEO") or None,
             endpoint_url=env.get("BEDROCK_ENDPOINT_URL") or None,
+            egress=egress,
         )
     raise ProviderError(
         f"unknown provider {name!r}; set ENGAGEMENT_PROVIDER to one of: "

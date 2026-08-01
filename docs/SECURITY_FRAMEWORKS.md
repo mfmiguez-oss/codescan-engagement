@@ -44,7 +44,7 @@ package's controls.
 | Security misconfiguration | Enforced | The control plane refuses to start without an issuer and audience, and is opt-in in the template; `test_the_control_plane_is_opt_in` |
 | Software & data integrity failures | Enforced | Vendored methodology hash-pinned; deploy files cross-checked; `test_the_mirror_contains_nothing_the_manifest_does_not_track`, `test_the_image_installs_what_the_control_plane_command_needs` |
 | Security logging & monitoring failures | Enforced | Append-only audit of every dispatch and outcome, exportable to a SIEM in ECS or CEF without widening what the trail discloses; `test_every_model_call_is_recorded`, `test_a_write_failure_is_an_error_not_a_warning`, `test_the_export_is_a_pure_function_of_the_trail`, `test_an_incomplete_run_is_exported_at_a_higher_severity_than_a_clean_one` |
-| SSRF | Not yet | The only outbound calls are to a configured model endpoint and a configured JWKS URI; neither is influenced by model output, but nothing tests that |
+| SSRF | Enforced | Outbound hosts are allow-listed from operator configuration only, checked at the one point bytes leave — so a host named anywhere in the material under review is unreachable by construction; `test_nothing_observed_can_widen_the_allowlist`, `test_the_provider_refuses_before_the_request_is_sent` |
 
 ## OWASP ASVS 5.0 (assessed at L1, selected chapters)
 
@@ -75,6 +75,48 @@ package's controls.
 | Exfiltration via inference API | Enforced | Credentials redacted before dispatch; `test_no_secret_reaches_the_provider` |
 | Denial of ML service / cost harvesting | Enforced | Refuse-before-dispatch ceilings; `test_call_ceiling_refuses_before_dispatch` |
 | Model swap behind a deployment alias | Not yet | No benchmark in this package; the estate's regression gate lives in the triage backbone |
+
+## Anthropic — securing an AI-native SDLC (assessed 2026-08-01)
+
+Against the practices in [How Anthropic secures its AI-native software
+development lifecycle](https://claude.com/blog/how-anthropic-secures-its-ai-native-software-development-lifecycle).
+This package is one stage of an SDLC, not a whole one, so several rows are
+**out of scope** rather than missing — marked as such rather than left blank to
+look like gaps.
+
+| Practice | Verdict | Evidence |
+|---|---|---|
+| Secure guidelines encoded for the generating agent | Enforced | `CLAUDE.md` plus the vendored expert manifests; the directive-refusing system prompt is applied in every phase; `test_expansion_delimits_supplied_files_as_untrusted` |
+| Limit the blast radius (least agency) | Enforced | Machine principals hold `scanner` only and cannot set a terminal state; `test_an_unattended_run_may_scan_but_not_adjudicate` |
+| Single-purpose identity per agent | Enforced | `identity.py`; a run may scan but not adjudicate, and the container runs as uid 10001 (`test_the_image_does_not_run_as_root`) |
+| **Egress allowlisting to limit prompt-injection exfiltration** | **Enforced** | `egress.py`: an allowlist derived **only** from operator configuration, checked at the one point bytes leave; `test_nothing_observed_can_widen_the_allowlist` |
+| Multiple specialised review agents with separate context windows | Enforced | Per-scenario subagent isolation with agent-id uniqueness enforced *across* passes; two-vendor detection (`test_agent_ids_stay_unique_across_passes`) |
+| Agents that cannot share blind spots | Enforced | Same-vendor second passes are **refused**, not warned about; `test_two_passes_on_one_vendor_are_refused` |
+| Agentic **and** deterministic scanning combined | Enforced | The deterministic backbone produces the ranked queue with no model at all; the AI stages annotate it; `test_scoring_is_available_without_any_optional_install` |
+| Proof required before a finding is acted on | Partial | The workspace re-reads every citation from the checkout, and PoC drafts state preconditions — but a triage decision is not itself gated on a written proof |
+| **Risk-weighted sampling of automated decisions** | **Enforced** | `governance.py`: a tier-driven fraction flagged for human review, deterministic per run; `test_sampling_is_stable_across_reruns` |
+| **Risk-tiered automation** | **Enforced** | `RiskTier`; `critical` samples every decision, which is the same as not adjudicating unattended |
+| **Shadow mode until an agent earns trust** | **Enforced** | A shadowed model's decisions are recorded and reported but do not adjudicate; `test_a_shadowed_models_decisions_do_not_count` |
+| Logging with the reasoning behind each decision | Enforced | Append-only audit with prompt digests; `movement_reason`, `ScoreBreakdown`, and lifecycle/exposure/chaining deltas each recorded beside the score; `test_every_model_call_is_recorded` |
+| Every agent action in a SIEM, for attribution | Enforced | `siem.py` (ECS/CEF), narrowing never widening; `test_a_detail_key_outside_the_allowlist_is_dropped_and_reported` |
+| Invariant testing of critical properties | Enforced | `tests/test_invariants.py` plus `scripts/mutation_check.py`, which breaks the code in 25 places to prove the tests notice; `test_the_register_parses_and_is_not_empty` |
+| Humans in the loop at leverage points | Enforced | Terminal states are human-only and identity-bound; sampling puts a human on a measured fraction of the rest; `test_a_machine_may_never_set_a_terminal_state` |
+| Treat agents as an insider-threat class | Partial | Blocked egress and shadow decisions are audited and exported, but there is no alerting rule that fires on an out-of-alignment action |
+| Vitals dashboard across runs | Not yet | Per-run reporting only; nothing aggregates across runs |
+| Continuous DAST matched to deploy cadence | Out of scope | This package performs static, scenario-driven review; it does not deploy |
+| Automated PSR at the planning stage | Out of scope | No design-document stage here |
+| Bug bounty | Out of scope | An organisational programme, not a property of this package |
+
+Two rows are worth stating plainly. **Egress allowlisting** closed the most
+material gap: an agent that reads attacker-controlled source and then makes
+network calls has an exfiltration path, and prompt injection does not need the
+model to leak anything — it only needs a later stage to fetch a URL. The
+allowlist is built from configuration only, so a host named anywhere in the
+material under review is unreachable by construction.
+
+And **sampling** answers the question an unattended run otherwise cannot: if no
+automated decision is ever checked, there is no evidence the decisions are good
+— only the absence of evidence that they are bad.
 
 ## Others in scope of the design
 

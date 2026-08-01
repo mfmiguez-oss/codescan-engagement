@@ -170,6 +170,35 @@ def _lifecycle(life: LifecycleReport | None) -> str:
     )
 
 
+def _movement(movement: dict[str, int] | None) -> str:
+    """What changed since the last run — the second thing an analyst looks for.
+
+    After "how much was reviewed", the next question is always "what is
+    different". Without it a returning reader re-reads a hundred unchanged rows
+    to find the three that moved.
+    """
+    if movement is None:
+        return ""
+    if not any(movement.values()):
+        return ""
+    tiles = "".join(
+        f"<div><span>{label}</span><b class='{css}'>{movement.get(key, 0)}</b></div>"
+        for label, key, css in (
+            ("Got worse", "increased", "bad"),
+            ("Got better", "decreased", "ok"),
+            ("New", "new", "warn"),
+            ("Unchanged", "unchanged", ""),
+        )
+    )
+    note = (
+        "<p class='sub'>Movement is measured against the previous run's baseline. "
+        "A first run reports everything as unknown rather than new.</p>"
+        if movement.get("unchanged", 0) == 0 and movement.get("increased", 0) == 0
+        else ""
+    )
+    return f"<h2>What changed</h2><div class='grid'>{tiles}</div>{note}"
+
+
 def _chains(analysis: AnalysisSummary | None) -> str:
     if analysis is None or not analysis.chains:
         return ""
@@ -228,6 +257,7 @@ def render(
     triage: TriageSummary | None = None,
     lifecycle: LifecycleReport | None = None,
     analysis: AnalysisSummary | None = None,
+    movement: dict[str, int] | None = None,
 ) -> str:
     """Render one run as a standalone HTML page."""
     reviewed = report.reviewed_fraction
@@ -285,6 +315,7 @@ def render(
         f"<div class='{banner_class}'><strong>{headline}</strong>{caveat}"
         f"<div class='grid'>{grid}</div></div>"
         f"{intelligence}"
+        f"{_movement(movement)}"
         f"{_lifecycle(lifecycle)}"
         f"{_chains(analysis)}"
         f"{_pocs(analysis)}"
@@ -303,7 +334,8 @@ def write(
     triage: TriageSummary | None = None,
     lifecycle: LifecycleReport | None = None,
     analysis: AnalysisSummary | None = None,
+    movement: dict[str, int] | None = None,
 ) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(report, triage, lifecycle, analysis), encoding="utf-8")
+    out.write_text(render(report, triage, lifecycle, analysis, movement), encoding="utf-8")
     return out

@@ -78,6 +78,8 @@ def test_every_run_flag_is_read_somewhere_in_the_command() -> None:
         "siem_format",
         "snyk_export",
         "baseline",
+        "second_model",
+        "second_sarif",
     ):
         assert f"args.{flag}" in source, f"--{flag.replace('_', '-')} parses but is never read"
 
@@ -228,7 +230,7 @@ def test_the_report_renderer_accepts_what_the_run_produces() -> None:
     from engagement.report import write
 
     parameters = list(inspect.signature(write).parameters)
-    assert parameters == ["report", "out", "triage", "lifecycle", "analysis"]
+    assert parameters == ["report", "out", "triage", "lifecycle", "analysis", "movement"]
 
 
 def test_the_documented_caps_are_the_ones_the_code_applies() -> None:

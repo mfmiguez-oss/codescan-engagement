@@ -68,6 +68,16 @@ test that exists.
 | R46 | Attacker-influenced text executes when the queue is opened in a spreadsheet | formula-leading cells neutralised on export | mitigated | test_a_hostile_title_cannot_execute_in_a_spreadsheet |
 | R47 | An unattended run spends on a model nobody chose, at a rate nobody projected | per-task allocation with a pre-dispatch projection; unpriced deployments reported | mitigated | test_an_unpriced_deployment_is_reported_rather_than_guessed |
 | R48 | A Snyk token is captured from a URL by a proxy or access log | credentials travel in an Authorization header only | mitigated | test_a_snyk_token_never_appears_in_a_url |
+| R49 | Two same-vendor passes produce a corroboration count that is not evidence | vendor independence enforced before the run; refused, not warned | mitigated | test_two_passes_on_one_vendor_are_refused |
+| R50 | A finding only one pass saw is dropped as unconfirmed | uncorroborated findings kept and reported as uncorroborated, not false | mitigated | test_a_finding_only_one_pass_saw_is_kept |
+| R51 | An unrecognised deployment alias is assumed independent of another | unknown counts as its own vendor; two unknowns are refused | mitigated | test_two_unrecognised_aliases_are_treated_as_one_vendor |
+| R52 | A score adjustment cannot be undone, so the score cannot be audited | every adjustment recorded beside the score; `base_score` recovers the original | mitigated | test_both_adjustments_together_stay_reversible |
+| R53 | An unreachable finding ranks with an internet-facing one | exposure derived from recon's request boundaries | mitigated | test_a_finding_on_a_request_boundary_is_more_exposed_than_one_that_is_not |
+| R54 | Overlapping chains inflate one finding past the evidence for it | chain contribution capped | mitigated | test_the_chaining_adjustment_is_capped |
+| R55 | A second pass silently does not run, leaving a queue that reads as corroborated | every failure path appends a warning naming what the queue does not mean | mitigated | test_a_budget_exhausted_by_the_first_pass_reports_no_corroboration |
+| R56 | Two passes share one context and are presented as independent reviews | separate runs; agent-id uniqueness enforced across passes, not only within one | mitigated | test_agent_ids_stay_unique_across_passes |
+| R57 | A second pass silently reuses the first pass's model | the second run's policy overrides the expert deployment | mitigated | test_the_second_pass_uses_the_second_vendors_model |
+| R58 | A second pass reviews a different checkout, so corroboration compares two things | the sibling run is created from the first run's own `run-config.yaml` | mitigated | test_a_second_pass_that_cannot_be_created_is_reported |
 
 ## What is deliberately out of scope
 

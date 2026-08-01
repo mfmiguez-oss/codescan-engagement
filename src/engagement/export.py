@@ -35,6 +35,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from .backbone import SEVERITY_VALUE
 from .contracts import ScoredFinding, StrictModel
 
 #: Ordered as an analyst reads: what and where first, then why it ranks there,
@@ -69,7 +70,10 @@ COLUMNS = [
 #: A leading character a spreadsheet would treat as a formula.
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
-_SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
+#: Derived from the backbone rather than restated. Two copies of one ladder
+#: drift, and a movement column computed against a stale copy would report
+#: severity changes that did not happen.
+_SEVERITY_ORDER = [severity.value for severity in sorted(SEVERITY_VALUE, key=SEVERITY_VALUE.get)]  # type: ignore[arg-type]
 
 
 def severity_rank(severity: str) -> int:

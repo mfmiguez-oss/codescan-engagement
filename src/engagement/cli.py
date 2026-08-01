@@ -20,17 +20,20 @@ from pathlib import Path
 from .analysis import AnalysisSummary, analyse
 from .audit import AuditLog, FileSink, default_audit_path, read_events
 from .budget import Budget, Ledger
-from .contracts import Disposition, RunRef, RunReport
+from .contracts import Disposition, Phase, RunRef, RunReport
 from .driver import Driver, Policy
+from .egress import build_policy
 from .export import movement_summary, write_manifest, write_queue
 from .feeds import CISA_KEV_URL, FeedError, fetch_kev, load_snyk, write_kev
+from .governance import RiskTier, review
 from .identity import Action, Unauthorized, authorize, machine
 from .lifecycle import LifecycleError, LifecycleReport, assess, load_feed
-from .models import Task, build_plan, render_plan
+from .models import SingleVendorError, Task, build_plan, check_two_vendor_passes, render_plan
 from .providers import ProviderError, build_provider
 from .report import write as write_report
 from .siem import FORMATS, summarize
 from .siem import export as siem_export
+from .signals import apply_chaining, apply_exposure, load_boundaries
 from .triage import TriageError, TriageSummary, ingest_run
 from .workspace import CliWorkspace, WorkspaceError, seed_workspace, vendored_workspace
 
@@ -110,9 +113,41 @@ def _build_parser() -> argparse.ArgumentParser:
         "no credentials. This is usually what closes the EOL blind spot.",
     )
     run.add_argument(
+        "--second-model",
+        default="",
+        help="Deployment for a second, independent detection pass. Must be a "
+        "different vendor from --expert-model; refused otherwise.",
+    )
+    run.add_argument(
+        "--second-sarif",
+        type=Path,
+        help="Override the second pass's SARIF with one produced out of band. "
+        "Not needed for --second-model: the driver drives both passes.",
+    )
+    run.add_argument(
         "--baseline",
         type=Path,
         help="Previous run's baseline, for severity movement. Rolled forward here.",
+    )
+    run.add_argument(
+        "--risk-tier",
+        choices=[t.value for t in RiskTier],
+        default=RiskTier.standard.value,
+        help="How much adjudication may go unreviewed. 'critical' samples every "
+        "decision for human review, which is the same as not adjudicating "
+        "unattended at all.",
+    )
+    run.add_argument(
+        "--sample-rate",
+        type=float,
+        help="Override the tier's human-review sampling rate (0.0-1.0).",
+    )
+    run.add_argument(
+        "--shadow-model",
+        action="append",
+        default=[],
+        help="A model whose decisions are recorded but do not count until it has "
+        "earned trust. Repeatable.",
     )
     run.add_argument(
         "--siem",
@@ -263,8 +298,9 @@ def _bound(flag: int | None, env: Mapping[str, str], name: str, default: int) ->
 
 
 def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    egress = build_policy(env)
     try:
-        provider = build_provider(env)
+        provider = build_provider(env, egress=egress)
     except ProviderError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -284,6 +320,19 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             "ENGAGEMENT_MODEL. An unattended run never guesses a deployment.",
             file=sys.stderr,
         )
+        return EXIT_CONFIG
+
+    try:
+        second = args.second_model.strip()
+        if second:
+            for warning in check_two_vendor_passes(
+                [policy.expert_model or policy.model, second],
+                allow_single=env.get("ENGAGEMENT_ALLOW_SINGLE_VENDOR", "") == "1",
+            ):
+                print(f"warning: {warning}", file=sys.stderr)
+            policy.second_expert_model = second
+    except SingleVendorError as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
         return EXIT_CONFIG
 
     try:
@@ -319,11 +368,12 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     ref = RunRef(target=args.target, run_id=args.run_id)
 
     try:
-        report = (
-            driver.resume_parked(ref, sarif_out=args.sarif_out)
-            if args.resume_parked
-            else driver.run(ref, sarif_out=args.sarif_out)
-        )
+        if args.resume_parked:
+            report = driver.resume_parked(ref, sarif_out=args.sarif_out)
+        elif policy.has_second_pass():
+            report = driver.run_two_pass(ref, sarif_out=args.sarif_out)
+        else:
+            report = driver.run(ref, sarif_out=args.sarif_out)
     except WorkspaceError as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -336,8 +386,21 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     analysis = None
     if args.triage:
         try:
+            # The driver produces the second pass itself; --second-sarif only
+            # overrides it, for a pass produced out of band.
+            second_path = args.second_sarif or (
+                Path(report.second_sarif_path) if report.second_sarif_path else None
+            )
+            extra = {}
+            if second_path and Path(second_path).exists():
+                extra[f"pass-2:{args.second_model or 'second'}"] = Path(second_path)
+            elif second_path:
+                warnings.append(
+                    f"detection: no SARIF at {second_path}; this queue comes "
+                    "from one pass, so every finding is uncorroborated"
+                )
             summary = ingest_run(
-                report, repo=repo, out_dir=run_dir, feeds=args.feeds
+                report, repo=repo, out_dir=run_dir, feeds=args.feeds, extra_sarif=extra
             )
             warnings.extend(summary.warnings)
         except TriageError as exc:
@@ -351,6 +414,13 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         analysis = _run_analysis(args, summary, driver, repo, run_dir, audit_log)
         if analysis is not None:
             warnings.extend(analysis.warnings)
+        signal_report = apply_exposure(
+            summary.queue, load_boundaries(run_dir / "recon-output" / "recon-items.jsonl")
+        )
+        if analysis is not None:
+            apply_chaining(summary.queue, analysis.chains, signal_report)
+        warnings.extend(signal_report.warnings)
+
         # written last, so the worklist reflects lifecycle findings and the
         # adjustments the earlier stages made rather than a pre-enrichment queue
         queue_path, rows, queue_warnings = write_queue(
@@ -365,6 +435,35 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         summary.csv_path = str(queue_path)
         movement = movement_summary(rows)
 
+    governance = review(
+        {item.item_id: item.detail for item in report.candidates},
+        run_id=args.run_id,
+        tier=RiskTier(args.risk_tier),
+        rate=args.sample_rate,
+        shadow_models=list(args.shadow_model),
+        model_of={
+            item.item_id: policy.model_for(Phase.triage) for item in report.candidates
+        },
+    )
+    warnings.extend(governance.warnings)
+    audit_log.record(
+        "governance_reviewed",
+        tier=governance.tier.value,
+        rate=governance.rate,
+        decisions=len(governance.decisions),
+        sampled=len(governance.sampled),
+        shadowed=len(governance.shadowed),
+    )
+    if egress.denied:
+        # A blocked destination is the clearest signal that something tried to
+        # reach somewhere nobody configured, and an unattended run has nobody
+        # watching it happen.
+        warnings.append(
+            f"egress: {len(egress.denied)} call(s) were refused to "
+            f"{', '.join(sorted(set(egress.denied))[:5])}"
+        )
+        audit_log.record("egress_denied", count=len(egress.denied))
+
     if args.siem:
         try:
             path, count = siem_export(
@@ -376,7 +475,9 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
 
     if args.report:
         try:
-            path = write_report(report, args.report, summary, lifecycle_report, analysis)
+            path = write_report(
+                report, args.report, summary, lifecycle_report, analysis, movement
+            )
             print(f"  report    : {path}")
         except OSError as exc:
             warnings.append(f"report: not written ({exc})")
@@ -393,6 +494,12 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             )
             if summary.csv_path:
                 print(f"  csv       : {summary.csv_path}")
+        if governance.sampled or governance.shadowed:
+            print(
+                f"  review    : {len(governance.sampled)} of "
+                f"{len(governance.decisions)} decision(s) flagged for a human "
+                f"({governance.tier.value} tier), {len(governance.shadowed)} shadowed"
+            )
         if movement is not None:
             print(
                 f"  movement  : {movement['increased']} worse, "

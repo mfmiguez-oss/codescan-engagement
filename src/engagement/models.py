@@ -303,6 +303,86 @@ def sampling_for(deployment: str, temperature: float, seed: int | None) -> dict[
     return params
 
 
+#: Vendor per family prefix, for the two-pass rule below. Deliberately coarse:
+#: the question is only "would these two models fail the same way?", and models
+#: from one vendor share training data, tokenizer lineage and refusal behaviour.
+_VENDORS: tuple[tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("gpt-", "openai"),
+    ("o3", "openai"),
+    ("o4", "openai"),
+    ("codex", "openai"),
+    ("mistral", "mistral"),
+    ("codestral", "mistral"),
+    ("llama", "meta"),
+    ("cohere", "cohere"),
+    ("command", "cohere"),
+    ("titan", "amazon"),
+    ("nova", "amazon"),
+    ("gemini", "google"),
+    ("grok", "xai"),
+    ("phi", "microsoft"),
+    ("deepseek", "deepseek"),
+)
+
+
+def vendor_of(deployment: str) -> str:
+    """Which vendor trained this model, as far as the id reveals.
+
+    ``unknown`` when the id says nothing — treated as its own vendor, so two
+    unrecognised aliases are never *assumed* to be independent.
+    """
+    lowered = bare_model_id(deployment)
+    for prefix, vendor in _VENDORS:
+        if lowered.startswith(prefix) or f".{prefix}" in lowered:
+            return vendor
+    return "unknown"
+
+
+class SingleVendorError(RuntimeError):
+    """Two detection passes were configured on one vendor's models."""
+
+
+def check_two_vendor_passes(deployments: list[str], allow_single: bool = False) -> list[str]:
+    """Refuse a second pass that cannot disagree with the first.
+
+    The value of a second pass is *independence*. Two models from one vendor
+    share training data, tokenizer lineage and refusal behaviour, so they miss
+    the same things in the same places — and a second pass that agrees for
+    structural reasons produces a corroboration count that reads like evidence
+    and is not. The whole point of the count is that it means something.
+
+    Returns the warnings a caller should report. Raises when the configuration
+    would produce false corroboration and ``allow_single`` was not set.
+    """
+    named = [d.strip() for d in deployments if d.strip()]
+    if len(named) < 2:
+        return []
+
+    vendors = [vendor_of(d) for d in named]
+    warnings: list[str] = []
+    if "unknown" in vendors:
+        unrecognised = [d for d, v in zip(named, vendors, strict=True) if v == "unknown"]
+        warnings.append(
+            f"detection: vendor could not be determined for {', '.join(unrecognised)}; "
+            "independence between passes is assumed, not verified"
+        )
+    if len(set(vendors)) > 1:
+        return warnings
+
+    message = (
+        f"both detection passes use {vendors[0]} models ({', '.join(named)}). "
+        "Two models from one vendor share training data and refusal behaviour, so "
+        "they miss the same things — the corroboration count would read as "
+        "evidence without being any. Use models from different vendors, or set "
+        "ENGAGEMENT_ALLOW_SINGLE_VENDOR=1 to accept a weaker second pass."
+    )
+    if not allow_single:
+        raise SingleVendorError(message)
+    warnings.append(f"detection: {message}")
+    return warnings
+
+
 class Allocation(StrictModel):
     """One task, the deployment it will use, and what that will cost."""
 

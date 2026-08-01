@@ -38,9 +38,11 @@ class FakeWorkspace:
         self._candidates_per_scenario = candidates_per_scenario
         self.recon_done = recon_done
         self.backlog_done = backlog_done
+        self.backlog_json: str | None = None
         self.finished: dict[str, str] = {}
         self.decisions: dict[str, str] = {}
         self.agent_ids: set[str] = set()
+        self.created_runs: list[str] = []
         self.recon_calls = 0
         self.sarif_written = False
         #: status the next recorded scenario result will report
@@ -102,6 +104,9 @@ class FakeWorkspace:
         return self._prompt("router", str(ref))
 
     def record_backlog(self, ref: RunRef, answer: str) -> None:
+        # Kept verbatim so a test can assert what the recorder actually saw:
+        # a fenced answer reaching here is what broke a live run.
+        self.backlog_json = answer
         data = json.loads(answer)
         if "scenarios" not in data:
             raise WorkspaceError("router answer has no scenarios array")
@@ -181,6 +186,19 @@ class FakeWorkspace:
         decision = self.decision_for.get(candidate_id, "accepted")
         self.decisions[candidate_id] = decision
         return decision
+
+    def create_run(self, source: RunRef, run_id: str) -> RunRef:
+        """A sibling run: the same backlog, nothing finished yet.
+
+        `agent_ids` is deliberately *not* reset — the workspace rejects a
+        repeated id, and that rule must hold across passes too, or a second pass
+        could reuse the first's context and call itself independent.
+        """
+        self.created_runs.append(run_id)
+        self.finished = {}
+        self.decisions = {}
+        self.attempts = {}
+        return RunRef(target=source.target, run_id=run_id)
 
     def emit_sarif(self, ref: RunRef, out: Path | None = None) -> Path:
         self.sarif_written = True

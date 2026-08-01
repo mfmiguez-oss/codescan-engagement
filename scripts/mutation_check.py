@@ -149,6 +149,112 @@ MUTATIONS: list[Mutation] = [
         "        return 0",
         "tests/test_feeds.py::test_a_stale_catalogue_is_detectable",
     ),
+    (
+        # Identity: a fingerprint that stops canonicalising splits one weakness
+        # into several findings and orphans every decision keyed on the old id.
+        "backbone.py",
+        "    label = _LABEL_SEPARATORS.sub(\"_\", raw.upper()).strip(\"_\")\n"
+        "    return _WEAKNESS_SYNONYMS.get(label, label)",
+        "    return raw",
+        "tests/test_backbone_conformance.py"
+        "::test_spelling_variants_of_one_weakness_hash_identically",
+    ),
+    (
+        "backbone.py",
+        '    normalised = path.strip().replace("\\\\", "/").lower()',
+        "    normalised = path",
+        "tests/test_backbone_conformance.py"
+        "::test_path_separator_and_case_do_not_split_a_finding",
+    ),
+    (
+        # The floor is what makes known exploitation outrank a weighted opinion.
+        "backbone.py",
+        "    kev_floor_applied = finding.kev and blended < KEV_FLOOR",
+        "    kev_floor_applied = False",
+        "tests/test_backbone_conformance.py::test_a_kev_finding_cannot_rank_below_the_floor",
+    ),
+    (
+        "backbone.py",
+        "    return sorted(findings, key=lambda f: (-(f.risk_score or 0.0), f.fingerprint))",
+        "    return sorted(findings, key=lambda f: -(f.risk_score or 0.0))",
+        "tests/test_backbone_conformance.py::test_ranking_is_stable_for_equal_scores",
+    ),
+    (
+        # Two same-vendor passes miss the same things, so their agreement is not
+        # evidence — a corroboration count built on it would mislead.
+        "models.py",
+        "    if not allow_single:\n        raise SingleVendorError(message)",
+        "    if False:\n        raise SingleVendorError(message)",
+        "tests/test_two_pass.py::test_two_passes_on_one_vendor_are_refused",
+    ),
+    (
+        "contracts.py",
+        "        return self.lifecycle_adjust + self.exposure_adjust + self.chaining_adjust",
+        "        return self.lifecycle_adjust",
+        "tests/test_signals.py::test_both_adjustments_together_stay_reversible",
+    ),
+    (
+        "signals.py",
+        "        if score >= mapping.by_path.get(item_path, -1.0):",
+        "        if item_path not in mapping.by_path:",
+        "tests/test_signals.py::test_the_most_exposed_boundary_in_a_file_decides",
+    ),
+    (
+        "signals.py",
+        "        delta = min(MAX_CHAIN_ADJUST, count * CHAIN_POINTS)",
+        "        delta = count * CHAIN_POINTS",
+        "tests/test_signals.py::test_the_chaining_adjustment_is_capped",
+    ),
+    (
+        # The network boundary. An allowlist that fails open is not one.
+        "egress.py",
+        "        if self.enforce:\n            raise EgressBlocked(message)",
+        "        if False:\n            raise EgressBlocked(message)",
+        "tests/test_egress.py::test_an_unconfigured_host_is_refused",
+    ),
+    (
+        "egress.py",
+        "        if host and host in self.allowed:\n            return",
+        "        if host:\n            return",
+        "tests/test_egress.py::test_nothing_observed_can_widen_the_allowlist",
+    ),
+    (
+        # Sampling is the only evidence an unattended queue's decisions are any
+        # good; without it there is merely no evidence they are bad.
+        "governance.py",
+        "    return value < rate",
+        "    return False",
+        "tests/test_governance.py::test_selection_is_uniform_at_the_configured_rate",
+    ),
+    (
+        "governance.py",
+        "        is_shadow = bool(model and model in shadow)",
+        "        is_shadow = False",
+        "tests/test_governance.py::test_a_shadowed_models_decisions_do_not_count",
+    ),
+    (
+        # A second pass skipped for budget must not leave a queue that reads as
+        # corroborated. Silence here is the failure mode, not the exception.
+        "driver.py",
+        "        if not self._ledger.can_afford():\n"
+        "            report.warnings.append(\n"
+        '                "detection: the budget was exhausted by the first pass, so the "',
+        "        if False:\n"
+        "            report.warnings.append(\n"
+        '                "detection: the budget was exhausted by the first pass, so the "',
+        "tests/test_two_pass.py"
+        "::test_a_budget_exhausted_by_the_first_pass_reports_no_corroboration",
+    ),
+    (
+        "driver.py",
+        '        second_policy = self._policy.model_copy(\n'
+        '            update={"expert_model": second_model, "second_expert_model": ""}\n'
+        "        )",
+        '        second_policy = self._policy.model_copy(\n'
+        '            update={"second_expert_model": ""}\n'
+        "        )",
+        "tests/test_two_pass.py::test_the_second_pass_uses_the_second_vendors_model",
+    ),
 ]
 
 
