@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# build output pip writes *into* a source tree it installs from
+vendor/**/build/
+vendor/**/*.egg-info/
+.env
+
+# vendor/ is deliberately committed: the image is built from it.
+
+# Runtime artifacts: run workspaces, exports, and anything a scan produced.
+runs/
+reports/
+*.sarif
+*.sarif.json
+state.db

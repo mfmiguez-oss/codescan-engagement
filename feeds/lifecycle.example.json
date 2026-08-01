@@ -1,0 +1,63 @@
+{
+  "source": "endoflife.date + registry metadata",
+  "generated": "2026-08-01",
+  "_comment": [
+    "Package lifecycle feed. Two independent signals, either sufficient:",
+    "  'cycles' — dated release lines, as published by endoflife.date. 'eos' is",
+    "  end of standard support, 'eol' is end of life. A version is matched to the",
+    "  narrowest cycle whose prefix it carries, so 4.2.3 matches cycle '4.2' over",
+    "  cycle '4' when both are listed.",
+    "  'deprecated' — the maintainer marked the package superseded, from npm",
+    "  deprecation metadata, a PyPI yank, or a successor named in the docs. It",
+    "  needs no dates and applies to every version.",
+    "A package absent from this file is reported as 'unknown', never 'supported'."
+  ],
+  "packages": [
+    {
+      "ecosystem": "pypi",
+      "name": "django",
+      "source": "endoflife.date/django",
+      "cycles": [
+        { "cycle": "3.2", "eos": "2023-04-01", "eol": "2024-04-01" },
+        { "cycle": "4.2", "eos": "2025-12-01", "eol": "2026-04-01" },
+        { "cycle": "5.0", "eos": "2025-08-01", "eol": "2025-08-01" },
+        { "cycle": "5.2", "eos": "2027-12-01", "eol": "2028-04-01" }
+      ]
+    },
+    {
+      "ecosystem": "npm",
+      "name": "request",
+      "deprecated": true,
+      "reason": "the package is no longer maintained",
+      "replacement": "got, axios, or the platform fetch",
+      "source": "npm registry deprecation metadata"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "node",
+      "source": "endoflife.date/nodejs",
+      "cycles": [
+        { "cycle": "16", "eos": "2023-09-11", "eol": "2023-09-11" },
+        { "cycle": "18", "eos": "2025-04-30", "eol": "2025-04-30" },
+        { "cycle": "20", "eos": "2026-04-30", "eol": "2026-04-30" },
+        { "cycle": "22", "eos": "2027-04-30", "eol": "2027-04-30" }
+      ]
+    },
+    {
+      "ecosystem": "maven",
+      "name": "log4j",
+      "source": "endoflife.date/log4j",
+      "cycles": [{ "cycle": "1", "eos": "2015-08-05", "eol": "2015-08-05" }]
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "python",
+      "source": "endoflife.date/python",
+      "cycles": [
+        { "cycle": "3.8", "eos": "2024-10-07", "eol": "2024-10-07" },
+        { "cycle": "3.9", "eos": "2025-10-05", "eol": "2025-10-05" },
+        { "cycle": "3.12", "eos": "2028-10-02", "eol": "2028-10-02" }
+      ]
+    }
+  ]
+}

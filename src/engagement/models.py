@@ -1,0 +1,420 @@
+"""Which model does which task, and what that costs.
+
+An unattended run makes every model choice on its own, so the choice has to be
+written down somewhere a human can audit before the bill arrives. This module is
+that place: one table mapping each task to a capability tier, one table of what
+each tier costs, and a projection the CLI prints *before* dispatch.
+
+The allocation follows one rule — **spend on judgement, economise on volume** —
+because the two are anti-correlated across this pipeline:
+
+``router``
+    One call per run, and it decides the entire backlog. A router that misses a
+    routing unit loses every finding that unit would have produced, and no later
+    stage can recover it. Highest tier; the cost is one call.
+``scenarios``
+    One call per scenario — the bulk of the spend *and* the stage that actually
+    finds vulnerabilities. Highest tier, because a cheaper model here does not
+    produce a cheaper run, it produces a run that finds less and costs the same
+    to review.
+``triage``
+    One call per candidate, adjudicating a claim against evidence already
+    gathered. Bounded, mechanical, and checkable — the workspace validates every
+    citation against the checkout regardless. Mid tier.
+``chains``
+    One call per service. Cross-finding reasoning over a small prompt: rare,
+    cheap, and hard. High tier.
+``poc``
+    Batched drafting from findings that are already established. The hard part
+    was the finding; this is writing it up. Lowest tier.
+
+Two things this deliberately does not do. It does not pick a model when none is
+configured — an unattended run that guesses a deployment guesses a bill. And it
+does not silently downgrade: if the configured deployment for a task is unknown
+to the cost table, the projection says so rather than quietly assuming a rate.
+
+**Sampling parameters are a per-family fact, not a global setting.** Recent
+Anthropic models (Opus 4.7 and later, Opus 5, Sonnet 5, Fable 5) removed
+``temperature``/``top_p``/``top_k`` entirely and reject them with a 400 — so the
+determinism lever that works on one deployment is a hard failure on another.
+:data:`SAMPLING_SUPPORT` records which families accept them, and
+:func:`sampling_for` returns what may actually be sent.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from enum import Enum
+
+from pydantic import Field
+
+from .contracts import StrictModel
+
+
+class Tier(str, Enum):
+    """Capability tier a task needs, independent of any vendor's naming."""
+
+    frontier = "frontier"  # hardest judgement; few calls
+    high = "high"
+    mid = "mid"
+    economy = "economy"  # mechanical, high volume
+
+
+class Task(str, Enum):
+    """Every stage that spends money."""
+
+    router = "router"
+    scenarios = "scenarios"
+    triage = "triage"
+    chains = "chains"
+    poc = "poc"
+
+
+class TaskProfile(StrictModel):
+    """Why a task sits where it does — the audit trail for the allocation."""
+
+    task: Task
+    tier: Tier
+    #: How the call count grows. Recorded because tier alone does not say
+    #: whether a choice is cheap: one frontier call is cheaper than a hundred
+    #: economy ones.
+    volume: str
+    rationale: str
+
+
+#: The allocation. Ordered by the pipeline's own sequence.
+PROFILES: dict[Task, TaskProfile] = {
+    Task.router: TaskProfile(
+        task=Task.router,
+        tier=Tier.frontier,
+        volume="1 per run",
+        rationale=(
+            "Decides the whole backlog. A missed routing unit loses every finding "
+            "it would have produced, and no later stage can recover it — but it "
+            "costs exactly one call, so the strongest model is also the cheapest "
+            "insurance in the pipeline."
+        ),
+    ),
+    Task.scenarios: TaskProfile(
+        task=Task.scenarios,
+        tier=Tier.frontier,
+        volume="1 per scenario (the bulk of the run)",
+        rationale=(
+            "The stage that actually finds vulnerabilities. Economising here does "
+            "not produce a cheaper run — it produces a run that finds less and "
+            "costs the same to review."
+        ),
+    ),
+    Task.triage: TaskProfile(
+        task=Task.triage,
+        tier=Tier.mid,
+        volume="1 per candidate",
+        rationale=(
+            "Adjudicates a claim against evidence already gathered, and the "
+            "workspace re-validates every citation against the checkout whatever "
+            "the model says. Bounded and checkable, so a mid tier holds."
+        ),
+    ),
+    Task.chains: TaskProfile(
+        task=Task.chains,
+        tier=Tier.high,
+        volume="1 per service",
+        rationale=(
+            "Cross-finding reasoning over a short prompt: rare, cheap per call, "
+            "and genuinely hard. High tier costs almost nothing at this volume."
+        ),
+    ),
+    Task.poc: TaskProfile(
+        task=Task.poc,
+        tier=Tier.economy,
+        volume="1 per 10 findings, top 40 only",
+        rationale=(
+            "Drafting a procedure for a finding that is already established. The "
+            "hard part was finding it; this is writing it up, and it is advisory "
+            "output that a human reviews before acting on."
+        ),
+    ),
+}
+
+
+class ModelSpec(StrictModel):
+    """What a deployment costs and what it will accept.
+
+    Rates are US dollars per million tokens, as published for the Anthropic API
+    — which is also what Microsoft Foundry bills at, through the Marketplace.
+    Amazon Bedrock is partner-operated and priced separately, so a Bedrock run
+    projects with these rates only as an approximation, and says so.
+    """
+
+    #: Deployment or model id as it is written in configuration.
+    id: str
+    family: str
+    tier: Tier
+    input_per_mtok: float
+    output_per_mtok: float
+    #: False when the API rejects temperature/top_p/top_k outright.
+    accepts_sampling: bool = True
+    note: str = ""
+
+
+#: Published rates, current as of 2026-08-01. A deployment absent from this
+#: table still runs — the projection reports it as unpriced rather than
+#: inventing a number, because a fabricated cost estimate is worse than none.
+CATALOGUE: dict[str, ModelSpec] = {
+    spec.id: spec
+    for spec in (
+        ModelSpec(
+            id="claude-fable-5",
+            family="claude",
+            tier=Tier.frontier,
+            input_per_mtok=10.0,
+            output_per_mtok=50.0,
+            accepts_sampling=False,
+            note="thinking always on; sampling parameters removed (400 if sent)",
+        ),
+        ModelSpec(
+            id="claude-opus-5",
+            family="claude",
+            tier=Tier.frontier,
+            input_per_mtok=5.0,
+            output_per_mtok=25.0,
+            accepts_sampling=False,
+            note="sampling parameters removed (400 if sent)",
+        ),
+        ModelSpec(
+            id="claude-opus-4-8",
+            family="claude",
+            tier=Tier.frontier,
+            input_per_mtok=5.0,
+            output_per_mtok=25.0,
+            accepts_sampling=False,
+        ),
+        ModelSpec(
+            id="claude-opus-4-7",
+            family="claude",
+            tier=Tier.high,
+            input_per_mtok=5.0,
+            output_per_mtok=25.0,
+            accepts_sampling=False,
+        ),
+        ModelSpec(
+            id="claude-sonnet-5",
+            family="claude",
+            tier=Tier.high,
+            input_per_mtok=3.0,
+            output_per_mtok=15.0,
+            accepts_sampling=False,
+            note="non-default sampling values rejected",
+        ),
+        ModelSpec(
+            id="claude-sonnet-4-6",
+            family="claude",
+            tier=Tier.high,
+            input_per_mtok=3.0,
+            output_per_mtok=15.0,
+        ),
+        ModelSpec(
+            id="claude-haiku-4-5",
+            family="claude",
+            tier=Tier.economy,
+            input_per_mtok=1.0,
+            output_per_mtok=5.0,
+            note="accepts sampling parameters; 200K context",
+        ),
+    )
+}
+
+
+#: Families whose recent generations reject sampling parameters outright.
+#: Matched as a prefix against the deployment id, lowercased.
+_SAMPLING_REMOVED: tuple[str, ...] = (
+    "claude-fable",
+    "claude-mythos",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-5",
+)
+
+#: Families that accept a seed for reproducible sampling.
+_SEED_SUPPORTED: tuple[str, ...] = ("gpt-", "o3", "o4")
+
+
+def spec_for(deployment: str) -> ModelSpec | None:
+    """The catalogue entry for a deployment, if it has one."""
+    return CATALOGUE.get(deployment.strip())
+
+
+#: Vendor and geo prefixes a platform prepends to a model id. Bedrock writes
+#: ``anthropic.claude-opus-5`` and cross-region profiles add ``us.``/``eu.``, so
+#: a match against the bare family name never fires unless these come off first.
+#: This was a live defect: the Bedrock path sent temperature to a model that
+#: rejects it, which is a 400 on the whole call rather than a degraded answer.
+_ID_PREFIXES: tuple[str, ...] = ("us.", "eu.", "apac.", "anthropic.")
+
+
+def bare_model_id(deployment: str) -> str:
+    """Strip platform routing prefixes down to the family-bearing id."""
+    lowered = deployment.strip().lower()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _ID_PREFIXES:
+            if lowered.startswith(prefix):
+                lowered = lowered[len(prefix) :]
+                changed = True
+    return lowered
+
+
+def accepts_sampling(deployment: str) -> bool:
+    """Whether this deployment will accept temperature/top_p at all.
+
+    Prefix-matched rather than table-only, because a deployment alias is chosen
+    by whoever configured the resource and will not always match a catalogue id.
+    Defaulting to *not* sending on a recognised family is the safe direction: a
+    missing temperature costs a little determinism, while sending one to a model
+    that removed it fails the whole call.
+    """
+    lowered = bare_model_id(deployment)
+    if any(lowered.startswith(prefix) for prefix in _SAMPLING_REMOVED):
+        return False
+    spec = spec_for(lowered) or spec_for(deployment)
+    return spec.accepts_sampling if spec else True
+
+
+def accepts_seed(deployment: str) -> bool:
+    """Whether a seed may be sent — an OpenAI-surface parameter only."""
+    lowered = bare_model_id(deployment)
+    return any(prefix in lowered for prefix in _SEED_SUPPORTED)
+
+
+def sampling_for(deployment: str, temperature: float, seed: int | None) -> dict[str, object]:
+    """The determinism parameters this deployment will actually accept.
+
+    Returns an empty mapping for families that removed them. The caller sends
+    exactly what comes back, so a family that gained or lost support is one edit
+    here rather than a change at every dispatch site.
+    """
+    if not accepts_sampling(deployment):
+        return {}
+    params: dict[str, object] = {"temperature": temperature}
+    if seed is not None and accepts_seed(deployment):
+        params["seed"] = seed
+    return params
+
+
+class Allocation(StrictModel):
+    """One task, the deployment it will use, and what that will cost."""
+
+    task: Task
+    tier: Tier
+    deployment: str
+    projected_calls: int = 0
+    input_per_mtok: float | None = None
+    output_per_mtok: float | None = None
+    priced: bool = False
+
+    def projected_cost(self, input_tokens: int, output_tokens: int) -> float | None:
+        """Dollars for a projected token spend, or ``None`` when unpriced."""
+        if not self.priced or self.input_per_mtok is None or self.output_per_mtok is None:
+            return None
+        return (
+            input_tokens / 1_000_000 * self.input_per_mtok
+            + output_tokens / 1_000_000 * self.output_per_mtok
+        )
+
+
+class Plan(StrictModel):
+    """The whole run's model allocation, printable before a call is made."""
+
+    allocations: list[Allocation] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    def unpriced(self) -> list[str]:
+        return sorted({a.deployment for a in self.allocations if not a.priced})
+
+
+def build_plan(
+    deployments: Mapping[str, str],
+    scenarios: int = 0,
+    candidates: int = 0,
+    services: int = 1,
+    findings: int = 0,
+    poc_batch: int = 10,
+    max_poc: int = 40,
+) -> Plan:
+    """Project each task's model and call count before anything is dispatched.
+
+    The call-count model mirrors the stages exactly: one router call, one per
+    scenario, one per candidate, one per service for chains, and one per batch
+    of PoC drafts up to the cap. Getting this wrong in the optimistic direction
+    would be the worst kind of error — a budget that looks affordable until the
+    run is already halfway through it.
+    """
+    plan = Plan()
+    counts = {
+        Task.router: 1 if scenarios or candidates else 0,
+        Task.scenarios: max(0, scenarios),
+        Task.triage: max(0, candidates),
+        Task.chains: max(0, services),
+        Task.poc: -(-min(max(0, findings), max_poc) // poc_batch) if findings else 0,
+    }
+
+    for task, profile in PROFILES.items():
+        deployment = (deployments.get(task.value) or "").strip()
+        if not deployment:
+            plan.warnings.append(
+                f"model: no deployment set for {task.value}; that stage will not run"
+            )
+            continue
+        spec = spec_for(deployment)
+        allocation = Allocation(
+            task=task,
+            tier=profile.tier,
+            deployment=deployment,
+            projected_calls=counts[task],
+            priced=spec is not None,
+            input_per_mtok=spec.input_per_mtok if spec else None,
+            output_per_mtok=spec.output_per_mtok if spec else None,
+        )
+        plan.allocations.append(allocation)
+        if spec is not None and spec.tier is not profile.tier:
+            plan.warnings.append(
+                f"model: {task.value} wants the {profile.tier.value} tier but "
+                f"{deployment} is {spec.tier.value} — {profile.rationale.split('.')[0]}."
+            )
+
+    if plan.unpriced():
+        plan.warnings.append(
+            "cost: no published rate for "
+            f"{', '.join(plan.unpriced())} — the projection below omits them "
+            "rather than guessing a rate"
+        )
+    return plan
+
+
+def render_plan(plan: Plan, avg_input_tokens: int = 6000, avg_output_tokens: int = 1200) -> str:
+    """The plan as a table an operator reads before authorising the run."""
+    lines = [
+        f"{'task':<11}{'tier':<10}{'deployment':<24}{'calls':>7}{'est. $':>10}",
+        "-" * 62,
+    ]
+    total = 0.0
+    any_priced = False
+    for allocation in plan.allocations:
+        cost = allocation.projected_cost(
+            avg_input_tokens * allocation.projected_calls,
+            avg_output_tokens * allocation.projected_calls,
+        )
+        if cost is not None:
+            total += cost
+            any_priced = True
+        rendered = f"{cost:>10.2f}" if cost is not None else f"{'unpriced':>10}"
+        lines.append(
+            f"{allocation.task.value:<11}{allocation.tier.value:<10}"
+            f"{allocation.deployment[:23]:<24}{allocation.projected_calls:>7}{rendered}"
+        )
+    if any_priced:
+        lines.append("-" * 62)
+        lines.append(f"{'projected':<52}{total:>10.2f}")
+    return "\n".join(lines)
