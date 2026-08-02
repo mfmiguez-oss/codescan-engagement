@@ -30,7 +30,7 @@
     "src/openhack/__main__.py": "c2ee4ddb093c9af060cafaf68219907f8a6b7b301ed3f8bea75db7555adec987",
     "src/openhack/backlog.py": "a0b22f74c98fbce41c690353b3d4ac5c058497e59800885c0dc5baef2ee08bee",
     "src/openhack/cli.py": "782aa450f88eb06d166b0702d4d069cdcbc941de1b7a7148a665e3d55e7335a7",
-    "src/openhack/coverage.py": "5eddeba0a067e51b418070b5d935645bc13fa463574686510e91a9506da42af8",
+    "src/openhack/coverage.py": "72c7076935a8000fb26fccfea16c9c8506e6783be3edc155ac28eb6da1da2258",
     "src/openhack/expert_scope.py": "4bbe1ced752e00c3464022f71eeaf40619271c4ce44e47bdb217eb19478e3af2",
     "src/openhack/inventory.py": "81e39102ad746430b0af555e43e8047a37ac267c1d83608130796ed42f178108",
     "src/openhack/inventory_patterns.py": "2d613ca34fde728537b9c47dba90025de5512f15a5e90fc0c05360831be1bcdf",
@@ -59,13 +59,18 @@
     "templates/scenario-result.json": "786cd4d1091a0ed096f200deadc9366298983dd8cc91725fe50f34ab7212dd53",
     "templates/scenario-router-prompt.md": "0877648625a68f61ee3b815529614ab7dce9626967b99583e482ec194c79c399"
   },
-  "source_commit": "86831ead1cadde2e9e186261741790170e3b54c2",
+  "source_commit": "9a1f836ce54c5c55b13277d68b0b18c629b534a7",
+  "source_dirty": [
+    "src/openhack/coverage.py"
+  ],
   "source_repo": "OpenHack",
+  "source_url": "https://github.com/mfmiguez-oss/OpenHack-main.git",
   "trees": [
     "src/openhack",
     "agents",
     "templates",
     "config"
   ],
-  "vendored_at": "2026-07-31T23:00:06.969967+00:00"
+  "upstream_origin": "https://github.com/hadriansecurity/openhack",
+  "vendored_at": "2026-08-02T06:00:24.997382+00:00"
 }

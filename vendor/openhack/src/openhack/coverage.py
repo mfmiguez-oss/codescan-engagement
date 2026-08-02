@@ -34,7 +34,23 @@ MANIFESTS = {
     "composer.json", "composer.lock", "package.json", "package-lock.json",
     "pnpm-lock.yaml", "requirements.txt", "yarn.lock",
 }
-PRODUCTIVE_CLASSES = {"client", "config", "manifest", "runtime", "script", "template"}
+#: Server-side source files. Every one of these previously fell through to
+#: "other" and was scored as "not a runtime attack surface", so a repository
+#: written in any of these languages had its *entire source tree* excluded from
+#: routing while recon happily indexed it — a run that completes cleanly,
+#: reports full coverage, and reviews only configuration and vendored assets.
+#:
+#: `.php` is absent because it already has its own `runtime` branch below, and
+#: `.js`/`.ts` because a `.js` suffix is classified `client` regardless of where
+#: it sits; reclassifying those is a separate judgement about front-end code and
+#: is not made here.
+SOURCE_SUFFIXES = {
+    ".py", ".rb", ".go", ".java", ".kt", ".kts", ".scala", ".cs", ".rs",
+    ".ex", ".exs", ".pl", ".pm",
+}
+PRODUCTIVE_CLASSES = {
+    "client", "config", "manifest", "runtime", "script", "source", "template",
+}
 REQUEST_BOUNDARY_KIND = "request_boundaries"
 SUGGESTION_LIMIT = 500
 MAX_REQUIREMENTS_PER_PATH = 4
@@ -174,6 +190,12 @@ def _path_class(path: str) -> str:
         return "script"
     if suffix == ".php" or low.startswith(("app/bundles/", "plugins/", "app/config/")):
         return "runtime"
+    # Last of the productive branches on purpose. Everything that excludes a
+    # path — tests, fixtures, docs, vendored assets, CI — is decided above, so
+    # a `tests/foo.py` is still `test` and only source that survived those
+    # checks reaches here.
+    if suffix in SOURCE_SUFFIXES:
+        return "source"
     return "other"
 
 

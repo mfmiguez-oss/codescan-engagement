@@ -111,6 +111,7 @@ test that exists.
 | R89 | A run id from a query string reads a `queue.json` outside the workspace | the resolved path is checked against the workspace root before it is used | mitigated | test_a_run_id_cannot_escape_the_workspace |
 | R90 | A bulk state change is refused halfway, leaving the caller unable to say which half happened | authorized once before anything is written, and reported per finding | mitigated | test_a_bulk_change_is_authorized_once_before_anything_is_written |
 | R91 | One bulk request becomes ten thousand writes | the fingerprint list is bounded and over-long requests are refused | mitigated | test_a_bulk_request_is_bounded |
+| R92 | The vendored mirror claims a commit it was not built from, because it was vendored from a dirty checkout | the manifest records every uncommitted source path and the script warns that the pin will not reproduce | mitigated | test_the_manifest_records_whether_the_source_was_dirty |
 
 ## Threat models per output
 

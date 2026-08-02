@@ -123,6 +123,27 @@ def test_the_mirror_contains_nothing_the_manifest_does_not_track() -> None:
     )
 
 
+def test_the_manifest_records_whether_the_source_was_dirty() -> None:
+    """The mirror must never claim a provenance it does not have.
+
+    `vendor_openhack.py` copies the **working tree** while recording `git HEAD`
+    as the source commit, so vendoring from a dirty checkout produces a
+    manifest naming a commit that does not contain what was vendored. The
+    in-place guard still passes — it compares against the hashes recorded here
+    — so nothing fails and the mirror silently stops being reproducible.
+
+    An empty list is the honest answer for a clean checkout; the field being
+    *absent* means it was vendored before anyone thought to record it.
+    """
+    manifest = _manifest()
+    assert "source_dirty" in manifest, (
+        "the manifest does not record whether the source tree was clean, so "
+        "`source_commit` cannot be trusted to reproduce it — re-run "
+        "scripts/vendor_openhack.py"
+    )
+    assert isinstance(manifest["source_dirty"], list)
+
+
 @pytest.mark.skipif(
     not (UPSTREAM / "src" / "openhack").is_dir(),
     reason="upstream OpenHack checkout not present alongside this repo",
