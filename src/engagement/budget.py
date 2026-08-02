@@ -17,7 +17,9 @@ limit.
 
 from __future__ import annotations
 
-from pydantic import Field
+from threading import Lock
+
+from pydantic import Field, PrivateAttr
 
 from .contracts import StrictModel
 
@@ -61,33 +63,68 @@ class Ledger(StrictModel):
     input_tokens: int = 0
     output_tokens: int = 0
 
+    #: Guards every read-modify-write below. Dispatch can run concurrently, and
+    #: a ceiling that is only enforced under one thread is not a ceiling.
+    _lock: Lock = PrivateAttr(default_factory=Lock)
+
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def check(self, cost: int = 1) -> None:
-        """Refuse now if the next ``cost`` calls would breach either ceiling."""
+    def _breach(self, cost: int) -> str:
+        """Which ceiling ``cost`` more calls would cross, if either."""
         if self.calls + cost > self.budget.max_calls:
-            raise BudgetExceeded(
-                f"call ceiling reached ({self.budget.max_calls}); refusing before dispatch"
-            )
+            return f"call ceiling reached ({self.budget.max_calls}); refusing before dispatch"
         if self.total_tokens >= self.budget.max_total_tokens:
-            raise BudgetExceeded(
+            return (
                 f"token ceiling reached ({self.budget.max_total_tokens}); "
                 "refusing before dispatch"
             )
+        return ""
 
-    def record(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
-        self.calls += 1
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
+    def check(self, cost: int = 1) -> None:
+        """Refuse now if the next ``cost`` calls would breach either ceiling."""
+        with self._lock:
+            breach = self._breach(cost)
+        if breach:
+            raise BudgetExceeded(breach)
+
+    def reserve(self, cost: int = 1) -> None:
+        """Claim ``cost`` calls against the ceiling, atomically.
+
+        Separate from :meth:`record_usage` because checking and then counting
+        are two operations, and concurrent dispatch can slip between them: two
+        callers both pass a check at one call below the ceiling, and both
+        dispatch. Counting at claim time is what keeps a ceiling a ceiling.
+        """
+        with self._lock:
+            breach = self._breach(cost)
+            if not breach:
+                self.calls += cost
+        if breach:
+            raise BudgetExceeded(breach)
+
+    def release(self, cost: int = 1) -> None:
+        """Hand back a reservation whose dispatch never happened.
+
+        A call that failed before the model produced anything is not spend, and
+        counting it would let a run of transient failures exhaust a budget that
+        was never used.
+        """
+        with self._lock:
+            self.calls = max(0, self.calls - cost)
+
+    def record_usage(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        """Add the tokens one dispatch actually reported. The call itself was
+        already counted by :meth:`reserve`."""
+        with self._lock:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
 
     def remaining_calls(self) -> int:
-        return self.budget.affordable(self.calls)
+        with self._lock:
+            return self.budget.affordable(self.calls)
 
     def can_afford(self, cost: int = 1) -> bool:
-        try:
-            self.check(cost)
-        except BudgetExceeded:
-            return False
-        return True
+        with self._lock:
+            return not self._breach(cost)

@@ -110,6 +110,32 @@ flowchart TD
 Deterministic phases are free; only three phases spend. That is why the budget
 governor only ever gates those three.
 
+## Wall clock, and the two things that set it
+
+Dispatch streams, so a call's duration is essentially its *output* length ÷ the
+model's generation rate — a live run measured ~137 output tokens/second. Input
+barely registers once it is served from cache. Wall clock for a phase is
+therefore the output it generates, divided by how many calls run at once.
+
+Both terms have a lever, and they fail in opposite directions:
+
+- **Shorter answers.** `--effort` is the cheapest lever on spend and time at
+  once, because it acts on the one quantity both are made of. It is gated per
+  family (`models.effort_for`) as an **allowlist**: Haiku 4.5 and Sonnet 4.5
+  reject the parameter outright, and a 400 on every call is a worse outcome than
+  a forgone saving.
+- **More calls at once.** The scenario phase is one call per scenario and
+  hundreds of them, all independent, so `--scenario-concurrency` is where the
+  wall clock actually is. It defaults to **1**, because raising it is a decision
+  about the resource's per-minute quota rather than a free speedup — see the
+  rate-limit note under the router below. Concurrency also warms before it fans
+  out, and holds a lock over the workspace, for reasons given there.
+
+The ledger reserves a call slot *atomically* before dispatch and hands it back
+if the dispatch never happened, so a ceiling stays a ceiling with several
+workers racing it; a check followed by a later increment would let two callers
+past one remaining slot.
+
 ## The budget gate, and why it sits exactly there
 
 OpenHack's cost model is unusually well behaved:
@@ -156,6 +182,20 @@ rather than of length. Chat completions additionally needs
 `stream_options.include_usage`, without which a streamed call reports no usage
 and a run that spent money meters as free. (The Bedrock path still uses
 `converse` and is not streamed — the same hazard is latent there.)
+
+**Retryable statuses are retried, and chunking has a rate-limit cost.** A 429 or
+5xx arrives *before* the model generates, so nothing is billed and asking again
+costs only time; dispatch now honours `Retry-After` when the resource sends one
+and backs off with jitter otherwise, giving up after five attempts with a
+message naming the cause rather than a bare HTTP error.
+
+Chunking makes that path load-bearing, because it trades rate-limit budget for
+output-ceiling headroom. The invariant prefix is *cached*, so 51 calls cost
+roughly 1.4× one call's input in money — but each call still **sends** ~170K
+input tokens, so the same 51 calls consume ~51× the input against a per-minute
+quota. A live run measured ~156K input tokens/minute and was throttled 12
+minutes in. Caching saves money, not quota. Anything that raises calls-per-minute
+— concurrency above all — has to be sized against that, not against cost.
 
 **Chunk answers are durable, and the router resumes.** Splitting the phase into
 dozens of calls creates a failure mode the single call never had: the longer it

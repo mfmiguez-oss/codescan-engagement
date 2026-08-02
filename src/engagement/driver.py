@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from pydantic import Field
@@ -142,6 +144,18 @@ class Policy(StrictModel):
     #: ``ModelRequest`` is sized for the phases that return a single verdict; a
     #: router chunk returns a document and needs materially more room.
     router_max_output_tokens: int = 16384
+    #: Scenarios dispatched at once. The scenario phase is one call per scenario
+    #: and hundreds of them, all independent, so wall clock is otherwise just
+    #: their generation summed. **One by default** — raising it is a decision
+    #: about the resource's per-minute quota, not a free speedup: a live run was
+    #: throttled at ~156K input tokens/minute *sequentially*, and a cached
+    #: prefix still counts against that quota even though it is nearly free in
+    #: money. Measure the resource's limit before raising this.
+    scenario_concurrency: int = 1
+    #: Effort level for phases that accept one. Empty means send nothing.
+    #: Ignored for families that reject the parameter — Haiku 4.5 among them —
+    #: see :func:`engagement.models.effort_for`.
+    effort: str = ""
     #: Emit SARIF at the end of a run.
     emit_sarif: bool = True
     #: Deployment for a second, independent detection pass. Must be a different
@@ -345,6 +359,10 @@ class Driver:
         self._dispatcher = Dispatcher(provider, self._ledger, self._audit)
         self._parked: list[ParkedScenario] = []
         self._redactions = 0
+        #: Serialises workspace access. The workspace is a CLI over one run
+        #: directory; concurrent scenarios would otherwise run two `openhack`
+        #: processes that interleave appends to its shared state and trace.
+        self._workspace_lock = Lock()
 
     @property
     def ledger(self) -> Ledger:
@@ -385,6 +403,7 @@ class Driver:
             prompt=prompt,
             cache_prefix=cache_prefix,
             max_output_tokens=max_output_tokens,
+            effort=self._policy.effort,
         )
         self._redactions = self._dispatcher.redactions
         return answer
@@ -548,7 +567,14 @@ class Driver:
         return best
 
     def _do_scenario(self, ref: RunRef, scenario: ScenarioRef) -> WorkOutcome:
-        prompt = self._workspace.render_scenario_prompt(ref, scenario.scenario_id)
+        # Every workspace call in this method and its expansion helpers is
+        # serialised by `_workspace_lock`. Scenarios can run concurrently, and
+        # the workspace is a CLI: two `openhack` processes against one run would
+        # interleave their appends to the shared trace and state files. The lock
+        # costs nothing worth measuring — the workspace calls are local and
+        # sub-second, while the model call outside it takes a minute.
+        with self._workspace_lock:
+            prompt = self._workspace.render_scenario_prompt(ref, scenario.scenario_id)
         # The expert manifest is hoisted ahead of the scenario and cached. Only
         # the manifest moves: it is reference material the renderer appends
         # last and nothing refers to it by position, whereas the instruction
@@ -574,9 +600,10 @@ class Driver:
                         "scenario_prompt_sha256": prompt.digest,
                     },
                 )
-                outcome = self._workspace.record_scenario_result(
-                    ref, scenario.scenario_id, stamped
-                )
+                with self._workspace_lock:
+                    outcome = self._workspace.record_scenario_result(
+                        ref, scenario.scenario_id, stamped
+                    )
             except BudgetExceeded:
                 raise
             except WorkspaceError as exc:
@@ -682,9 +709,10 @@ class Driver:
                     ).hexdigest(),
                 },
             )
-            second = self._workspace.record_scenario_result(
-                ref, scenario.scenario_id, stamped
-            )
+            with self._workspace_lock:
+                second = self._workspace.record_scenario_result(
+                    ref, scenario.scenario_id, stamped
+                )
         except BudgetExceeded:
             parked.reason = "needs_context (budget exhausted during expansion)"
             return self._park(ref, scenario, parked)
@@ -716,7 +744,8 @@ class Driver:
                 # excluded are reported rather than forgotten
                 unresolved.append(path)
                 continue
-            content = self._workspace.read_source(ref, path)
+            with self._workspace_lock:
+                content = self._workspace.read_source(ref, path)
             if content is None:
                 unresolved.append(path)
                 continue
@@ -966,21 +995,106 @@ class Driver:
             return False
         pending.sort(key=lambda item: PRIORITY_RANK[item.priority])
 
+        workers = max(1, self._policy.scenario_concurrency)
+        if workers == 1:
+            return self._drain_in_series(ref, report, seen, pending)
+        return self._drain_in_parallel(ref, report, seen, pending, workers)
+
+    def _unfunded_tail(
+        self, report: RunReport, tail: list[ScenarioRef]
+    ) -> None:
+        """Account for scenarios the budget never reached."""
+        self._record_unfunded(
+            report.scenarios,
+            [item.scenario_id for item in tail],
+            "budget exhausted before this scenario was dispatched",
+        )
+        report.warnings.append(
+            f"budget: {len(tail)} scenario(s) were never dispatched "
+            "and are NOT known to be clean"
+        )
+
+    def _drain_in_series(
+        self,
+        ref: RunRef,
+        report: RunReport,
+        seen: set[str],
+        pending: list[ScenarioRef],
+    ) -> bool:
         progressed = False
         for index, scenario in enumerate(pending):
             if not self._ledger.can_afford():
-                self._record_unfunded(
-                    report.scenarios, [item.scenario_id for item in pending[index:]],
-                    "budget exhausted before this scenario was dispatched",
-                )
-                report.warnings.append(
-                    f"budget: {len(pending) - index} scenario(s) were never dispatched "
-                    "and are NOT known to be clean"
-                )
+                self._unfunded_tail(report, pending[index:])
                 return False
             seen.add(scenario.scenario_id)
             report.scenarios.append(self._do_scenario(ref, scenario))
             progressed = True
+        return progressed
+
+    def _drain_in_parallel(
+        self,
+        ref: RunRef,
+        report: RunReport,
+        seen: set[str],
+        pending: list[ScenarioRef],
+        workers: int,
+    ) -> bool:
+        """Dispatch independent scenarios at once, warming the cache first.
+
+        One scenario per expert goes out in series before the rest fan out. The
+        expert manifest is the cached prefix, and a cache entry only becomes
+        readable once the response that wrote it has begun — so fanning out
+        cold means every worker misses at once and each pays the write premium
+        instead of one paying it and the rest reading. Warming costs one serial
+        call per distinct expert and saves that premium on every scenario after.
+        """
+        warm: list[ScenarioRef] = []
+        rest: list[ScenarioRef] = []
+        primed: set[str] = set()
+        for scenario in pending:
+            if scenario.expert in primed:
+                rest.append(scenario)
+            else:
+                primed.add(scenario.expert)
+                warm.append(scenario)
+
+        outcomes: dict[str, WorkOutcome] = {}
+        progressed = False
+        for index, scenario in enumerate(warm):
+            if not self._ledger.can_afford():
+                self._unfunded_tail(report, warm[index:] + rest)
+                report.scenarios.sort(key=lambda item: item.item_id)
+                return False
+            seen.add(scenario.scenario_id)
+            outcomes[scenario.scenario_id] = self._do_scenario(ref, scenario)
+            progressed = True
+
+        # Submitted, not chunked: the ledger reserves atomically, so workers
+        # that lose the race for the last slots raise BudgetExceeded and are
+        # recorded as unfunded rather than silently dropped.
+        starved: list[ScenarioRef] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for index, scenario in enumerate(rest):
+                if not self._ledger.can_afford():
+                    starved = rest[index:]
+                    break
+                seen.add(scenario.scenario_id)
+                futures[pool.submit(self._do_scenario, ref, scenario)] = scenario
+            for future, scenario in futures.items():
+                try:
+                    outcomes[scenario.scenario_id] = future.result()
+                    progressed = True
+                except BudgetExceeded:
+                    starved.append(scenario)
+
+        for scenario in pending:
+            outcome = outcomes.get(scenario.scenario_id)
+            if outcome is not None:
+                report.scenarios.append(outcome)
+        if starved:
+            self._unfunded_tail(report, starved)
+            return False
         return progressed
 
     def _drain_candidates(

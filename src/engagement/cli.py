@@ -33,7 +33,14 @@ from .feeds import CISA_KEV_URL, FeedError, fetch_kev, load_snyk, write_kev
 from .governance import RiskTier, review
 from .identity import Action, Role, Unauthorized, authorize, machine, operator
 from .lifecycle import LifecycleError, LifecycleReport, assess, load_feed
-from .models import SingleVendorError, Task, build_plan, check_two_vendor_passes, render_plan
+from .models import (
+    EFFORT_LEVELS,
+    SingleVendorError,
+    Task,
+    build_plan,
+    check_two_vendor_passes,
+    render_plan,
+)
 from .preflight import PreflightReport, deployments_for
 from .preflight import check as preflight_check
 from .providers import ModelProvider, ProviderError, build_provider
@@ -104,6 +111,26 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=Policy().router_max_output_tokens,
         help="Output ceiling for one router call (default sized for a chunk).",
+    )
+    run.add_argument(
+        "--scenario-concurrency",
+        type=int,
+        default=Policy().scenario_concurrency,
+        help=(
+            "Scenarios dispatched at once. Default 1. Raising it is a decision "
+            "about the resource's per-minute quota, not a free speedup: a "
+            "cached prompt prefix still counts against that quota."
+        ),
+    )
+    run.add_argument(
+        "--effort",
+        default="",
+        choices=["", *sorted(EFFORT_LEVELS)],
+        help=(
+            "Effort level, the cheapest lever on both spend and wall clock. "
+            "Silently omitted for families that reject it (Haiku 4.5, "
+            "Sonnet 4.5), where sending it would fail the call."
+        ),
     )
     run.add_argument("--no-sarif", action="store_true")
     run.add_argument("--sarif-out", type=Path)
@@ -786,6 +813,8 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         max_retries=args.max_retries,
         router_chunk_units=args.router_chunk_units,
         router_max_output_tokens=args.router_max_output_tokens,
+        scenario_concurrency=args.scenario_concurrency,
+        effort=args.effort,
         emit_sarif=not args.no_sarif,
     )
     if not policy.has_model():

@@ -175,7 +175,7 @@ def test_a_service_unreachable_on_budget_is_reported_not_skipped() -> None:
     findings = [_finding("a"), _finding("b")]
     summary = AnalysisSummary()
     spent = Ledger(budget=Budget(max_calls=1))
-    spent.record()
+    spent.reserve()
     dispatcher = Dispatcher(FakeProvider(), spent, AuditLog(MemorySink()))
 
     assert ChainEngine(dispatcher, "m").find(findings, summary) == []

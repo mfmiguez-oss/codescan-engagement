@@ -15,6 +15,8 @@ actually differs per cloud — be asserted offline in the gate.
 from __future__ import annotations
 
 import json
+import random
+import time
 from collections.abc import Iterator, Mapping
 from typing import Any, Protocol, runtime_checkable
 
@@ -22,7 +24,7 @@ from pydantic import Field
 
 from .contracts import StrictModel
 from .egress import EgressPolicy
-from .models import sampling_for
+from .models import effort_for, sampling_for
 
 PROVIDERS = ("foundry", "bedrock")
 
@@ -45,6 +47,42 @@ class ProviderTimeout(RuntimeError):
     stream is billed by the vendor and invisible here. Callers that meter spend
     need to be able to tell it apart from a refusal or a bad request.
     """
+
+
+#: Statuses worth asking again on. All of them are refusals to *start*, so the
+#: model generated nothing and a retry costs only time. A 4xx that is not here
+#: means the request itself is wrong and asking again would be a loop.
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+
+#: Total attempts, not extra ones. Five spans roughly a minute of backoff, which
+#: is the right order for a per-minute token quota: a long unattended phase
+#: should ride out a throttle rather than discard the run over it.
+RETRY_ATTEMPTS = 5
+
+#: Ceiling on one backoff wait. Past this the resource is not throttling, it is
+#: unavailable, and the caller is better told than kept waiting.
+MAX_BACKOFF_SECONDS = 60.0
+
+
+def _retry_after(headers: Any, attempt: int) -> float:
+    """How long to wait before asking again.
+
+    The resource's own ``Retry-After`` wins when it sends one — it knows when
+    the quota window rolls over and a guess does not. Otherwise exponential
+    backoff with jitter; the jitter matters because a throttled run retries in
+    lockstep otherwise, and every attempt collides at the same instant.
+    """
+    advertised = None
+    try:
+        advertised = headers.get("retry-after")
+    except AttributeError:  # pragma: no cover - defensive
+        advertised = None
+    if advertised:
+        try:
+            return min(float(advertised), MAX_BACKOFF_SECONDS)
+        except ValueError:
+            pass  # an HTTP-date rather than seconds; fall through to backoff
+    return min(2.0**attempt + random.uniform(0, 1), MAX_BACKOFF_SECONDS)
 
 
 def _stream_events(response: Any) -> Iterator[dict[str, Any]]:
@@ -171,6 +209,10 @@ class ModelRequest(StrictModel):
     #: :mod:`engagement.caching` for why only some content may go here.
     cache_prefix: str = ""
     max_output_tokens: int = 4096
+    #: Effort level, or empty to send none. Gated per family at dispatch — see
+    #: :func:`engagement.models.effort_for` — because the parameter is a 400 on
+    #: the families that never had it.
+    effort: str = ""
     #: Zero by default: an unattended run should re-run to the same answer where
     #: the family allows it, because a queue that changes between identical runs
     #: cannot be reviewed or regression-tested.
@@ -217,6 +259,17 @@ class ModelProvider(Protocol):
 
 class ProviderError(RuntimeError):
     """Configuration that would produce a silently degraded run."""
+
+
+class ProviderThrottled(RuntimeError):
+    """The resource refused every attempt with a retryable status.
+
+    Distinct from :class:`ProviderTimeout`: nothing was generated and nothing
+    was billed, so this is the *cheap* failure of the two. It is raised rather
+    than retried forever because a quota that has not cleared after a minute of
+    backoff is a capacity problem the operator has to size for, not one more
+    call away.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +321,7 @@ class FoundryProvider:
         every surface below.
         """
         sampling = sampling_for(request.deployment, request.temperature, request.seed)
+        effort = effort_for(request.deployment, request.effort)
         if self._matches(request.deployment, _ANTHROPIC_FAMILIES):
             # The cache breakpoint goes on the *last* system block, so the span
             # it covers is the instruction text plus the invariant prefix — in
@@ -293,6 +347,7 @@ class FoundryProvider:
                 # a hang; streamed, the same answer arrives as a steady trickle
                 # and only real silence trips the timeout.
                 "stream": True,
+                **effort,
             }
             # the Anthropic surface has no `seed`; temperature only, and only
             # on the generations that still accept it
@@ -408,36 +463,61 @@ class FoundryProvider:
         # than at construction so a base_url changed at runtime cannot slip past.
         if self._egress is not None:
             self._egress.check(str(shape["url"]), purpose="model dispatch")
-        try:
-            with httpx.stream(
-                "POST",
-                shape["url"],
-                headers=shape["headers"],
-                json=shape["body"],
-                timeout=READ_TIMEOUT_SECONDS,
-            ) as response:
-                if response.status_code >= 400:
-                    # The body of an error is not streamed in usefully sized
-                    # pieces, and raise_for_status on an unread stream would
-                    # report the status with none of the detail underneath it.
-                    response.read()
-                response.raise_for_status()
-                content, usage = _accumulate_stream(_stream_events(response))
-        except httpx.TimeoutException as exc:
+        content: str = ""
+        usage: dict[str, int] = {}
+        waited = 0.0
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                with httpx.stream(
+                    "POST",
+                    shape["url"],
+                    headers=shape["headers"],
+                    json=shape["body"],
+                    timeout=READ_TIMEOUT_SECONDS,
+                ) as response:
+                    if response.status_code >= 400:
+                        # The body of an error is not streamed in usefully sized
+                        # pieces, and raise_for_status on an unread stream would
+                        # report the status with none of the detail underneath it.
+                        response.read()
+                    if response.status_code in RETRY_STATUSES:
+                        # Rejected before generating, so nothing was billed and
+                        # nothing is lost by asking again. The resource says how
+                        # long to wait when it knows; otherwise back off.
+                        if attempt < RETRY_ATTEMPTS - 1:
+                            delay = _retry_after(response.headers, attempt)
+                            waited += delay
+                            time.sleep(delay)
+                            continue
+                        raise ProviderThrottled(
+                            f"{request.deployment} returned "
+                            f"{response.status_code} on all {RETRY_ATTEMPTS} "
+                            f"attempts across {waited:.0f}s of backoff. A "
+                            "per-minute quota on the resource is the usual "
+                            "cause, and note that a cached prompt prefix still "
+                            "counts against it — this phase sends the same large "
+                            "prefix on every call. Send smaller answers or fewer "
+                            "calls per minute rather than retrying harder."
+                        )
+                    response.raise_for_status()
+                    content, usage = _accumulate_stream(_stream_events(response))
+                break
+            except httpx.TimeoutException as exc:
             # Now a *stall*, not a slow answer: the timeout measures the gap
             # between chunks, so reaching it means the stream went quiet rather
             # than that the model was still working. Still not a free failure —
             # this raises before the ledger records anything, so whatever was
             # generated is billed by the vendor and invisible to the run.
-            raise ProviderTimeout(
-                f"stream from {request.deployment} went silent for "
-                f"{READ_TIMEOUT_SECONDS:.0f}s at max_output_tokens="
-                f"{request.max_output_tokens}. Because dispatch streams, this is "
-                "a stalled connection rather than a long generation — retry, and "
-                "if it recurs suspect the network or the resource rather than the "
-                "size of the answer. Any tokens already generated are billed and "
-                "are NOT in this run's ledger or audit trail."
-            ) from exc
+                raise ProviderTimeout(
+                    f"stream from {request.deployment} went silent for "
+                    f"{READ_TIMEOUT_SECONDS:.0f}s at max_output_tokens="
+                    f"{request.max_output_tokens}. Because dispatch streams, this "
+                    "is a stalled connection rather than a long generation — "
+                    "retry, and if it recurs suspect the network or the resource "
+                    "rather than the size of the answer. Any tokens already "
+                    "generated are billed and are NOT in this run's ledger or "
+                    "audit trail."
+                ) from exc
         return ModelResponse(
             deployment=request.deployment,
             content=content,

@@ -241,6 +241,49 @@ _SAMPLING_REMOVED: tuple[str, ...] = (
 #: Families that accept a seed for reproducible sampling.
 _SEED_SUPPORTED: tuple[str, ...] = ("gpt-", "o3", "o4")
 
+#: Families that accept ``output_config.effort``. An allowlist rather than a
+#: deny-list, because sending it where it is unsupported **fails the whole
+#: call** — Haiku 4.5 and Sonnet 4.5 reject it outright — while omitting it only
+#: forgoes a saving. Effort is the cheapest lever on both spend and wall clock,
+#: since it shortens the answer and answer length is what both are made of,
+#: which is exactly why it must not be sent blind.
+_EFFORT_SUPPORTED: tuple[str, ...] = (
+    "claude-fable",
+    "claude-mythos",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+)
+
+#: Levels the API defines. ``xhigh`` and ``max`` arrived after Opus 4.5, which
+#: takes only the first three — but a rejected level is a 400 an operator can
+#: read, unlike a silently dropped one, so the level is passed through as given.
+EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def accepts_effort(deployment: str) -> bool:
+    """Whether this deployment will accept an effort level at all."""
+    lowered = bare_model_id(deployment)
+    return any(lowered.startswith(prefix) for prefix in _EFFORT_SUPPORTED)
+
+
+def effort_for(deployment: str, effort: str) -> dict[str, object]:
+    """The ``output_config`` this deployment will accept, if any.
+
+    Empty when no effort was asked for, or when the family rejects the
+    parameter. The caller sends exactly what comes back, so a family gaining or
+    losing support is one edit here rather than a change at every dispatch site
+    — the same contract as :func:`sampling_for`.
+    """
+    level = effort.strip().lower()
+    if not level or not accepts_effort(deployment):
+        return {}
+    return {"output_config": {"effort": level}}
+
 
 def spec_for(deployment: str) -> ModelSpec | None:
     """The catalogue entry for a deployment, if it has one."""

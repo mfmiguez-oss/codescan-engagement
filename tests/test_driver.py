@@ -10,7 +10,14 @@ import json
 import pytest
 
 from engagement.budget import Budget, Ledger
-from engagement.contracts import Disposition, Phase, Priority, RunRef, RunReport
+from engagement.contracts import (
+    Disposition,
+    Phase,
+    Priority,
+    RunRef,
+    RunReport,
+    ScenarioRef,
+)
 from engagement.driver import Driver, Policy
 from engagement.providers import FakeProvider
 from fakes import FakeWorkspace, scenarios
@@ -442,6 +449,85 @@ def test_a_target_with_no_routing_units_still_routes_in_one_call() -> None:
 
     assert len(provider.requests) == 1
     assert provider.requests[0].cache_prefix == ""
+
+
+def _verified(count: int, experts: tuple[str, ...] = ("injection",)) -> FakeWorkspace:
+    backlog = [
+        ScenarioRef(scenario_id=f"S{n:03d}", expert=experts[n % len(experts)])
+        for n in range(1, count + 1)
+    ]
+    return FakeWorkspace(scenarios=backlog)
+
+
+def test_concurrent_scenarios_all_complete_and_none_is_lost() -> None:
+    """The scenario phase is one call per scenario and hundreds of them, all
+    independent, so wall clock is otherwise just their generation summed."""
+    workspace = _verified(12)
+    driver = _driver(workspace, _provider('{"status": "verified"}'), scenario_concurrency=4)
+
+    report = driver.run(REF)
+
+    completed = [s for s in report.scenarios if s.disposition == Disposition.completed]
+    assert len(completed) == 12
+    assert len({s.item_id for s in report.scenarios}) == 12
+
+
+def test_concurrent_scenarios_never_touch_the_workspace_at_the_same_time() -> None:
+    """The workspace is a CLI over one run directory. Two `openhack` processes
+    against it would interleave their appends to the shared trace and state."""
+    workspace = _verified(12)
+    driver = _driver(workspace, _provider('{"status": "verified"}'), scenario_concurrency=6)
+
+    driver.run(REF)
+
+    assert workspace.max_concurrent_workspace_calls == 1
+
+
+def test_the_call_ceiling_still_holds_when_scenarios_run_concurrently() -> None:
+    """A ceiling enforced only under one thread is not a ceiling. Workers that
+    lose the race for the last slots are recorded, not silently dropped."""
+    workspace = _verified(20)
+    driver = _driver(
+        workspace,
+        _provider('{"status": "verified"}'),
+        budget=Budget(max_calls=5),
+        scenario_concurrency=8,
+    )
+
+    report = driver.run(REF)
+
+    assert driver.ledger.calls <= 5
+    # Every scenario is accounted for either way: dispatched, or named unfunded.
+    assert len(report.scenarios) == 20
+    assert any("NOT known to be clean" in w for w in report.warnings)
+
+
+def test_one_scenario_per_expert_goes_out_before_the_rest_fan_out() -> None:
+    """The expert manifest is the cached prefix, and a cache entry only becomes
+    readable once the response that wrote it has begun. Fanning out cold means
+    every worker misses at once and each pays the write premium."""
+    experts = ("injection", "crypto", "access")
+    workspace = _verified(12, experts=experts)
+    by_id = {item.scenario_id: item.expert for item in workspace.backlog}
+    provider = _provider('{"status": "verified"}')
+    driver = _driver(workspace, provider, scenario_concurrency=6)
+
+    driver.run(REF)
+
+    # The first three dispatches are the warming ones: sent in series, one per
+    # distinct expert, before anything fans out.
+    warmed = [
+        expert
+        for sid, expert in by_id.items()
+        if any(sid in request.user for request in provider.requests[:3])
+    ]
+    assert sorted(warmed) == sorted(experts)
+
+
+def test_a_single_worker_is_the_default_and_stays_serial() -> None:
+    """Raising concurrency is a decision about the resource's per-minute quota,
+    not a free speedup, so it is opt-in."""
+    assert Policy().scenario_concurrency == 1
 
 
 def test_a_declared_needs_context_reaches_expansion_even_if_the_recorder_refuses() -> None:

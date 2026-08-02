@@ -10,8 +10,12 @@ exist before a result can be recorded against it.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 
 from engagement.contracts import (
     ParkedScenario,
@@ -73,6 +77,11 @@ class FakeWorkspace:
         #: durable per-chunk router answers, keyed as the real workspace keys
         #: them. Survives across drivers in a test, the way files survive a run.
         self.router_chunks: dict[str, str] = {}
+        #: highest number of workspace calls seen in flight at once. Must stay 1
+        #: however many scenarios run concurrently — see `_exclusive`.
+        self.max_concurrent_workspace_calls = 0
+        self._depth = 0
+        self._depth_lock = Lock()
 
     # -- prompts ------------------------------------------------------------
 
@@ -134,12 +143,40 @@ class FakeWorkspace:
     def pending_scenarios(self, ref: RunRef) -> list[ScenarioRef]:
         return [item for item in self.backlog if item.scenario_id not in self.finished]
 
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Record whether two workspace calls ever overlapped.
+
+        The real workspace shells out to the OpenHack CLI against one run
+        directory, so two at once would interleave appends to its shared trace
+        and state files. A concurrent driver must never let that happen, and a
+        fake that cannot notice would let the regression through silently.
+        """
+        with self._depth_lock:
+            self._depth += 1
+            self.max_concurrent_workspace_calls = max(
+                self.max_concurrent_workspace_calls, self._depth
+            )
+        try:
+            time.sleep(0.001)  # widen the window a race would land in
+            yield
+        finally:
+            with self._depth_lock:
+                self._depth -= 1
+
     def render_scenario_prompt(self, ref: RunRef, scenario_id: str) -> RenderedPrompt:
-        if all(item.scenario_id != scenario_id for item in self.backlog):
-            raise WorkspaceError(f"unknown scenario {scenario_id}")
-        return self._prompt("scenario", scenario_id)
+        with self._exclusive():
+            if all(item.scenario_id != scenario_id for item in self.backlog):
+                raise WorkspaceError(f"unknown scenario {scenario_id}")
+            return self._prompt("scenario", scenario_id)
 
     def record_scenario_result(
+        self, ref: RunRef, scenario_id: str, answer: str
+    ) -> ScenarioOutcome:
+        with self._exclusive():
+            return self._record_scenario_result(ref, scenario_id, answer)
+
+    def _record_scenario_result(
         self, ref: RunRef, scenario_id: str, answer: str
     ) -> ScenarioOutcome:
         if scenario_id in self.reject:

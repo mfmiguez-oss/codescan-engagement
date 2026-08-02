@@ -130,6 +130,40 @@ class _FakeStream:
         return None
 
 
+def test_effort_reaches_the_families_that_take_it() -> None:
+    """Effort shortens the answer, and answer length is what both spend and wall
+    clock are made of — so it is the cheapest lever on either."""
+    body = FoundryProvider(resource="res", api_key="k").build_request(
+        ModelRequest(deployment="claude-opus-5", system="s", user="u", effort="low")
+    )["body"]
+    assert body["output_config"] == {"effort": "low"}
+
+
+def test_effort_is_withheld_from_the_families_that_reject_it() -> None:
+    """Haiku 4.5 and Sonnet 4.5 400 on the parameter, so sending it blind would
+    fail every call of a run that asked for a cheaper one. Omitting it only
+    forgoes the saving, which is why the gate is an allowlist."""
+    from engagement.models import accepts_effort
+
+    assert not accepts_effort("claude-haiku-4-5")
+    assert not accepts_effort("claude-sonnet-4-5")
+    assert accepts_effort("claude-opus-5")
+    # Platform prefixes must not defeat the match.
+    assert accepts_effort("us.anthropic.claude-opus-5")
+
+    body = FoundryProvider(resource="res", api_key="k").build_request(
+        ModelRequest(deployment="claude-haiku-4-5", system="s", user="u", effort="low")
+    )["body"]
+    assert "output_config" not in body
+
+
+def test_asking_for_no_effort_sends_none() -> None:
+    body = FoundryProvider(resource="res", api_key="k").build_request(
+        ModelRequest(deployment="claude-opus-5", system="s", user="u")
+    )["body"]
+    assert "output_config" not in body
+
+
 def test_dispatch_streams_so_a_long_answer_is_not_mistaken_for_a_hang() -> None:
     """Two live BenchmarkPython runs died on a whole-response deadline while the
     model was working normally. Streamed, the timeout measures silence instead."""
@@ -224,6 +258,77 @@ def test_a_stalled_stream_says_what_it_cost_and_that_it_is_not_a_long_answer() -
     assert f"{READ_TIMEOUT_SECONDS:.0f}s" in message
     assert "stalled connection rather than a long generation" in message
     assert "NOT in this run's ledger" in message
+
+
+class _FakeErrorStream(_FakeStream):
+    """A response that refuses with a status, optionally advertising a wait."""
+
+    def __init__(self, status: int, headers: dict[str, str] | None = None) -> None:
+        super().__init__([])
+        self.status_code = status
+        self.headers = headers or {}
+
+
+def test_a_throttled_call_is_retried_rather_than_ending_the_run() -> None:
+    """A 429 arrives before the model generates anything, so nothing is billed
+    and nothing is lost by asking again. A live run died on one 12 minutes in."""
+    import httpx
+
+    from engagement.providers import RETRY_STATUSES
+
+    assert 429 in RETRY_STATUSES
+
+    ok = [
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}',
+        'data: {"type":"message_delta","usage":{"output_tokens":2}}',
+    ]
+    responses = [_FakeErrorStream(429, {"retry-after": "0"}), _FakeStream(ok)]
+    provider = FoundryProvider(resource="res", api_key="k")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(httpx, "stream", lambda *a, **k: responses.pop(0))
+        response = provider.complete(
+            ModelRequest(deployment="claude-haiku-4-5", system="s", user="u")
+        )
+
+    assert response.content == "{}"
+    assert responses == []
+
+
+def test_a_quota_that_never_clears_says_so_instead_of_retrying_forever() -> None:
+    """After a minute of backoff a quota is a capacity problem to size for, not
+    one more call away. The message names the cause an operator can act on."""
+    import httpx
+
+    from engagement.providers import RETRY_ATTEMPTS, ProviderThrottled
+
+    calls = 0
+
+    def _always_throttled(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return _FakeErrorStream(429, {"retry-after": "0"})
+
+    provider = FoundryProvider(resource="res", api_key="k")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(httpx, "stream", _always_throttled)
+        with pytest.raises(ProviderThrottled) as throttled:
+            provider.complete(
+                ModelRequest(deployment="claude-haiku-4-5", system="s", user="u")
+            )
+
+    assert calls == RETRY_ATTEMPTS
+    assert "cached prompt prefix still counts against it" in str(throttled.value)
+
+
+def test_the_resources_own_retry_after_beats_a_guess() -> None:
+    """It knows when its quota window rolls over; backoff arithmetic does not."""
+    from engagement.providers import MAX_BACKOFF_SECONDS, _retry_after
+
+    assert _retry_after({"retry-after": "7"}, attempt=0) == 7.0
+    # Capped, so a hostile or broken header cannot park an unattended run.
+    assert _retry_after({"retry-after": "99999"}, 0) == MAX_BACKOFF_SECONDS
+    # An HTTP-date is not seconds; fall through to backoff rather than crash.
+    assert 0 < _retry_after({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}, 0) <= 2.0
 
 
 def test_a_streamed_dispatch_meters_what_the_stream_reported() -> None:

@@ -18,6 +18,7 @@ any other.
 from __future__ import annotations
 
 from hashlib import sha256
+from threading import Lock
 
 from .audit import AuditLog
 from .budget import Ledger
@@ -47,6 +48,9 @@ class Dispatcher:
         #: Accumulated across calls for the same reason redactions are: what
         #: caching actually did is a property of the run, not of one dispatch.
         self.caching = CacheReport()
+        #: Guards the two tallies above. They are read-modify-write on shared
+        #: state, and scenarios can dispatch concurrently.
+        self._counters = Lock()
 
     @property
     def ledger(self) -> Ledger:
@@ -63,6 +67,7 @@ class Dispatcher:
         prompt: str,
         cache_prefix: str = "",
         max_output_tokens: int | None = None,
+        effort: str = "",
     ) -> str:
         """Dispatch one prompt. Raises ``BudgetExceeded`` before spending.
 
@@ -83,40 +88,54 @@ class Dispatcher:
         caller says "this answer is legitimately large" rather than raising the
         floor for every phase at once.
         """
-        self._ledger.check()
+        # Claimed before anything is sent, and handed back below if the send
+        # never happened. Under concurrent dispatch a check here and a count
+        # after the response would let several callers past one remaining slot.
+        self._ledger.reserve()
         redacted = redact(prompt)
-        self.redactions += redacted.count
+        with self._counters:
+            self.redactions += redacted.count
 
         prefix = ""
         if cache_prefix:
-            if is_cacheable(cache_prefix, deployment):
-                redacted_prefix = redact(cache_prefix)
-                self.redactions += redacted_prefix.count
-                redacted.restorations.update(redacted_prefix.restorations)
+            redacted_prefix = redact(cache_prefix)
+            redacted.restorations.update(redacted_prefix.restorations)
+            cacheable = is_cacheable(cache_prefix, deployment)
+            if cacheable:
                 prefix = redacted_prefix.text
-                self.caching.offered += 1
             else:
                 # Sent as an ordinary part of the system prompt rather than
                 # dropped: the text is needed either way, and only the billing
                 # was ever in question.
-                self.caching.below_minimum += 1
-                redacted_prefix = redact(cache_prefix)
-                self.redactions += redacted_prefix.count
-                redacted.restorations.update(redacted_prefix.restorations)
                 system = f"{system}\n\n{redacted_prefix.text}"
+            with self._counters:
+                self.redactions += redacted_prefix.count
+                if cacheable:
+                    self.caching.offered += 1
+                else:
+                    self.caching.below_minimum += 1
 
         request = ModelRequest(
             deployment=deployment,
             system=system,
             user=redacted.text,
             cache_prefix=prefix,
+            effort=effort,
         )
         if max_output_tokens is not None:
             request = request.model_copy(update={"max_output_tokens": max_output_tokens})
-        response = self._provider.complete(request)
-        self._ledger.record(response.input_tokens, response.output_tokens)
-        self.caching.read_tokens += response.cache_read_tokens
-        self.caching.written_tokens += response.cache_write_tokens
+        try:
+            response = self._provider.complete(request)
+        except Exception:
+            # Nothing was produced, so the slot claimed above was never used.
+            # Keeping it would let a run of transient failures exhaust a budget
+            # that bought nothing.
+            self._ledger.release()
+            raise
+        self._ledger.record_usage(response.input_tokens, response.output_tokens)
+        with self._counters:
+            self.caching.read_tokens += response.cache_read_tokens
+            self.caching.written_tokens += response.cache_write_tokens
         self._audit.dispatch(
             phase=phase,
             deployment=deployment,
