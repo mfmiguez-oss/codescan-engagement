@@ -89,6 +89,22 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-calls", type=int, help="Overrides ENGAGEMENT_MAX_CALLS.")
     run.add_argument("--max-tokens", type=int, help="Overrides ENGAGEMENT_MAX_TOKENS.")
     run.add_argument("--max-retries", type=int, default=1)
+    run.add_argument(
+        "--router-chunk-units",
+        type=int,
+        default=Policy().router_chunk_units,
+        help=(
+            "Routing units per router call. The backlog is split across calls "
+            "and merged; lower this if a chunk keeps overrunning its output "
+            "ceiling. Note --max-tokens is a whole-run token budget, not this."
+        ),
+    )
+    run.add_argument(
+        "--router-max-output-tokens",
+        type=int,
+        default=Policy().router_max_output_tokens,
+        help="Output ceiling for one router call (default sized for a chunk).",
+    )
     run.add_argument("--no-sarif", action="store_true")
     run.add_argument("--sarif-out", type=Path)
     run.add_argument(
@@ -768,6 +784,8 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         expert_model=args.expert_model,
         triage_model=args.triage_model,
         max_retries=args.max_retries,
+        router_chunk_units=args.router_chunk_units,
+        router_max_output_tokens=args.router_max_output_tokens,
         emit_sarif=not args.no_sarif,
     )
     if not policy.has_model():

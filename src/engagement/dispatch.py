@@ -62,6 +62,7 @@ class Dispatcher:
         system: str,
         prompt: str,
         cache_prefix: str = "",
+        max_output_tokens: int | None = None,
     ) -> str:
         """Dispatch one prompt. Raises ``BudgetExceeded`` before spending.
 
@@ -74,6 +75,13 @@ class Dispatcher:
         ``cache_prefix`` is redacted like everything else. It carries text
         recovered from the repository under review, and content being invariant
         across calls says nothing about whether it holds a credential.
+
+        ``max_output_tokens`` overrides the per-call output ceiling for phases
+        whose answer is a whole document rather than one verdict. ``None``
+        keeps :class:`~engagement.providers.ModelRequest`'s default, which is
+        sized for the single-answer phases; passing a number here is how a
+        caller says "this answer is legitimately large" rather than raising the
+        floor for every phase at once.
         """
         self._ledger.check()
         redacted = redact(prompt)
@@ -97,14 +105,15 @@ class Dispatcher:
                 redacted.restorations.update(redacted_prefix.restorations)
                 system = f"{system}\n\n{redacted_prefix.text}"
 
-        response = self._provider.complete(
-            ModelRequest(
-                deployment=deployment,
-                system=system,
-                user=redacted.text,
-                cache_prefix=prefix,
-            )
+        request = ModelRequest(
+            deployment=deployment,
+            system=system,
+            user=redacted.text,
+            cache_prefix=prefix,
         )
+        if max_output_tokens is not None:
+            request = request.model_copy(update={"max_output_tokens": max_output_tokens})
+        response = self._provider.complete(request)
         self._ledger.record(response.input_tokens, response.output_tokens)
         self.caching.read_tokens += response.cache_read_tokens
         self.caching.written_tokens += response.cache_write_tokens

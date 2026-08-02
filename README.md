@@ -13,6 +13,7 @@ Stages, contracts and dataflows: [docs/DATAFLOW.md](docs/DATAFLOW.md) — includ
 the [degradation matrix](docs/DATAFLOW.md#degradation-what-happens-when-an-input-is-missing),
 which says what a run still means when a feed or a budget is missing.
 Topology and cloud setup: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+Running either web UI on your own machine: [docs/LOCAL_UI.md](docs/LOCAL_UI.md).
 Risk register: [docs/THREATMODEL.md](docs/THREATMODEL.md).
 Framework conformance, dated: [docs/SECURITY_FRAMEWORKS.md](docs/SECURITY_FRAMEWORKS.md).
 

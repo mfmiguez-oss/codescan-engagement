@@ -63,6 +63,16 @@ class FakeWorkspace:
         #: appended to every rendered prompt, so a test can plant material
         #: the driver must not forward verbatim
         self.prompt_extra = ""
+        #: routing units recon found. Empty leaves the router unchunked, which
+        #: is what most tests want; setting it exercises the chunked path.
+        self.units: list[str] = []
+        #: every router user-prompt the driver dispatched, in order
+        self.router_prompts: list[str] = []
+        #: cache prefix seen on each router call, in order
+        self.router_prefixes: list[str] = []
+        #: durable per-chunk router answers, keyed as the real workspace keys
+        #: them. Survives across drivers in a test, the way files survive a run.
+        self.router_chunks: dict[str, str] = {}
 
     # -- prompts ------------------------------------------------------------
 
@@ -99,6 +109,15 @@ class FakeWorkspace:
     def run_recon(self, ref: RunRef, experts: list[str]) -> None:
         self.recon_calls += 1
         self.recon_done = True
+
+    def routing_units(self, ref: RunRef) -> list[str]:
+        return list(self.units)
+
+    def read_router_chunk(self, ref: RunRef, key: str) -> str | None:
+        return self.router_chunks.get(key)
+
+    def write_router_chunk(self, ref: RunRef, key: str, answer: str) -> None:
+        self.router_chunks[key] = answer
 
     def render_router_prompt(self, ref: RunRef) -> RenderedPrompt:
         return self._prompt("router", str(ref))

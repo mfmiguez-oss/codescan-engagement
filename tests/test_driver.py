@@ -181,11 +181,267 @@ def test_a_fenced_router_answer_is_unwrapped_before_the_recorder_sees_it() -> No
 
 
 def test_a_truncated_router_answer_names_the_likely_cause() -> None:
-    from engagement.driver import _unfence
+    from engagement.driver import TruncatedAnswer, _router_answer
+
+    with pytest.raises(TruncatedAnswer, match="truncated by the output limit"):
+        _router_answer('```json\n{"scenarios": [{"id": "S001"')
+
+
+def test_a_truncated_answer_is_distinguishable_from_a_rejected_one() -> None:
+    """The two need opposite responses, so the router has to tell them apart.
+
+    A rejected backlog is worth re-asking; a truncated one is not, because the
+    same prompt truncates the same way. Sharing one exception type is what made
+    the live BenchmarkPython run pay for two calls to fail once.
+    """
+    from engagement.driver import TruncatedAnswer, _router_answer
     from engagement.workspace import WorkspaceError
 
-    with pytest.raises(WorkspaceError, match="may have been truncated"):
-        _unfence('```json\n{"scenarios": [{"id": "S001"')
+    with pytest.raises(WorkspaceError) as rejected:
+        _router_answer('["not", "an", "object"]')
+
+    assert not isinstance(rejected.value, TruncatedAnswer)
+
+
+TRUNCATED = '{"scenarios": [{"id": "S001"'
+
+
+def _chunk_answer(
+    units: list[str], ids: list[str] | None = None, **extra: object
+) -> str:
+    """A well-formed router answer routing exactly the units it was assigned."""
+    scenario_ids = ids or [f"S{n:03d}" for n in range(1, len(units) + 1)]
+    return json.dumps({
+        "scenarios": [
+            {"id": sid, "routing_unit_id": unit, "expert": "injection"}
+            for sid, unit in zip(scenario_ids, units, strict=True)
+        ],
+        "coverage_decisions": [],
+        **extra,
+    })
+
+
+def _routed(workspace: FakeWorkspace) -> dict:
+    return json.loads(workspace.backlog_json or "{}")
+
+
+def test_the_backlog_is_routed_in_chunks_so_no_one_answer_has_to_hold_it_all() -> None:
+    """The router's answer grows with the target, so a whole backlog cannot be
+    asked for at once. A live BenchmarkPython run proved it: 606 routing units,
+    one call, truncated mid-string at the output ceiling."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002", "U003", "U004", "U005"]
+    provider = FakeProvider(answers=[
+        _chunk_answer(["U001", "U002"]),
+        _chunk_answer(["U003", "U004"]),
+        _chunk_answer(["U005"]),
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=2)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert len(provider.requests) == 3
+    routed = [s["routing_unit_id"] for s in _routed(workspace)["scenarios"]]
+    assert routed == workspace.units
+
+
+def test_merged_scenarios_get_one_id_space_so_chunks_cannot_collide() -> None:
+    """Every chunk numbers its own scenarios from S001. Merging without
+    renumbering hands the recorder several scenarios claiming one id."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002"]
+    provider = FakeProvider(answers=[
+        _chunk_answer(["U001"], ["S001"]),
+        _chunk_answer(["U002"], ["S001"]),
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=1)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    scenarios = _routed(workspace)["scenarios"]
+    assert [s["id"] for s in scenarios] == ["S001", "S002"]
+    assert [s["routing_unit_id"] for s in scenarios] == ["U001", "U002"]
+
+
+def test_only_the_assignment_varies_between_router_calls() -> None:
+    """Chunking multiplies the calls, so the invariant material has to be paid
+    for once rather than once per chunk. It is identical across calls by
+    construction — which is exactly what makes it cacheable."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002", "U003"]
+    # Padded past the deployment's minimum cacheable prefix. Below it the
+    # dispatcher correctly declines to mark a breakpoint and folds the material
+    # into the system prompt instead, so a short fake would assert nothing about
+    # caching. A real router prompt is hundreds of kilobytes.
+    workspace.prompt_extra = "padding. " * 4000
+    provider = FakeProvider(answers=[
+        _chunk_answer(["U001"]), _chunk_answer(["U002"]), _chunk_answer(["U003"])
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=1)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    prefixes = {request.cache_prefix for request in provider.requests}
+    assert len(prefixes) == 1
+    assert prefixes.pop().startswith("# router prompt")
+    assert driver.dispatcher.caching.offered == 3
+    users = [request.user for request in provider.requests]
+    assert len(set(users)) == len(users)
+    assert "U001" in users[0] and "U001" not in users[1]
+
+
+def test_a_router_call_gets_more_output_room_than_a_single_verdict_phase() -> None:
+    """The 4096-token default is sized for a phase that returns one verdict. A
+    router chunk returns a document; left on the default it truncates."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001"]
+    provider = FakeProvider(answers=[_chunk_answer(["U001"])])
+    driver = _driver(workspace, provider)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert provider.requests[0].max_output_tokens == Policy().router_max_output_tokens
+
+
+def test_a_chunk_that_overruns_is_halved_rather_than_failing_the_run() -> None:
+    """Chunk size is a tuning knob, not a correctness one: too large costs one
+    wasted call before the split, and the run still completes."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002", "U003", "U004"]
+    provider = FakeProvider(answers=[
+        TRUNCATED,
+        _chunk_answer(["U001", "U002"]),
+        _chunk_answer(["U003", "U004"]),
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=4)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert len(provider.requests) == 3
+    routed = [s["routing_unit_id"] for s in _routed(workspace)["scenarios"]]
+    assert routed == workspace.units
+
+
+def test_a_truncation_is_never_retried_on_an_unchanged_prompt() -> None:
+    """The failure that cost the live run twice. An identical prompt truncates
+    identically, so a retry buys nothing; when a chunk is already one unit there
+    is no split left and the ceiling is genuinely too low. Fail, do not spend."""
+    from engagement.driver import TruncatedAnswer
+
+    workspace = FakeWorkspace()
+    workspace.units = ["U001"]
+    provider = FakeProvider(answers=[TRUNCATED], default=TRUNCATED)
+    driver = _driver(workspace, provider)
+
+    with pytest.raises(TruncatedAnswer):
+        driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert len(provider.requests) == 1
+
+
+def test_units_the_router_ignored_are_reported_not_silently_dropped() -> None:
+    """Work that was not done is never reported as work that found nothing. The
+    recorder owns admissibility, so this says what happened and lets it rule."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002"]
+    answer = _chunk_answer(["U001"])
+    provider = FakeProvider(answers=[answer], default=answer)
+    report = RunReport(ref=REF, phase=Phase.router)
+    driver = _driver(workspace, provider, router_chunk_units=2)
+
+    driver._do_router(REF, report)
+
+    assert any("U002" in warning for warning in report.warnings)
+
+
+def test_router_output_beyond_the_two_known_arrays_survives_the_merge() -> None:
+    """The router also emits coverage notes. A merge that understood only
+    scenarios and coverage decisions would drop them on every chunked run."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002"]
+    provider = FakeProvider(answers=[
+        _chunk_answer(["U001"], coverage_notes=["skipped crypto: no evidence"]),
+        _chunk_answer(["U002"], coverage_notes=["skipped ldap: no sink"]),
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=1)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert len(_routed(workspace)["coverage_notes"]) == 2
+
+
+def test_a_failed_router_does_not_discard_the_chunks_it_already_paid_for() -> None:
+    """The costliest defect the live runs found. The router is dozens of calls;
+    holding the answers in memory meant one timeout on call 40 threw away 39
+    paid-for answers. A live run lost $2.81 that way. Each answer is now durable,
+    so the unit of loss is one call."""
+    from engagement.providers import ProviderTimeout
+
+    class _TimesOutOnThirdCall(FakeProvider):
+        def complete(self, request: object) -> object:
+            if len(self.requests) == 2:
+                raise ProviderTimeout("no response within 600s")
+            return super().complete(request)  # type: ignore[arg-type]
+
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002", "U003"]
+    provider = _TimesOutOnThirdCall(answers=[
+        _chunk_answer(["U001"]), _chunk_answer(["U002"]), _chunk_answer(["U003"])
+    ])
+    driver = _driver(workspace, provider, router_chunk_units=1)
+
+    with pytest.raises(ProviderTimeout):
+        driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    # The two answers bought before the failure survived it.
+    assert len(workspace.router_chunks) == 2
+
+
+def test_a_resumed_router_re_asks_only_the_chunks_it_never_answered() -> None:
+    """Resume is what makes the durability worth having: a re-run after a
+    transient failure costs the remaining calls, not all of them again."""
+    workspace = FakeWorkspace()
+    workspace.units = ["U001", "U002", "U003"]
+    first = FakeProvider(answers=[
+        _chunk_answer(["U001"]), _chunk_answer(["U002"]), _chunk_answer(["U003"])
+    ])
+    _driver(workspace, first, router_chunk_units=1)._do_router(
+        REF, RunReport(ref=REF, phase=Phase.router)
+    )
+    assert len(first.requests) == 3
+
+    # Same workspace, fresh driver and provider: nothing left to ask.
+    second = FakeProvider(answers=[], default="{}")
+    _driver(workspace, second, router_chunk_units=1)._do_router(
+        REF, RunReport(ref=REF, phase=Phase.router)
+    )
+
+    assert second.requests == []
+    routed = [s["routing_unit_id"] for s in _routed(workspace)["scenarios"]]
+    assert routed == workspace.units
+
+
+def test_a_resumed_chunk_is_matched_by_its_units_not_its_position() -> None:
+    """Halving renumbers every chunk after the split, so a positional key would
+    make a resumed run read back the answer to a different assignment."""
+    from engagement.driver import _chunk_key
+
+    assert _chunk_key(["U001", "U002"]) == _chunk_key(["U001", "U002"])
+    assert _chunk_key(["U001", "U002"]) != _chunk_key(["U002", "U001"])
+    assert _chunk_key(["U001"]) != _chunk_key(["U001", "U002"])
+
+
+def test_a_target_with_no_routing_units_still_routes_in_one_call() -> None:
+    """Nothing to split on means nothing to chunk, and the prompt is the whole
+    task rather than shared material — so it is asked, not cached."""
+    workspace = FakeWorkspace()
+    provider = FakeProvider(answers=['{"scenarios": [], "coverage_decisions": []}'])
+    driver = _driver(workspace, provider)
+
+    driver._do_router(REF, RunReport(ref=REF, phase=Phase.router))
+
+    assert len(provider.requests) == 1
+    assert provider.requests[0].cache_prefix == ""
 
 
 def test_a_declared_needs_context_reaches_expansion_even_if_the_recorder_refuses() -> None:

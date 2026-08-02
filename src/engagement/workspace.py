@@ -125,6 +125,12 @@ class Workspace(Protocol):
 
     def run_recon(self, ref: RunRef, experts: list[str]) -> None: ...
 
+    def routing_units(self, ref: RunRef) -> list[str]: ...
+
+    def read_router_chunk(self, ref: RunRef, key: str) -> str | None: ...
+
+    def write_router_chunk(self, ref: RunRef, key: str, answer: str) -> None: ...
+
     def render_router_prompt(self, ref: RunRef) -> RenderedPrompt: ...
 
     def record_backlog(self, ref: RunRef, answer: str) -> None: ...
@@ -259,6 +265,56 @@ class CliWorkspace:
         else:
             args.append("--all-agents")
         self._run(*args)
+
+    def routing_units(self, ref: RunRef) -> list[str]:
+        """The routing unit ids recon found, in the order recon emitted them.
+
+        Read rather than derived: the router prompt names these ids and the
+        backlog recorder validates against them, so the driver has to split the
+        work on the *same* list both ends already agree on. An empty list is a
+        legitimate answer — a target with no routing units routes in one call —
+        and is not the same as the file being missing, which is a broken run.
+        """
+        path = self._run_dir(ref) / "recon-output" / "routing-units.jsonl"
+        if not path.exists():
+            raise WorkspaceError(
+                "routing-units.jsonl is missing; run recon before routing"
+            )
+        units: list[str] = []
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkspaceError(
+                    f"unreadable routing unit on line {number}: {exc}"
+                ) from exc
+            unit_id = str(data.get("unit_id", "")).strip()
+            if unit_id:
+                units.append(unit_id)
+        return units
+
+    def _router_chunk_path(self, ref: RunRef, key: str) -> Path:
+        return self._run_dir(ref) / "scenarios" / "router-chunks" / f"{key}.json"
+
+    def read_router_chunk(self, ref: RunRef, key: str) -> str | None:
+        """A chunk answer a previous attempt already paid for, if there is one.
+
+        Router answers are durable because the phase is long: a run that dies on
+        its fortieth call would otherwise discard thirty-nine paid-for answers
+        and start again. Stored per chunk rather than per run so the unit of
+        loss is one call.
+        """
+        path = self._router_chunk_path(ref, key)
+        if not path.exists():
+            return None
+        return path.read_text(encoding="utf-8")
+
+    def write_router_chunk(self, ref: RunRef, key: str, answer: str) -> None:
+        path = self._router_chunk_path(ref, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(answer, encoding="utf-8")
 
     def render_router_prompt(self, ref: RunRef) -> RenderedPrompt:
         self._run("create-scenarios", ref.target, ref.run_id)

@@ -15,7 +15,7 @@ actually differs per cloud — be asserted offline in the gate.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import Field
@@ -25,6 +25,119 @@ from .egress import EgressPolicy
 from .models import sampling_for
 
 PROVIDERS = ("foundry", "bedrock")
+
+
+#: How long to wait for *more bytes*, not for the whole answer. Dispatch streams
+#: (see :meth:`FoundryProvider.complete`), so this is the gap between chunks —
+#: it measures silence, not generation length, and a long answer that is still
+#: arriving never trips it. That distinction is the fix: two live
+#: BenchmarkPython runs died on a whole-response deadline while the model was
+#: working normally, the second one discarding 39 paid-for chunk answers.
+READ_TIMEOUT_SECONDS = 600.0
+
+
+class ProviderTimeout(RuntimeError):
+    """The stream went silent for :data:`READ_TIMEOUT_SECONDS`.
+
+    Its own type because a timeout is the one failure that can leave money
+    spent with nothing to show and nothing recorded: the ledger and the audit
+    trail are written from the completed response, so a call that dies mid
+    stream is billed by the vendor and invisible here. Callers that meter spend
+    need to be able to tell it apart from a refusal or a bad request.
+    """
+
+
+def _stream_events(response: Any) -> Iterator[dict[str, Any]]:
+    """The JSON objects on an SSE stream's ``data:`` lines.
+
+    Comment lines, ``event:`` lines and the ``[DONE]`` sentinel carry no payload
+    and are skipped. An unparseable line is skipped rather than fatal: losing one
+    delta degrades an answer, while raising discards an answer that is otherwise
+    complete and already paid for.
+    """
+    for raw in response.iter_lines():
+        line = raw.strip() if isinstance(raw, str) else raw.decode("utf-8").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+#: Usage fields worth carrying, across every surface's spelling of them.
+_USAGE_KEYS = (
+    "prompt_tokens",
+    "input_tokens",
+    "completion_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _merge_usage(into: dict[str, int], reported: Any) -> None:
+    """Fold one event's usage into the running tally.
+
+    Last non-zero value wins per field, because the surfaces disagree about
+    when they report: the Anthropic stream sends input and cache counts up
+    front in ``message_start`` and the output count at the end in
+    ``message_delta``, while chat completions send everything once at the end.
+    Taking the last non-zero of each keeps both shapes correct without the
+    caller knowing which one it is talking to.
+    """
+    if not isinstance(reported, dict):
+        return
+    for key in _USAGE_KEYS:
+        value = reported.get(key)
+        if isinstance(value, int) and value:
+            into[key] = value
+
+
+def _accumulate_stream(events: Iterator[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+    """Rebuild the text and usage of a completed answer from its deltas.
+
+    Handles all three Foundry surfaces, dispatching on the shape of each event
+    rather than on which surface was called: the caller already chose a URL, and
+    threading that choice down here would add a parameter that only ever repeats
+    what the payload already says.
+    """
+    parts: list[str] = []
+    usage: dict[str, int] = {}
+    for event in events:
+        kind = event.get("type", "")
+        if kind == "message_start":                      # Anthropic messages
+            message = event.get("message")
+            _merge_usage(usage, message.get("usage") if isinstance(message, dict) else None)
+        elif kind == "content_block_delta":
+            delta = event.get("delta")
+            text = delta.get("text") if isinstance(delta, dict) else None
+            if isinstance(text, str):
+                parts.append(text)
+        elif kind == "message_delta":
+            _merge_usage(usage, event.get("usage"))
+        elif kind == "response.output_text.delta":       # OpenAI responses
+            if isinstance(event.get("delta"), str):
+                parts.append(event["delta"])
+        elif kind.startswith("response.") and isinstance(event.get("response"), dict):
+            _merge_usage(usage, event["response"].get("usage"))
+        elif "choices" in event:                         # OpenAI chat completions
+            for choice in event.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                content = delta.get("content") if isinstance(delta, dict) else None
+                if isinstance(content, str):
+                    parts.append(content)
+            _merge_usage(usage, event.get("usage"))
+        else:
+            _merge_usage(usage, event.get("usage"))
+    return "".join(parts), usage
 
 
 def merge_prefix(system: str, cache_prefix: str) -> str:
@@ -175,6 +288,11 @@ class FoundryProvider:
                 "max_tokens": request.max_output_tokens,
                 "system": system,
                 "messages": [{"role": "user", "content": request.user}],
+                # Always streamed. A document-sized answer generates for minutes,
+                # and on a whole-response deadline that is indistinguishable from
+                # a hang; streamed, the same answer arrives as a steady trickle
+                # and only real silence trips the timeout.
+                "stream": True,
             }
             # the Anthropic surface has no `seed`; temperature only, and only
             # on the generations that still accept it
@@ -211,6 +329,7 @@ class FoundryProvider:
                     "instructions": instructions,
                     "input": request.user,
                     "max_output_tokens": request.max_output_tokens,
+                    "stream": True,
                     **sampling,
                 },
             }
@@ -220,6 +339,11 @@ class FoundryProvider:
                 {"role": "system", "content": instructions},
                 {"role": "user", "content": request.user},
             ],
+            "stream": True,
+            # Chat completions omits usage from a stream unless asked. Without
+            # this the ledger would meter every streamed call as zero tokens,
+            # which is worse than not metering: it reads as a free run.
+            "stream_options": {"include_usage": True},
             **sampling,
         }
         token_key = (
@@ -284,15 +408,39 @@ class FoundryProvider:
         # than at construction so a base_url changed at runtime cannot slip past.
         if self._egress is not None:
             self._egress.check(str(shape["url"]), purpose="model dispatch")
-        response = httpx.post(
-            shape["url"], headers=shape["headers"], json=shape["body"], timeout=300.0
-        )
-        response.raise_for_status()
-        data = response.json()
-        usage = data.get("usage", {})
+        try:
+            with httpx.stream(
+                "POST",
+                shape["url"],
+                headers=shape["headers"],
+                json=shape["body"],
+                timeout=READ_TIMEOUT_SECONDS,
+            ) as response:
+                if response.status_code >= 400:
+                    # The body of an error is not streamed in usefully sized
+                    # pieces, and raise_for_status on an unread stream would
+                    # report the status with none of the detail underneath it.
+                    response.read()
+                response.raise_for_status()
+                content, usage = _accumulate_stream(_stream_events(response))
+        except httpx.TimeoutException as exc:
+            # Now a *stall*, not a slow answer: the timeout measures the gap
+            # between chunks, so reaching it means the stream went quiet rather
+            # than that the model was still working. Still not a free failure —
+            # this raises before the ledger records anything, so whatever was
+            # generated is billed by the vendor and invisible to the run.
+            raise ProviderTimeout(
+                f"stream from {request.deployment} went silent for "
+                f"{READ_TIMEOUT_SECONDS:.0f}s at max_output_tokens="
+                f"{request.max_output_tokens}. Because dispatch streams, this is "
+                "a stalled connection rather than a long generation — retry, and "
+                "if it recurs suspect the network or the resource rather than the "
+                "size of the answer. Any tokens already generated are billed and "
+                "are NOT in this run's ledger or audit trail."
+            ) from exc
         return ModelResponse(
             deployment=request.deployment,
-            content=_foundry_content(data),
+            content=content,
             input_tokens=int(usage.get("prompt_tokens", usage.get("input_tokens", 0))),
             output_tokens=int(usage.get("completion_tokens", usage.get("output_tokens", 0))),
             # Absent on every surface that does not cache, which is why these
@@ -302,21 +450,6 @@ class FoundryProvider:
             cache_read_tokens=int(usage.get("cache_read_input_tokens", 0)),
             cache_write_tokens=int(usage.get("cache_creation_input_tokens", 0)),
         )
-
-
-def _foundry_content(data: dict[str, Any]) -> str:
-    """Text out of any Foundry surface: chat, Anthropic messages, or responses."""
-    if "choices" in data:
-        return str(data["choices"][0]["message"]["content"])
-    if isinstance(data.get("content"), list):
-        return "".join(
-            str(block.get("text", ""))
-            for block in data["content"]
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    if "output_text" in data:
-        return str(data["output_text"])
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +591,11 @@ class BedrockProvider:
                 self._endpoint_url or f"bedrock-runtime.{self._region}.amazonaws.com",
                 purpose="model dispatch",
             )
+        # Not streamed, unlike the Foundry path. `converse_stream` is a
+        # different call with a different response shape, and this provider has
+        # never been exercised against a document-sized answer — so the
+        # whole-response deadline that broke two live Foundry router runs is
+        # still latent here. Worth converting before routing a long phase at it.
         data = self._bedrock().converse(**self.build_request(request))
         usage = data.get("usage", {})
         blocks = data.get("output", {}).get("message", {}).get("content", []) or []

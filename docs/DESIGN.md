@@ -84,8 +84,8 @@ flowchart TD
   init["init-run<br/><i>clone + pin commit</i>"]:::free
   recon["run-recon<br/><i>deterministic, no model</i>"]:::free
   units["routing-units.jsonl"]:::free
-  rp["render router prompt"]:::free
-  router(["router call<br/><b>1 call</b>"]):::paid
+  rp["render router prompt<br/><i>invariant → cache prefix</i>"]:::free
+  router(["router calls<br/><b>1 per chunk of units</b><br/><i>answers merged</i>"]):::paid
   backlog["record backlog<br/><i>coverage validated</i>"]:::free
 
   budget{"<b>budget gate</b><br/>projection =<br/>scenarios + candidates"}:::gate
@@ -115,10 +115,73 @@ governor only ever gates those three.
 OpenHack's cost model is unusually well behaved:
 
 ```
-cost = 1 router call
+cost = ceil(routing units / router_chunk_units) router calls
      + 1 call per scenario
      + 1 call per candidate
 ```
+
+### Why the router is not one call
+
+The router is the only phase whose *answer* scales with the target: it emits a
+scenario or a coverage decision for every routing unit recon found. A live run
+against OWASP BenchmarkPython — 606 routing units — proved that cannot fit in
+one answer. It truncated mid-string and the JSON never parsed, twice, because
+the retry re-sent identical bytes and bought an identical truncation.
+
+So the assignment is split by routing unit and the answers merged before the
+recorder sees them. Three properties make the split safe rather than merely
+smaller:
+
+- **The prompt does not move.** Only the list of assigned unit ids varies per
+  call, so the rendered prompt is byte-identical across chunks and travels as
+  the cache prefix — paid for once instead of once per chunk. That also fixes a
+  defect the same run exposed: the router had been dispatching *uncached*, so
+  its 170K-token prompt was billed at full rate on every attempt.
+- **Ids are renumbered on merge.** Every chunk numbers its own scenarios from
+  `S001`; nothing outside a scenario refers to a scenario id (coverage decisions
+  key off `routing_unit_id`), so renumbering cannot dangle a reference.
+- **Truncation and rejection are different failures.** A rejected backlog is
+  worth re-asking. A truncated one is not — the same prompt truncates the same
+  way — so it halves the chunk instead, which changes the one thing that caused
+  it. Chunk size is therefore a tuning knob, not a correctness one: too large
+  costs one wasted call before the split and the run still completes.
+
+**Dispatch streams, so a long answer is not mistaken for a hang.** A
+document-sized answer generates for minutes before it is complete, and on a
+whole-response deadline that is indistinguishable from a stalled connection.
+Two live runs died that way while the model was working normally. The Foundry
+path now sets `stream: true` on all three of its surfaces and rebuilds the text
+and usage from the deltas, which turns the timeout into a measure of *silence*
+rather than of length. Chat completions additionally needs
+`stream_options.include_usage`, without which a streamed call reports no usage
+and a run that spent money meters as free. (The Bedrock path still uses
+`converse` and is not streamed — the same hazard is latent there.)
+
+**Chunk answers are durable, and the router resumes.** Splitting the phase into
+dozens of calls creates a failure mode the single call never had: the longer it
+runs, the more paid-for work there is to lose. A live run proved it — 39 of ~44
+chunks answered, then one timeout, and every answer discarded because they were
+held in memory until the merge. Each accepted answer is now written to
+`scenarios/router-chunks/` before the next call goes out, keyed by a hash of the
+chunk's *unit ids* rather than its position (halving renumbers everything after
+a split, so a positional key would read back the answer to a different
+assignment). A re-run asks only for what it never got, which makes the unit of
+loss one call instead of the whole phase.
+
+The default chunk size is measured, not derived. A live chunk of 40 units filled
+all 16,384 output tokens and was *still* cut off, which puts a routed unit above
+~410 output tokens; the default is 16. Overshoot is survivable but not free, and
+the second cost is the one that bites: a chunk large enough to truncate is also
+large enough to generate for minutes, and the same live run went on to exceed
+the HTTP read timeout mid-generation. A timeout is the worst failure available
+here — the ledger and audit trail are written from the response, so a call that
+never returns is billed by the vendor and recorded nowhere — which is why
+`ProviderTimeout` names the cost and the lever instead of raising a transport
+error. Sizing chunks below the ceiling avoids both failures at once.
+
+Units the router leaves neither routed nor excused are reported as a warning
+rather than enforced in the driver. The backlog recorder owns admissibility —
+it knows which units are mandatory and the driver does not.
 
 Unlike a detection sweep — where cost is `batches × models × passes` and only
 knowable once you are inside it — **the expensive phase is countable before you

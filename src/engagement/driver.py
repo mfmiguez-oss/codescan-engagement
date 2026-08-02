@@ -27,6 +27,7 @@ import json
 import uuid
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 
@@ -75,6 +76,36 @@ TRIAGE_SYSTEM = (
 #: unchanged prompt spends budget without supplying the missing context.
 CONCLUDED_STATUSES = frozenset({"verified", "rejected", "candidate"})
 
+#: The per-call scope note appended to the invariant router prompt. Everything
+#: the router needs to *decide* is in that prompt and is byte-identical across
+#: chunks; this is the only part that varies, which is what makes the rest
+#: cacheable. It is deliberately explicit that ids outside the list belong to
+#: another call: a router told only "route these" tends to also excuse
+#: everything else, and those stray decisions collide on merge.
+ROUTER_ASSIGNMENT = """\
+## This Call's Assignment
+
+The material above describes the whole target. Route **only** the routing units
+listed here. This is chunk {index} of {total}.
+
+Assigned routing unit ids ({count}):
+
+{units}
+
+Rules for this call:
+
+- Emit a `scenarios` entry only for an assigned routing unit id.
+- Emit a `coverage_decisions` entry for every assigned routing unit id you do
+  not route, carrying that id in `routing_unit_id`.
+- Every assigned id must appear exactly once, in `scenarios` or in
+  `coverage_decisions` — never in both, never in neither.
+- Say nothing about a routing unit outside this list. Another call owns it.
+- Scenario ids need only be unique within this answer. They are renumbered when
+  the chunks are merged.
+- Answer with a JSON object holding `scenarios` and `coverage_decisions`, in the
+  shape the material above specifies.
+"""
+
 
 class Policy(StrictModel):
     """The knobs that stand in for a human's judgement.
@@ -94,6 +125,23 @@ class Policy(StrictModel):
     #: Retries for a *rejected or unparseable* answer. Not for a conclusion of
     #: "needs more context" — that is a result, not a failure.
     max_retries: int = 1
+    #: Routing units per router call. The router is the one phase whose answer
+    #: scales with the size of the target — it emits a scenario or a coverage
+    #: decision for every unit recon found — so on a real repository the whole
+    #: backlog cannot fit in one answer at any ceiling worth setting.
+    #:
+    #: Twelve, from measurement rather than arithmetic. A live BenchmarkPython
+    #: chunk of 40 units filled all 16,384 output tokens and was still cut off;
+    #: at 16 units the mean answer was 9,945 tokens but 3 of 38 chunks still hit
+    #: the ceiling, and the longest generations ran past a 600s HTTP timeout.
+    #: Overshoot is survivable — the chunk is halved and re-asked — but each one
+    #: burns a call *and* spends minutes on an answer that gets discarded, so
+    #: the default sits below the observed spread rather than at its middle.
+    router_chunk_units: int = 12
+    #: Output ceiling for one router call. The 4096-token default on
+    #: ``ModelRequest`` is sized for the phases that return a single verdict; a
+    #: router chunk returns a document and needs materially more room.
+    router_max_output_tokens: int = 16384
     #: Emit SARIF at the end of a run.
     emit_sarif: bool = True
     #: Deployment for a second, independent detection pass. Must be a different
@@ -166,22 +214,99 @@ def _declared_needs_context(answer: str) -> ScenarioOutcome | None:
     )
 
 
-def _unfence(answer: str) -> str:
-    """Strip a markdown code fence, leaving the JSON a recorder can parse.
+class TruncatedAnswer(WorkspaceError):
+    """An answer that did not parse, most likely cut off by the output ceiling.
 
-    Re-serialising through :func:`unwrap_json` rather than slicing the string:
-    a fence is not the only thing a model wraps an answer in, and parsing is the
-    only check that what survives is actually JSON. A truncated answer therefore
-    fails *here*, with a message naming the phase, instead of inside the
-    workspace's file reader where the error says only "Expecting value".
+    Split out from an ordinary rejection because the two need opposite
+    responses. A backlog the *recorder* rejected can be worth re-asking: the
+    model saw the whole task and answered it badly. An answer that was cut off
+    cannot be — the same prompt produces the same truncation, so a retry spends
+    a second call to fail identically. The chunked router splits the assignment
+    instead, which changes the one thing that caused it.
+    """
+
+
+def _router_answer(answer: str) -> dict[str, Any]:
+    """Parse a router answer, unwrapping a markdown fence if it came in one.
+
+    Parsing here rather than in the workspace's file reader keeps the failure
+    legible: the error names the phase and the length instead of surfacing as
+    "Expecting value" from inside a recorder. A fence is not the only thing a
+    model wraps an answer in, and parsing is the only check that what survives
+    is actually JSON. A live run against DSVW is what surfaced the fence — every
+    offline fake answered unfenced.
     """
     try:
-        return json.dumps(unwrap_json(answer), indent=2, sort_keys=True)
+        data = unwrap_json(answer)
     except json.JSONDecodeError as exc:
-        raise WorkspaceError(
+        raise TruncatedAnswer(
             f"router answer was not JSON ({exc}); it was {len(answer)} characters "
-            "and may have been truncated by the output limit"
+            "and was most likely truncated by the output limit"
         ) from exc
+    if not isinstance(data, dict):
+        # Parsed cleanly but is the wrong shape: the model answered the wrong
+        # question rather than running out of room, so re-asking can help.
+        raise WorkspaceError("router answer was not a JSON object")
+    return data
+
+
+def _items(answer: dict[str, Any], key: str) -> list[Any]:
+    """One of the router's two lists, or an empty one if it omitted the key."""
+    value = answer.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _chunks(units: list[str], size: int) -> list[list[str]]:
+    """Split routing units into assignments, preserving recon's order."""
+    step = max(1, size)
+    return [units[index : index + step] for index in range(0, len(units), step)]
+
+
+def _unaddressed(chunk: list[str], answer: dict[str, Any]) -> list[str]:
+    """Assigned routing units the answer neither routed nor excused."""
+    seen: set[str] = set()
+    for key in ("scenarios", "coverage_decisions"):
+        for item in _items(answer, key):
+            if isinstance(item, dict):
+                unit = str(item.get("routing_unit_id", "")).strip()
+                if unit:
+                    seen.add(unit)
+    return [unit for unit in chunk if unit not in seen]
+
+
+def _renumber(scenarios: list[Any]) -> list[Any]:
+    """Give merged scenarios a single id space.
+
+    Every chunk numbers its own scenarios from S001, so merging without this
+    hands the recorder several scenarios claiming one id. Ids are positional —
+    coverage decisions key off ``routing_unit_id`` and proof obligations off
+    their own ids, so nothing outside a scenario refers to one and renumbering
+    cannot dangle a reference.
+    """
+    renumbered: list[Any] = []
+    for number, scenario in enumerate(scenarios, 1):
+        if isinstance(scenario, dict):
+            scenario = {**scenario, "id": f"S{number:03d}"}
+        renumbered.append(scenario)
+    return renumbered
+
+
+def _chunk_key(chunk: list[str]) -> str:
+    """A stable filename for one assignment's answer.
+
+    Keyed on the assigned unit ids, not the chunk's position: halving renumbers
+    every chunk after the split, so a positional key would make a resumed run
+    read back an answer to a different question. Hashed rather than joined
+    because forty ids do not fit in a filename.
+    """
+    return sha256("\n".join(chunk).encode("utf-8")).hexdigest()[:16]
+
+
+def _preview(units: list[str], limit: int = 8) -> str:
+    """A bounded list of ids for an operator message."""
+    if len(units) <= limit:
+        return ", ".join(units)
+    return f"{', '.join(units[:limit])} and {len(units) - limit} more"
 
 
 def _stamp(answer: str, fields: dict[str, str]) -> str:
@@ -238,7 +363,12 @@ class Driver:
     # -- model dispatch -----------------------------------------------------
 
     def _ask(
-        self, phase: Phase, system: str, prompt: str, cache_prefix: str = ""
+        self,
+        phase: Phase,
+        system: str,
+        prompt: str,
+        cache_prefix: str = "",
+        max_output_tokens: int | None = None,
     ) -> str:
         """One metered model call, through the shared dispatcher.
 
@@ -254,6 +384,7 @@ class Driver:
             system=system,
             prompt=prompt,
             cache_prefix=cache_prefix,
+            max_output_tokens=max_output_tokens,
         )
         self._redactions = self._dispatcher.redactions
         return answer
@@ -261,24 +392,160 @@ class Driver:
     # -- phases -------------------------------------------------------------
 
     def _do_router(self, ref: RunRef, report: RunReport) -> None:
+        """Route every unit and record one merged backlog.
+
+        The router is the only phase whose answer grows with the target, and
+        the growth is unbounded: one scenario or coverage decision per routing
+        unit recon found. On anything larger than a demo repository that
+        overruns the output ceiling, and the failure is invisible until the
+        JSON stops mid-string — so the assignment is split by routing unit and
+        the answers merged before the recorder ever sees them.
+
+        The rendered prompt is byte-identical across chunks, so it travels as
+        the cache prefix and is paid for once instead of once per call. Only
+        the assignment varies.
+        """
         prompt = self._workspace.render_router_prompt(ref)
+        units = self._workspace.routing_units(ref)
+        merged = (
+            self._route_chunked(ref, prompt.text, units, report)
+            if units
+            else self._route_whole(prompt.text)
+        )
+        self._workspace.record_backlog(
+            ref, json.dumps(merged, indent=2, sort_keys=True)
+        )
+
+    def _route_whole(self, prompt: str) -> dict[str, Any]:
+        """Ask for the entire backlog in one call.
+
+        Only for a target recon found no routing units in, where there is
+        nothing to split on and the prompt is the whole task.
+        """
         last: str = ""
         for _ in range(self._policy.max_retries + 1):
             try:
-                answer = self._ask(Phase.router, ROUTER_SYSTEM, prompt.text)
-                # Unwrap a markdown fence before the recorder sees it. The
-                # scenario and triage paths get this free from `_stamp`, which
-                # parses and re-serialises; the router hands its answer straight
-                # to the workspace, so nothing stripped the fence and
-                # `json.loads` failed at character 0. A live run against DSVW is
-                # what surfaced it — every offline fake answered unfenced.
-                self._workspace.record_backlog(ref, _unfence(answer))
-                return
+                return _router_answer(
+                    self._ask(
+                        Phase.router,
+                        ROUTER_SYSTEM,
+                        prompt,
+                        max_output_tokens=self._policy.router_max_output_tokens,
+                    )
+                )
             except WorkspaceError as exc:
-                # a rejected backlog is usually a coverage failure: the router
-                # left a mandatory routing unit neither covered nor excused
                 last = str(exc)
         raise WorkspaceError(f"router answer rejected after retries: {last}")
+
+    def _route_chunked(
+        self, ref: RunRef, prompt: str, units: list[str], report: RunReport
+    ) -> dict[str, Any]:
+        """Route units in assignments, halving any chunk that overruns.
+
+        Halving rather than failing is what makes the chunk size a tuning knob
+        instead of a correctness one: too large merely costs a wasted call
+        before the split, and the run still completes.
+        """
+        pending = _chunks(units, self._policy.router_chunk_units)
+        total = len(pending)
+        merged: dict[str, Any] = {"scenarios": [], "coverage_decisions": []}
+        missing: list[str] = []
+        index = 0
+        while pending:
+            chunk = pending.pop(0)
+            index += 1
+            try:
+                answer = self._route_chunk(ref, prompt, chunk, index, max(total, index))
+            except TruncatedAnswer:
+                if len(chunk) == 1:
+                    # One unit already, and its answer still does not fit. No
+                    # split is left to make, so the ceiling is genuinely too low
+                    # rather than the assignment too large.
+                    raise
+                half = len(chunk) // 2
+                pending[:0] = [chunk[:half], chunk[half:]]
+                total += 1
+                index -= 1
+                continue
+            # Merged by shape rather than by a known key list: the router also
+            # emits coverage notes, and a merge that only understood the two
+            # arrays would drop them silently on every chunked run.
+            for key, value in answer.items():
+                if isinstance(value, list):
+                    merged.setdefault(key, []).extend(value)
+                else:
+                    merged.setdefault(key, value)
+            missing.extend(_unaddressed(chunk, answer))
+        merged["scenarios"] = _renumber(merged["scenarios"])
+        if missing:
+            # Surfaced, not enforced. The backlog recorder owns admissibility —
+            # it knows which units are mandatory and this driver does not — so
+            # this says what happened and lets the recorder give the verdict.
+            report.warnings.append(
+                f"router: {len(missing)} routing unit(s) came back neither routed "
+                f"nor excused ({_preview(missing)}). The backlog recorder decides "
+                "whether the backlog is still admissible"
+            )
+        return merged
+
+    def _route_chunk(
+        self, ref: RunRef, prompt: str, chunk: list[str], index: int, total: int
+    ) -> dict[str, Any]:
+        """One assignment, re-asked while it leaves assigned units unaddressed.
+
+        A truncation propagates instead of being retried: an identical prompt
+        truncates identically, so only the caller's split changes the outcome.
+
+        An accepted answer is written to the run before returning, and a chunk
+        already answered is read back instead of re-asked. The router is a long
+        phase — dozens of calls on a real target — and a transient failure part
+        way through would otherwise discard every paid-for answer before it.
+        A live run lost 39 completed calls to a single timeout that way.
+        """
+        key = _chunk_key(chunk)
+        cached = self._workspace.read_router_chunk(ref, key)
+        if cached is not None:
+            try:
+                return _router_answer(cached)
+            except WorkspaceError:
+                # A half-written or hand-edited file is not worth trusting;
+                # re-asking costs one call and is always correct.
+                pass
+        best: dict[str, Any] | None = None
+        last: str = ""
+        assignment = ROUTER_ASSIGNMENT.format(
+            index=index,
+            total=total,
+            count=len(chunk),
+            units="\n".join(f"- {unit}" for unit in chunk),
+        )
+        for _ in range(self._policy.max_retries + 1):
+            try:
+                answer = _router_answer(
+                    self._ask(
+                        Phase.router,
+                        ROUTER_SYSTEM,
+                        assignment,
+                        cache_prefix=prompt,
+                        max_output_tokens=self._policy.router_max_output_tokens,
+                    )
+                )
+            except TruncatedAnswer:
+                raise
+            except WorkspaceError as exc:
+                last = str(exc)
+                continue
+            best = answer
+            if not _unaddressed(chunk, answer):
+                self._workspace.write_router_chunk(ref, key, json.dumps(answer))
+                return answer
+        if best is None:
+            raise WorkspaceError(f"router answer rejected after retries: {last}")
+        # Persisted even though it left units unaddressed: it was paid for, the
+        # shortfall is reported, and the recorder — not this driver — decides
+        # whether the merged backlog is admissible.
+        self._workspace.write_router_chunk(ref, key, json.dumps(best))
+        return best
 
     def _do_scenario(self, ref: RunRef, scenario: ScenarioRef) -> WorkOutcome:
         prompt = self._workspace.render_scenario_prompt(ref, scenario.scenario_id)
