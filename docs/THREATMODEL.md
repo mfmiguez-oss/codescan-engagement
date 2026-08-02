@@ -44,7 +44,7 @@ test that exists.
 | R22 | The vendored methodology drifts from upstream unnoticed | manifest of per-file hashes; drift and in-place edits fail the gate | mitigated | test_no_vendored_file_has_been_edited_in_place |
 | R23 | The deployed image cannot do the job it builds cleanly for | deploy files cross-checked, and an end-to-end scan runs in the image | mitigated | test_the_image_installs_what_the_control_plane_command_needs |
 | R24 | A scan runs with more privilege than reading source requires | the container runs as a non-root user | mitigated | test_the_image_does_not_run_as_root |
-| R25 | A rate-limited or hostile caller exhausts the control plane | rate limiting at the ingress | open | — |
+| R25 | A rate-limited or hostile caller exhausts the control plane | per-principal token buckets in the control plane, with a smaller allowance on spending routes; a fleet still needs one at the ingress | mitigated | test_a_caller_past_its_allowance_is_refused |
 | R26 | The JWKS endpoint is unreachable or serves rotated keys mid-run | bounded key cache with refetch on unknown `kid` | open | — |
 | R27 | An analyst acts on a queue without knowing how much was reviewed | coverage stated before any finding in the report | mitigated | test_coverage_is_the_first_thing_the_page_says |
 | R28 | Secrets reach a log platform through the control plane's own logging | failures log the exception type, never the token | open | — |
@@ -82,6 +82,46 @@ test that exists.
 | R60 | A vault silently falls back to a stale environment value, so rotation does nothing | a configured vault that fails is an error, never a fallback | mitigated | test_a_configured_vault_never_falls_back_to_the_environment |
 | R61 | A secret value reaches a log, an error message or an artifact | failures name the vault and the secret name only; the plan prints no values | mitigated | test_a_failure_names_the_coordinates_and_never_the_value |
 | R62 | The vault fetch is refused by this package's own egress allowlist | the vault host is derived from the same configuration that names the vault | mitigated | test_the_vault_host_is_on_the_egress_allowlist |
+| R63 | An unattended run authorises its own exceptions to the critical-only rule, and the rule stops existing | `draft_poc` refuses a machine actor, derived from the subject and not the role set | mitigated | test_a_run_may_not_authorise_its_own_exception_to_the_critical_rule |
+| R64 | An unauthenticated caller spends model budget through the drafting route | requesting a draft is authenticated and authorized exactly like a write, before any provider is built | mitigated | test_requesting_a_draft_without_a_credential_is_refused |
+| R65 | A requested draft is an unbounded spend because a person asked for it | the batch cap and the run ledger apply to a request too, and the shortfall is reported | mitigated | test_a_request_is_metered_and_bounded_like_any_other_spend |
+| R66 | A finding lifted into critical by enrichment is drafted against its pre-enrichment score and skipped | chaining is fed back inside `analyse`, before selection reads the score | mitigated | test_chain_membership_reaches_the_score_before_poc_selection_reads_it |
+| R67 | Feeding chaining back twice double-counts and inflates a score | one place applies it; the caller no longer does | mitigated | test_chaining_is_applied_exactly_once |
+| R68 | A finding below critical reads as one no PoC exists for | undrafted findings named, with the request path stated in the same warning | mitigated | test_findings_below_critical_are_named_and_pointed_at_the_request_path |
+| R69 | A CLI-asserted operator identity is mistaken for a verified one | `operator()` carries `analyst` only and is displayed as unverified; terminal states stay behind the control plane | mitigated | test_a_cli_operator_may_ask_for_work_and_still_not_close_a_finding |
+| R70 | A credential rides into a cached prompt prefix and persists on a third party's infrastructure | the prefix is redacted on the same path as every other byte that leaves | mitigated | test_the_prefix_is_redacted_like_everything_else_that_leaves |
+| R71 | Hoisting content to make it cacheable changes what the model was asked | only the expert manifest moves; the instruction block stays with the header it refers to | mitigated | test_the_instruction_block_stays_with_the_header_it_refers_to |
+| R72 | A cache prefix is silently dropped on a surface that cannot mark a breakpoint | folded into the system prompt instead, so the model sees the same prompt either way | mitigated | test_a_surface_without_cache_control_still_receives_the_prefix |
+| R73 | Every call pays a cache write premium for an entry nothing ever reads | reads are counted from the provider's own numbers and a cache that never hits is a warning | mitigated | test_a_cache_offered_and_never_read_is_a_warning_not_a_zero |
+| R74 | The console decides who may do what, and drifts from the server | the settable states are computed by the authorizing function and rendered; the server refuses regardless | mitigated | test_hiding_a_control_is_a_courtesy_and_the_server_still_refuses |
+| R75 | A finding title from the repository under review executes in the analyst's browser | the page builds nodes and assigns text; nothing from the queue is written as markup | mitigated | test_the_page_never_writes_queue_data_as_markup |
+| R76 | A development token becomes a network-reachable shared credential | `--dev-token` is refused unless the listener is bound to loopback | mitigated | test_a_shared_dev_token_is_refused_off_loopback |
+| R77 | An access token is persisted where another page or a later session can reach it | held in a variable only; never in `localStorage`, never in a cookie | mitigated | test_the_token_is_never_put_in_persistent_storage |
+| R78 | The console loads code from another origin | one self-contained document under a deny-by-default CSP | mitigated | test_the_policy_admits_no_other_origin |
+| R79 | A missing deployment is silently replaced by an available one, changing the bill and the findings while every count looks healthy | preflight reports availability and never acts on it; no field pairs a missing model with a replacement | mitigated | test_the_report_carries_no_field_that_could_become_a_replacement |
+| R80 | A provider that cannot list its deployments blocks every run | an empty listing means *unknown*, never *serves nothing*; an unchecked run proceeds and says so | mitigated | test_a_provider_that_cannot_answer_leaves_the_run_unchecked |
+| R81 | A correctly configured cross-region profile id is refused as missing | deployments compared bare as well as exactly, so platform prefixes do not defeat the match | mitigated | test_a_platform_prefix_does_not_make_a_present_model_look_missing |
+| R82 | A run discovers a missing deployment three phases in, having already spent what it took to get there | every deployment a run could reach — including the second pass — is checked before dispatch | mitigated | test_every_task_a_run_could_reach_is_checked |
+| R83 | The rate limiter becomes an oracle for what a principal would be allowed to do | authorization is answered before the limit, so a forbidden caller is told 403 rather than 429 | mitigated | test_authorization_is_answered_before_the_limit |
+| R84 | The limiter's own principal map grows without bound and becomes the exhaustion vector | the map is capped and evicts least-recently-seen entries | mitigated | test_the_principal_map_cannot_itself_become_the_exhaustion_vector |
+| R85 | A caller raises its own spend ceiling by naming one in a run request | the request model is strict; budget and model come from the deployment | mitigated | test_a_run_request_cannot_smuggle_extra_arguments |
+| R86 | An analyst who may close findings can also start scans | starting a run needs `scanner`, which is separate from the adjudication roles | mitigated | test_an_approver_who_cannot_scan_may_not_start_a_run |
+| R87 | Two runs against one target race on the workspace and corrupt each other | one run per target at a time, refused with 409 rather than started | mitigated | test_two_runs_against_one_target_are_refused |
+| R88 | A control plane that only serves a queue is also able to spend | starting runs is off unless the deployment passes `--allow-runs` | mitigated | test_a_deployment_that_did_not_enable_runs_refuses_them |
+| R89 | A run id from a query string reads a `queue.json` outside the workspace | the resolved path is checked against the workspace root before it is used | mitigated | test_a_run_id_cannot_escape_the_workspace |
+| R90 | A bulk state change is refused halfway, leaving the caller unable to say which half happened | authorized once before anything is written, and reported per finding | mitigated | test_a_bulk_change_is_authorized_once_before_anything_is_written |
+| R91 | One bulk request becomes ten thousand writes | the fingerprint list is bounded and over-long requests are refused | mitigated | test_a_bulk_request_is_bounded |
+
+## Threat models per output
+
+Organised by artifact rather than by risk, and long enough to be its own
+document: **[OUTPUTS.md](OUTPUTS.md)** describes everything a repo analysis
+produces, who reads it, what it must not be read as, and the threat model for
+each — with a diagram apiece.
+
+The register above and that file answer different questions. This one asks
+"what could go wrong in the pipeline"; that one asks "what may a reader of this
+file safely conclude from it".
 
 ## What is deliberately out of scope
 

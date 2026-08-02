@@ -363,6 +363,29 @@ def movement_summary(rows: list[Row]) -> dict[str, int]:
     return tally
 
 
+def read_manifest(path: Path) -> list[ScoredFinding]:
+    """Load a run's queue back out of its manifest, findings only.
+
+    The manifest carries worklist columns beside each finding — movement, merge
+    counts, provenance — and :class:`ScoredFinding` forbids unknown fields on
+    purpose. They are dropped here rather than the model being loosened: the
+    strictness is what catches a workspace changing shape underneath a run, and
+    trading it away to save one dict comprehension would be a bad exchange.
+
+    Raises :class:`ValueError` on a manifest that is not readable, because the
+    caller is about to spend model budget against whatever this returns.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+        raise ValueError(f"{path} is not a queue manifest")
+    fields = set(ScoredFinding.model_fields)
+    return [
+        ScoredFinding.model_validate({k: v for k, v in entry.items() if k in fields})
+        for entry in payload["findings"]
+        if isinstance(entry, dict)
+    ]
+
+
 def write_manifest(rows: list[Row], path: Path, run_id: str) -> Path:
     """A machine-readable sidecar carrying what the CSV flattens."""
     path.parent.mkdir(parents=True, exist_ok=True)

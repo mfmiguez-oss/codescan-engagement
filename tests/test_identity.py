@@ -12,6 +12,7 @@ from engagement.identity import (
     ValidationState,
     authorize,
     machine,
+    operator,
 )
 
 ANALYST = Principal(subject="oid-1", roles=[Role.analyst], tenant="acme")
@@ -37,6 +38,52 @@ def test_an_unattended_run_may_scan_but_not_adjudicate() -> None:
     authorize(machine(), Action.run_scan)
     with pytest.raises(Unauthorized):
         authorize(machine(), Action.set_state, ValidationState.confirmed)
+
+
+def test_a_run_may_not_authorise_its_own_exception_to_the_critical_rule() -> None:
+    """A run drafts for what came out critical and stops. If it could also ask
+    for the rest, the rule would not exist — so the machine actor is refused
+    here even though it is exactly the actor that spends on every other stage."""
+    with pytest.raises(Unauthorized, match="machine actor"):
+        authorize(machine(), Action.draft_poc)
+
+
+def test_a_machine_holding_every_role_is_still_refused_a_requested_draft() -> None:
+    """Derived from the subject, not the role set: a role can be granted by
+    mistake, while the subject is minted by whatever issued the credential."""
+    over_privileged = Principal(subject="machine:runner", roles=list(Role))
+    with pytest.raises(Unauthorized):
+        authorize(over_privileged, Action.draft_poc)
+
+
+def test_the_people_who_work_the_queue_may_request_a_draft() -> None:
+    authorize(ANALYST, Action.draft_poc)
+    authorize(APPROVER, Action.draft_poc)
+    authorize(ADMIN, Action.draft_poc)
+
+
+def test_a_scanner_may_run_scans_and_not_request_drafts() -> None:
+    with pytest.raises(Unauthorized):
+        authorize(SCANNER, Action.draft_poc)
+
+
+def test_a_cli_operator_must_be_named() -> None:
+    """A default would put an unattributable action in the trail and make it
+    read like an attributable one."""
+    for blank in ("", "   "):
+        with pytest.raises(Unauthorized):
+            operator(blank)
+
+
+def test_a_cli_operator_may_ask_for_work_and_still_not_close_a_finding() -> None:
+    """Identity on a shell is asserted, not verified. It buys the ability to
+    spend, never the ability to end review."""
+    ada = operator("ada")
+
+    assert not ada.is_machine
+    authorize(ada, Action.draft_poc)
+    with pytest.raises(Unauthorized):
+        authorize(ada, Action.set_state, ValidationState.risk_accepted)
 
 
 def test_an_analyst_may_investigate_but_not_close() -> None:

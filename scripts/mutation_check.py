@@ -51,6 +51,154 @@ MUTATIONS: list[Mutation] = [
         "tests/test_analysis.py::test_model_prose_cannot_carry_markup_into_the_pack",
     ),
     (
+        # the rule going back to drafting for everything — the expensive
+        # regression, and the one that reads as a feature
+        "analysis.py",
+        "        critical = [finding for finding in findings if is_critical(finding)]",
+        "        critical = list(findings)",
+        "tests/test_analysis.py::test_only_critical_findings_are_drafted_for_automatically",
+    ),
+    (
+        # selection reading a pre-chaining score: a finding lifted into critical
+        # by the stage immediately before it would be silently skipped
+        "analysis.py",
+        "        apply_chaining(findings, summary.chains, signals)",
+        "        pass",
+        "tests/test_analysis.py::"
+        "test_chain_membership_reaches_the_score_before_poc_selection_reads_it",
+    ),
+    (
+        # the limiter checked before authorization, turning it into an oracle
+        # for what a principal would be allowed to do if it only waited
+        "api.py",
+        "        try:\n"
+        "            authorize(principal, action, state, tenant=self._config.tenant or None)\n"
+        "        except Unauthorized as exc:\n"
+        '            logger.info("authorization denied for %s: %s", principal.subject, exc)\n'
+        '            raise Problem(403, "forbidden") from exc\n'
+        "        try:\n"
+        "            self._limiter.check(principal.actor(), spending=spending)",
+        "        try:\n"
+        "            self._limiter.check(principal.actor(), spending=spending)\n"
+        "        except RateLimited as exc:\n"
+        '            raise Problem(429, "too many requests") from exc\n'
+        "        try:\n"
+        "            authorize(principal, action, state, tenant=self._config.tenant or None)\n"
+        "        except Unauthorized as exc:\n"
+        '            raise Problem(403, "forbidden") from exc\n'
+        "        try:\n"
+        "            pass",
+        "tests/test_ratelimit.py::test_authorization_is_answered_before_the_limit",
+    ),
+    (
+        # a bulk change authorized per finding instead of once, so a refusal
+        # arrives after some of the work is already done
+        "api.py",
+        "        self._guard(principal, Action.set_state, state)\n\n"
+        '        note = payload.get("note")\n'
+        "        results: list[dict[str, Any]] = []",
+        '        note = payload.get("note")\n'
+        "        results: list[dict[str, Any]] = []",
+        "tests/test_console.py::"
+        "test_a_bulk_change_is_authorized_once_before_anything_is_written",
+    ),
+    (
+        # a run id from the query string joined without checking it stays
+        # inside the workspace
+        "serving.py",
+        "        if not candidate.is_relative_to(root):\n"
+        '            raise ValueError("run id escapes the workspace")',
+        "        if False:\n"
+        '            raise ValueError("")',
+        "tests/test_console.py::test_a_run_id_cannot_escape_the_workspace",
+    ),
+    (
+        # the threat model rendering repository text unneutralised: a pipe ends
+        # a table cell and a quote closes a Mermaid label, silently
+        "threatmodel.py",
+        '_UNSAFE = re.compile(r"[<>|`\\"\\r\\n]")',
+        '_UNSAFE = re.compile(r"(?!x)x")',
+        "tests/test_threatmodel.py::"
+        "test_a_hostile_finding_title_cannot_break_the_document",
+    ),
+    (
+        # coverage stated after the threats, where a reader has already formed
+        # a view of how much of the system this describes
+        "threatmodel.py",
+        "    lines += _coverage(report)\n    lines += _entry_points(exposure)",
+        "    lines += _entry_points(exposure)",
+        "tests/test_threatmodel.py::test_coverage_is_stated_before_any_threat",
+    ),
+    (
+        # "could not tell" collapsing into "serves nothing" — the failure that
+        # would block every run the moment a list endpoint went down
+        "preflight.py",
+        "    if not available:\n        return PreflightReport(\n            checked=False,",
+        "    if not available:\n        return PreflightReport(\n            checked=True,",
+        "tests/test_preflight.py::"
+        "test_a_provider_that_cannot_answer_leaves_the_run_unchecked",
+    ),
+    (
+        # a correctly-configured Bedrock profile id read as missing
+        "preflight.py",
+        "    if wanted in available:\n        return True\n"
+        "    return bare_model_id(wanted) in bare",
+        "    return wanted in available",
+        "tests/test_preflight.py::"
+        "test_a_platform_prefix_does_not_make_a_present_model_look_missing",
+    ),
+    (
+        # the cache prefix silently dropped on a surface that cannot mark a
+        # breakpoint — a cost optimisation that changes what the model is asked
+        "providers.py",
+        "        instructions = merge_prefix(request.system, request.cache_prefix)",
+        "        instructions = request.system",
+        "tests/test_caching.py::"
+        "test_a_surface_without_cache_control_still_receives_the_prefix",
+    ),
+    (
+        # a prefix under the floor dropped rather than inlined
+        "dispatch.py",
+        '                system = f"{system}\\n\\n{redacted_prefix.text}"',
+        "                pass",
+        "tests/test_caching.py::test_a_prefix_below_the_floor_is_still_sent_to_the_model",
+    ),
+    (
+        # the cached span escaping redaction: invariant text is not safe text
+        "dispatch.py",
+        "                redacted_prefix = redact(cache_prefix)\n"
+        "                self.redactions += redacted_prefix.count\n"
+        "                redacted.restorations.update(redacted_prefix.restorations)\n"
+        "                prefix = redacted_prefix.text",
+        "                prefix = cache_prefix",
+        "tests/test_caching.py::"
+        "test_the_prefix_is_redacted_like_everything_else_that_leaves",
+    ),
+    (
+        # the console deciding authority for itself instead of rendering the
+        # server's answer — and the server no longer enforcing it
+        "identity.py",
+        "    if state in TERMINAL_STATES:\n"
+        "        if not principal.has(Role.approver):",
+        "    if state in TERMINAL_STATES:\n"
+        "        if False:",
+        "tests/test_console.py::"
+        "test_hiding_a_control_is_a_courtesy_and_the_server_still_refuses",
+    ),
+    (
+        # a run authorising its own exception to the rule
+        "identity.py",
+        "        if principal.is_machine:\n"
+        "            raise Unauthorized(\n"
+        '                f"{principal.subject} is a machine actor: a PoC outside the "\n'
+        '                "critical set is drafted on a person\'s request, never on a run\'s"\n'
+        "            )",
+        "        if False:\n"
+        "            raise Unauthorized(\"\")",
+        "tests/test_identity.py::"
+        "test_a_run_may_not_authorise_its_own_exception_to_the_critical_rule",
+    ),
+    (
         "lifecycle.py",
         "            report.unknown_components.append(f\"{ecosystem or '?'}:{name}\")\n"
         "            report.assessments.append(\n"

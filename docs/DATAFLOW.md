@@ -88,9 +88,12 @@ flowchart TB
   PARSE --> ENRICH["enrich<br/><i>KEV · EPSS</i>"]:::det
   ENRICH --> SCORE["score · rank<br/><i>weighted + KEV floor</i>"]:::det
   SCORE --> LIFE["lifecycle<br/><i>EOL · EOS · deprecated</i>"]:::det
-  LIFE --> CHAINS["chains<br/><i>1 call per service</i>"]:::ai
-  LIFE --> POC["PoC drafts<br/><i>1 call per 10</i>"]:::ai
-  LIFE --> EXPORT["worklist<br/><i>dedup · movement</i>"]:::det
+  LIFE --> EXPO["exposure<br/><i>recon boundaries</i>"]:::det
+  EXPO --> CHAINS["chains<br/><i>1 call per service</i>"]:::ai
+  CHAINS --> CHAIN2["chaining fed back"]:::det
+  CHAIN2 --> POC["PoC drafts<br/><i>critical only · 1 call per 10</i>"]:::ai
+  REQ["analyst request<br/><i>CLI · console</i>"]:::art -.-> POC
+  CHAIN2 --> EXPORT["worklist<br/><i>dedup · movement</i>"]:::det
   EXPORT --> OUT["queue.csv · queue.json"]:::art
   CHAINS --> PACK["chains.json"]:::art
   POC --> MD["pocs.md"]:::art
@@ -122,10 +125,11 @@ Each stage's input and output type, and whether it can spend money.
 | score | `backbone` | `Finding` | `Finding` + `ScoreBreakdown` | — |
 | project | `triage` | `Finding` | `ScoredFinding` | — |
 | lifecycle | `lifecycle` | `ScoredFinding[]`, inventory | + minted findings, adjustments | — |
-| chains | `analysis` | `ScoredFinding[]` | `Chain[]` | ● |
-| PoC | `analysis` | `ScoredFinding[]` | `Poc[]` | ● |
 | exposure | `signals` | recon boundaries | `exposure` + adjustment | — |
+| chains | `analysis` | `ScoredFinding[]` | `Chain[]` | ● |
 | chaining | `signals` | `Chain[]` | `chaining` + adjustment | — |
+| PoC | `analysis` | critical `ScoredFinding[]` | `Poc[]` | ● |
+| PoC on request | `analysis` | named ids, any score | `Poc[]` | ● |
 | worklist | `export` | `ScoredFinding[]`, baseline | `Row[]` → CSV | — |
 
 **All four score dimensions are now populated.** Severity and exploitability
@@ -252,6 +256,9 @@ Everything written, and who reads it.
 | `<baseline>.json` | `export` | the **next** run's movement column | ● |
 | `chains.json` | `analysis` | analysts; the report | ● |
 | `pocs.md` | `analysis` | responders | ● |
+| `pocs-requested.md` | `draft-poc` | the analyst who asked | ● |
+| `decisions.jsonl` | the control plane | the console; the next run's queue | ● |
+| `threat-model.md` | `threatmodel` | whoever decides what to fix | ● |
 | `report.html` | `report` | analysts; ticket attachments | ● |
 | `kev.json` | `fetch-kev` | enrichment | cached |
 
@@ -277,9 +284,16 @@ a warning that names what the result does **not** mean.
 | baseline | the whole worklist | movement reads `unknown`, never `new` |
 | budget mid-run | what was reached | remaining items as `unfunded`, exit code 3 |
 | model deployment | nothing that stage does | refuses to start; never guesses a deployment |
+| a configured deployment the resource does not serve | nothing — the run is refused before dispatch | the missing name, the task that wanted it, and the deployments in that family that exist. **Never a substitution** |
+| the provider cannot list its deployments | everything; the run proceeds | *unchecked*, warned, and exit 3 from the standalone command — a listing that failed is not a check that passed |
 | two providers configured | nothing | refuses; never guesses a bill |
 | a chain call fails | every other service | those findings named as *never examined* |
 | a PoC batch fails | every other batch | those findings named as *not attempted* — never *implausible* |
+| a finding is below critical | the whole queue; it ranks normally | named as undrafted, with the request path — a draft is asked for by id, not argued past a threshold |
+| a cache prefix below the model's floor | the whole prompt; the text is sent inline | counted, because the API would accept the breakpoint and cache nothing |
+| a cache offered and never read | everything | a warning: every call paid the write premium for an entry nothing reused |
+| no run directory for the console | the machine API | the console is not mounted at all, rather than rendering an empty queue as though the run found nothing |
+| recon boundaries (exposure) | drafting still runs | every finding at the no-boundary baseline, so fewer reach critical — the missing recon is reported |
 
 The single rule underneath all of it: **absence is reported as absence.** A
 stage that could not check something must never produce output shaped like a

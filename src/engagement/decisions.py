@@ -107,6 +107,17 @@ class DecisionStore(Protocol):
 
     def all(self) -> list[Decision]: ...
 
+    def history(self, fingerprint: str) -> list[Decision]:
+        """Every decision ever recorded for one finding, oldest first.
+
+        Part of the protocol rather than one backend's extra, because "who
+        closed this, and when" is a question asked about findings that are
+        currently *open* — a store that can only answer for the current state
+        cannot answer it at all, and a caller should not have to know which
+        backend it happens to be talking to before it can ask.
+        """
+        ...
+
 
 class _BaseStore:
     """Shared write path. Subclasses supply storage, never the rule."""
@@ -135,18 +146,32 @@ class _BaseStore:
 
 
 class MemoryDecisionStore(_BaseStore):
+    """In-memory, and still append-only.
+
+    The history is kept here too rather than only in the file backend: a test
+    that exercised precedence against a store with no history would not be
+    exercising the same contract the deployment runs, and the one place that
+    difference would show up is the audit question nobody tests until they
+    need the answer.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self._records: dict[str, Decision] = {}
+        self._history: list[Decision] = []
 
     def get(self, fingerprint: str) -> Decision | None:
         return self._records.get(fingerprint)
 
     def _write(self, decision: Decision) -> None:
         self._records[decision.fingerprint] = decision
+        self._history.append(decision)
 
     def all(self) -> list[Decision]:
         return list(self._records.values())
+
+    def history(self, fingerprint: str) -> list[Decision]:
+        return [d for d in self._history if d.fingerprint == fingerprint]
 
 
 class JsonlDecisionStore(_BaseStore):

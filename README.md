@@ -164,18 +164,226 @@ engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
 
 `--chains` finds ordered sequences that combine into a worse outcome than any
 one finding alone — one call per service, because a chain between components
-that never talk is not a chain. `--pocs` drafts, per finding, what an operator
-*would* do in a test environment, with the preconditions first: whether the path
-is really open is decided there. Both write into the run folder — `chains.json`
-and a readable `pocs.md` pack — and both are **advisory**. Nothing is executed,
-and a failure costs its own artifact, never a finding.
+that never talk is not a chain. `--pocs` drafts what an operator *would* do in a
+test environment, with the preconditions first: whether the path is really open
+is decided there. Both write into the run folder — `chains.json` and a readable
+`pocs.md` pack — and both are **advisory**. Nothing is executed, and a failure
+costs its own artifact, never a finding.
 
-They spend from the run's own ledger, so `--max-calls` still bounds the whole
-engagement. The caps are bounds like any other and are reported, never silent:
-chain discovery examines at most 60 findings per service and PoC drafting the
-top 40 by risk, in batches of 10 so one over-long response cannot truncate every
-draft in it. Findings past a cap are named in the summary — no PoC below means
-*not attempted*, never *implausible*.
+### Which findings get a draft
+
+**Only the ones that come out of enrichment critical** — declared critical by a
+scanner, or scored at or above the KEV floor of 85 once lifecycle, exposure and
+chaining have been applied. *Final* is the operative word: chaining is produced
+by the stage immediately before drafting, so a finding that becomes critical
+only by being a link in a chain is still drafted for.
+
+Everything else is drafted **on request**. The rule is deliberately narrow, not
+a judgement that the rest cannot be demonstrated, so both surfaces can ask for
+one by id:
+
+```bash
+ENGAGEMENT_OPERATOR=ada engagement draft-poc runs/acme/run-001 \
+  --finding F-0142 --finding F-0311 --model gpt-5-mini
+```
+
+and, from the console, `POST /api/findings/{id}/poc` — authenticated,
+authorized and audited like a write, because it spends. A machine actor is
+refused it: a run that could authorise its own exceptions to the rule would not
+have one. On the CLI the operator names themselves and that identity is
+*asserted, not verified*, which is why it buys the ability to spend and never
+the ability to close a finding.
+
+Both paths spend from a ledger, so `--max-calls` still bounds the engagement.
+The caps are bounds like any other and are reported, never silent: chain
+discovery examines at most 60 findings per service and PoC drafting at most 40,
+in batches of 10 so one over-long response cannot truncate every draft in it.
+Findings past a cap, and findings below critical, are named in the summary — no
+PoC below means *not attempted*, never *implausible*.
+
+## The threat model of the repo you scanned
+
+Every run writes `threat-model.md` beside its other outputs — a threat model of
+**the system that was reviewed**, not of this tool. The queue answers "which
+finding first" and the report answers "how much was reviewed"; this answers the
+question asked before either: what does this system expose, to whom, and what
+would go wrong.
+
+It is assembled from evidence the run already gathered — entry points from
+recon's request boundaries, assets from the components and the lifecycle pass,
+threats from the scored queue, combinations from chain discovery — and **no
+model is called to write it**. That keeps it deterministic (the same run
+produces the same document) and stops it becoming a fifth thing to distrust.
+
+Coverage is stated before any threat, for the same reason the report states it
+first: a threat model built from a run that reached 40% of its backlog
+describes 40% of a system, and a reader who is not told that reads a quiet
+section as a safe one. Sections that can be thin for a reason name the reason —
+no recon data, no lifecycle feed, no chain discovery — rather than rendering
+empty and looking like "none".
+
+Everything in it comes from a repository under review, so markup is stripped,
+lengths are bounded, and Mermaid node ids are minted rather than taken from
+finding text. A hostile title cannot break the table or silently stop the
+diagram rendering.
+
+See [docs/OUTPUTS.md](docs/OUTPUTS.md) for every artifact a run produces, what
+it must not be read as, and the threat model for each.
+
+## Preflight
+
+A run that names a deployment nobody deployed fails at first dispatch — after
+recon, after the workspace is prepared, and having already spent the calls it
+took to get there. Preflight asks the resource what it serves and compares that
+against every deployment the run could reach, before anything is dispatched.
+
+```bash
+engagement preflight --model claude-opus-5 --analysis-model claude-haiku-4-5
+```
+
+It runs automatically before `engagement run`; `--no-preflight` skips it.
+
+**It reports availability and never acts on it.** The obvious next step —
+"the configured model is missing, so use one that is present" — is precisely
+what it does not do. A silent substitution changes both the bill and the queue
+while every tally still looks healthy: the call count is identical, the ledger
+balances, and the findings are different. Two reasons specific to this package
+make it worse than it sounds: a substituted model may share a vendor with the
+second detection pass, turning corroboration into two models with one blind
+spot, and both sampling support and cache minimums are per-family, so a swap
+silently re-decides each. So it refuses, names what is missing and which task
+wanted it, and shows the deployments in that family that *do* exist.
+
+**Unknown is not missing.** If the provider cannot answer — no permission to
+list, an unreachable endpoint, an empty response — the run is *unchecked* and
+proceeds with a warning, because blocking on a failed listing call would turn
+an advisory check into an outage for runs whose inference works fine. The
+standalone command exits **3** in that case, this CLI's "finished, but not
+cleanly" code, so a scheduler is not told a check passed that never ran.
+
+## The analyst console
+
+The self-contained `report.html` is read-only by design and stays that way.
+The console is its counterpart: the one surface where a person changes a state.
+
+```bash
+engagement console runs/acme/run-001 --model claude-opus-5
+```
+
+It serves the ranked queue joined to each finding's current decision, and lets
+an analyst set a state with a note or ask for a PoC draft. What it may offer is
+decided by the server: `/api/whoami` returns the exact set of states your
+principal may set — computed by the same function that enforces them — so you
+are never shown a control that will be refused. Hiding a control is a courtesy;
+the refusal is the control.
+
+**Authentication is OIDC authorization code with PKCE, and the token is held in
+memory only.** No cookie, no server-side session, nothing on disk. The control
+plane was already bearer-only and that is worth keeping: a cookie would be
+attached automatically to every request to the origin, which is what makes CSRF
+possible, whereas a token in a variable is attached deliberately or not at all.
+A page refresh signs you out, which is the price.
+
+The session refreshes itself: the refresh token is held in memory beside the
+access token, renewed a minute before expiry, and a request that still meets a
+401 retries once behind the scenes. A reload signs you out, which is the same
+trade the access token makes and for the same reason.
+
+For local work with no identity provider, `--dev-token` accepts one fixed
+string — and is **refused unless the listener is on loopback**, because the
+whole identity model rests on "human" having a referent and a shared string
+reachable from a network is not one. It is granted exactly what the invocation
+enabled, so `scanner` appears only alongside `--allow-runs`.
+
+### What the console does
+
+- **Pick a run.** It discovers every run in the workspace that produced a
+  queue, newest first, and opens on the one you pointed it at. A run with no
+  `queue.json` is omitted rather than shown as a run that found nothing.
+- **Open a finding.** Evidence, the score arithmetic (final, the backbone's
+  number before adjustments, and each recorded adjustment separately), whether
+  recon found a boundary in that file, the chains it belongs to, its PoC draft,
+  and every decision ever recorded about it. One request, because the join
+  needs to know which absences mean "no" and which mean "never asked" —
+  "no chain mentions this" and "chain discovery never ran" are different facts.
+- **Adjudicate in bulk.** Select rows, set one state across them, and get a
+  per-finding answer. Authorized once before anything is written, so a refusal
+  cannot arrive halfway; and the response says how many *survived*, because a
+  count alone would hide a machine proposal losing to a human decision.
+- **Start a scan** — see below.
+
+### Starting a run from the console
+
+Off unless a deployment turns it on:
+
+```bash
+engagement console runs/acme/run-001 --model claude-opus-5 --allow-runs
+```
+
+This is the most authority the package grants, so it is fenced four ways. It
+needs the **`scanner`** role — deliberately not `analyst`, because the role
+that may spend has always been separate from the role that may adjudicate, and
+an approver who can close findings still cannot start a scan. The **budget is
+the deployment's**, set by `--run-max-calls`; a caller-supplied ceiling is not
+a ceiling, and the request model refuses a body that tries to name one. **One
+run per target at a time**, because two race on the workspace's own files and
+the second would corrupt the first while both reported success — a second
+attempt gets 409, which says "later", not "never". And the run executes as a
+**subprocess running the same CLI you would type**, so a failure inside a scan
+cannot take the control plane down with it.
+
+Exit 3 — finished, but left work parked or unfunded — is reported as
+*incomplete*, not as a failure. Showing it as failure teaches an analyst to
+ignore the status; showing it as success hides that the run did not finish its
+backlog.
+
+### Rate limiting
+
+Per principal, not per address: a token is what authority attaches to, and
+limiting by address would put a whole office behind one bucket while doing
+nothing about a credential used from many places. Spending routes — drafting a
+PoC, starting a run — carry a second, much smaller allowance checked *as well
+as* the general one, so exhausting the expensive path still leaves you able to
+read and adjudicate.
+
+Authorization is answered **before** the limit. Telling a caller who will never
+be allowed to "slow down" invites them to keep trying and turns the limiter
+into an oracle for what they might eventually be permitted to do.
+
+It bounds one process. A multi-replica deployment still needs a real limiter at
+the ingress — four replicas of a per-process limit is four times the limit, and
+quietly.
+
+Everything the page renders comes from a repository under review, so nothing is
+written into the document as markup: the page builds nodes and assigns text. A
+finding titled `<img src=x onerror=…>` renders as those characters.
+
+## Prompt caching
+
+The scenario stage is the bulk of a run's spend, and every scenario prompt ends
+with the same expert manifest — 7–10 KB of playbook, byte-identical for every
+scenario routed to that expert, of which there are twelve. It is hoisted ahead
+of the scenario and cached, so a repeat is billed at roughly a tenth of the
+input rate.
+
+**Only the manifest moves.** The instruction block above it is larger and looks
+like the better prize, but it says "answer every required proof obligation
+listed above" — and "above" is the scenario header. Hoist it and that reference
+dangles. The manifest is appended last by the renderer, is referred to only as
+"read the expert manifest", and carries no positional reference at all. A
+cheaper prompt that quietly asks a different question is not a saving.
+
+Two things follow, and both are reported rather than assumed:
+
+- The minimum cacheable prefix is **model-dependent** — 512 tokens on Opus 5,
+  1024 on Sonnet 5 and Opus 4.8, 4096 on Opus 4.6 and Haiku 4.5. A prefix below
+  the deployment's floor is sent inline and uncached, and counted, because the
+  API would otherwise accept the breakpoint and cache nothing.
+- Cache reads and writes are recorded from the provider's own numbers, in the
+  ledger and in the audit trail. A run that offered a prefix and never read one
+  back **warns**: every call paid the write premium for an entry nothing
+  reused, which is more expensive than not caching at all and is otherwise
+  completely silent.
 
 ## The worklist
 

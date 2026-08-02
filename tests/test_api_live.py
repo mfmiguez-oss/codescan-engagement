@@ -217,6 +217,11 @@ def test_the_failure_reason_never_reaches_the_caller(keypair: tuple[Any, str]) -
 # -- over HTTP --------------------------------------------------------------
 
 
+class _Drafter:
+    def draft(self, principal: Any, fingerprint: str) -> dict[str, Any]:
+        return {"finding_id": fingerprint, "requested_by": principal.actor()}
+
+
 @pytest.fixture()
 def client(keypair: tuple[Any, str]) -> TestClient:
     _, public_pem = keypair
@@ -225,6 +230,7 @@ def client(keypair: tuple[Any, str]) -> TestClient:
         MemoryDecisionStore(),
         ApiConfig(tenant="acme"),
         MAPPING,
+        _Drafter(),
     )
     return TestClient(build_app(plane))
 
@@ -277,6 +283,28 @@ def test_an_analyst_is_refused_the_close_over_http(
         ).status_code
         == 200
     )
+
+
+def test_a_draft_can_be_requested_from_the_console_over_http(
+    client: TestClient, keypair: tuple[Any, str]
+) -> None:
+    """The other half of the critical-only rule: what a run did not draft for
+    automatically, an analyst asks for from the page they are reading."""
+    key, _ = keypair
+    token = _issue(key, oid="oid-analyst", roles=["Engagement.Analyst"])
+
+    response = client.post(
+        "/api/findings/fp1/poc", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["requested_by"] == "oid-analyst"
+
+
+def test_requesting_a_draft_is_authenticated_like_a_write(client: TestClient) -> None:
+    """It spends money, so it is guarded like a write even though it records
+    no decision."""
+    assert client.post("/api/findings/fp1/poc").status_code == 401
 
 
 def test_an_error_body_carries_no_detail(client: TestClient) -> None:

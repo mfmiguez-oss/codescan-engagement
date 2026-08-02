@@ -45,6 +45,8 @@ class Action(str, Enum):
     run_scan = "run_scan"
     set_state = "set_state"
     export = "export"
+    #: Ask for a PoC draft against a finding the automatic rule passed over.
+    draft_poc = "draft_poc"
 
 
 class ValidationState(str, Enum):
@@ -122,6 +124,33 @@ def machine(name: str = "engagement") -> Principal:
     )
 
 
+def operator(name: str) -> Principal:
+    """The principal a CLI invocation acts as.
+
+    **Asserted, not verified.** On a shell there is no token to check, and the
+    honest thing is to record who claimed to be there rather than to mint a
+    principal that looks as trustworthy as one the control plane proved. The
+    name is required for exactly that reason: a default would put an
+    unattributable action in the trail and read like an attributable one.
+
+    It carries ``analyst`` and never ``approver``, so the unverified path can
+    ask for work to be done and still cannot close a finding. The states that
+    end review stay behind the control plane, which is the only place identity
+    is actually proven.
+    """
+    subject = name.strip()
+    if not subject:
+        raise Unauthorized(
+            "a CLI action must name the operator taking it — set "
+            "ENGAGEMENT_OPERATOR so the audit trail can attribute it"
+        )
+    return Principal(
+        subject=f"operator:{subject}",
+        display=f"{subject} (cli, unverified)",
+        roles=[Role.analyst],
+    )
+
+
 def authorize(
     principal: Principal,
     action: Action,
@@ -154,6 +183,20 @@ def authorize(
     if action is Action.export:
         if not (principal.has(Role.analyst) or principal.has(Role.scanner)):
             raise Unauthorized(f"{principal.subject} may not export findings")
+        return
+
+    if action is Action.draft_poc:
+        # A run drafts for what came out critical and stops. Everything below
+        # that is drafted because a person judged the rule wrong about one
+        # finding — so a machine actor is refused here even holding every role.
+        # An unattended run that could authorise its own exceptions has no rule.
+        if principal.is_machine:
+            raise Unauthorized(
+                f"{principal.subject} is a machine actor: a PoC outside the "
+                "critical set is drafted on a person's request, never on a run's"
+            )
+        if not (principal.has(Role.analyst) or principal.has(Role.approver)):
+            raise Unauthorized(f"{principal.subject} may not request PoC drafts")
         return
 
     if action is Action.set_state:

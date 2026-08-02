@@ -10,6 +10,21 @@ than per-finding, which is why neither falls out of scoring:
   in a test environment, and above all what must *already be true* for the path
   to be open. The preconditions are usually the real finding.
 
+A PoC is drafted **only for a finding that comes out of enrichment critical**.
+"Final" is the load-bearing word: exposure and chaining both move a score, and
+chaining is produced by the stage immediately before this one, so selection runs
+after those adjustments have landed rather than against the score the backbone
+first wrote. Drafting for the whole queue spends the most expensive stage on the
+findings least likely to be acted on this week, and — worse — a pack in which
+every finding has a draft stops telling a responder where to start.
+
+Everything below critical is drafted **on request**, never automatically:
+:func:`draft_requested` takes the ids a person named and drafts for exactly
+those, whatever they score. That is the difference the rule turns on — an
+unattended run decides on its own to spend only where the evidence already
+says "act now", and an analyst who disagrees asks, from the CLI or the console,
+and gets a draft for the finding they are actually looking at.
+
 Both stages are **advisory and subordinate**. They annotate a queue that the
 deterministic backbone already produced, ranked and complete; a failure here
 costs its own artifact and never a finding. That ordering is what makes them
@@ -39,10 +54,12 @@ from pathlib import Path
 
 from pydantic import Field
 
+from .backbone import KEV_FLOOR, Severity
 from .budget import BudgetExceeded
 from .contracts import Chain, Poc, ScoredFinding, StrictModel
 from .dispatch import Dispatcher
 from .providers import unwrap_json
+from .signals import SignalReport, apply_chaining
 
 #: Appended to both system prompts. The queue carries titles and code snippets
 #: recovered from the repository under review, so it is attacker-influenced text
@@ -96,8 +113,15 @@ POC_BATCH = 10
 
 #: PoC drafting is ordered by risk and stops here. This is a bound on an advisory
 #: artifact, never on the findings: everything still ships ranked, and a draft for
-#: the 41st-riskiest finding is worth little beside the finding itself.
+#: the 41st-riskiest finding is worth little beside the finding itself. It applies
+#: to a requested batch too — an explicit request is still a request to spend.
 MAX_POC_FINDINGS = 40
+
+#: The score at which a finding is treated as critical. The KEV floor rather than
+#: a fresh number: the backbone already asserts that a finding at or above it is
+#: as serious as this system ranks anything, and a second constant would be a
+#: second definition of "critical" free to drift from the first.
+CRITICAL_SCORE = KEV_FLOOR
 
 #: Model prose is truncated rather than trusted to be short.
 MAX_TEXT = 2000
@@ -198,6 +222,22 @@ def _render(findings: list[ScoredFinding]) -> str:
     return "\n".join(lines)
 
 
+def is_critical(finding: ScoredFinding) -> bool:
+    """Whether a finding is critical *once every adjustment has landed*.
+
+    Either the declared severity or the final score is enough, and both halves
+    earn their place. Severity alone would miss a high finding that KEV,
+    lifecycle, exposure and chaining together pushed into the top band — which
+    is the whole reason those adjustments exist. Score alone would miss a
+    scanner's own critical that this pipeline happened to have no exploit
+    intelligence about, and "we knew nothing extra" is not grounds to demote it.
+    """
+    return (
+        finding.severity.strip().lower() == Severity.critical.value
+        or finding.risk_score >= CRITICAL_SCORE
+    )
+
+
 def _by_repo(findings: list[ScoredFinding]) -> dict[str, list[ScoredFinding]]:
     """Group by service. A chain between components that never talk is not a chain."""
     groups: dict[str, list[ScoredFinding]] = {}
@@ -286,7 +326,13 @@ class ChainEngine:
 
 
 class PocEngine:
-    """Drafts a proof of concept per finding, highest risk first, in batches."""
+    """Drafts a proof of concept per finding, highest risk first, in batches.
+
+    Two entry points, and the difference between them is who decided to spend.
+    :meth:`draft` is what an unattended run calls and drafts only for findings
+    that came out critical. :meth:`draft_for` is what a person calls and drafts
+    for exactly the findings they named, whatever those score.
+    """
 
     phase = "poc"
 
@@ -295,16 +341,66 @@ class PocEngine:
         self._deployment = deployment
 
     def draft(self, findings: list[ScoredFinding], summary: AnalysisSummary) -> list[Poc]:
-        ranked = sorted(findings, key=lambda f: f.risk_score, reverse=True)
+        """Draft for the critical findings only. The unattended path."""
+        critical = [finding for finding in findings if is_critical(finding)]
+        lesser = [finding for finding in findings if not is_critical(finding)]
+        if lesser:
+            summary.pocs_undrafted += [f.id for f in lesser]
+            summary.warnings.append(
+                f"poc: {len(lesser)} finding(s) did not come out of enrichment "
+                f"critical (severity below critical and score under "
+                f"{CRITICAL_SCORE:.0f}) and were not drafted for automatically. "
+                "A draft for any of them can be requested by id from the CLI or "
+                "the console; no PoC here means not attempted, not implausible"
+            )
+
+        ranked = sorted(critical, key=lambda f: f.risk_score, reverse=True)
         targets, over_cap = ranked[:MAX_POC_FINDINGS], ranked[MAX_POC_FINDINGS:]
         if over_cap:
             summary.pocs_undrafted += [f.id for f in over_cap]
             summary.warnings.append(
-                f"poc: {len(over_cap)} finding(s) ranked below the top "
+                f"poc: {len(over_cap)} critical finding(s) ranked below the top "
                 f"{MAX_POC_FINDINGS} were not drafted for — they ship without a PoC, "
                 "which is a bound on the appendix and not on the queue"
             )
+        return self._draft_batches(targets, summary)
 
+    def draft_for(
+        self, findings: list[ScoredFinding], wanted: list[str], summary: AnalysisSummary
+    ) -> list[Poc]:
+        """Draft for named findings regardless of score. The on-request path.
+
+        Criticality is not consulted: the request *is* the judgement, and an
+        analyst who has to argue a finding past a threshold before the tool will
+        help them is an analyst who stops asking. What is still enforced is that
+        the ids exist in the queue — a draft against an id this run never
+        produced would be a model inventing a finding, which is the one thing
+        neither path allows.
+        """
+        by_id = {finding.id: finding for finding in findings}
+        targets = [by_id[item] for item in dict.fromkeys(wanted) if item in by_id]
+        unknown = [item for item in dict.fromkeys(wanted) if item not in by_id]
+        if unknown:
+            summary.warnings.append(
+                f"poc: {len(unknown)} requested id(s) are not in this run's queue "
+                f"and were not drafted for: {', '.join(sorted(unknown)[:10])}"
+            )
+        if len(targets) > MAX_POC_FINDINGS:
+            over_cap = targets[MAX_POC_FINDINGS:]
+            targets = targets[:MAX_POC_FINDINGS]
+            summary.pocs_undrafted += [f.id for f in over_cap]
+            summary.warnings.append(
+                f"poc: {len(over_cap)} requested finding(s) were past the "
+                f"{MAX_POC_FINDINGS}-finding cap and were not drafted for — an "
+                "explicit request is still a request to spend, so it is bounded "
+                "like any other"
+            )
+        return self._draft_batches(targets, summary)
+
+    def _draft_batches(
+        self, targets: list[ScoredFinding], summary: AnalysisSummary
+    ) -> list[Poc]:
+        """The shared spend path. Both entry points meter through this one."""
         pocs: list[Poc] = []
         for start in range(0, len(targets), POC_BATCH):
             batch = targets[start : start + POC_BATCH]
@@ -465,12 +561,21 @@ def analyse(
     repo: str = "",
     want_chains: bool = True,
     want_pocs: bool = True,
+    signals: SignalReport | None = None,
 ) -> AnalysisSummary:
     """Run the advisory stages over a scored queue.
 
     Never raises for a model or budget failure: the queue it annotates is
     already complete and ranked, so the correct outcome of a failure here is a
     thinner appendix and a louder summary, not a lost run.
+
+    Adjusts the findings in place between its two stages: chain membership is
+    fed back into each finding's score before PoC selection reads it. Exposure
+    must therefore already have been applied by the caller — a finding that only
+    reaches critical once reachability and chaining are counted has to be
+    drafted for, and it cannot be if selection runs against a pre-enrichment
+    score. ``signals`` is where those chaining counts are recorded when the
+    caller is keeping a tally.
     """
     summary = AnalysisSummary()
     if not findings:
@@ -480,6 +585,10 @@ def analyse(
     before = dispatcher.ledger.calls
     if want_chains:
         summary.chains = ChainEngine(dispatcher, deployment).find(findings, summary)
+        # applied here rather than by the caller afterwards, because "afterwards"
+        # is too late to change what the next stage selects — and applying it
+        # twice would double-count, so this is the one place that may
+        apply_chaining(findings, summary.chains, signals)
     if want_pocs:
         summary.pocs = PocEngine(dispatcher, deployment).draft(findings, summary)
     summary.model_calls = dispatcher.ledger.calls - before
@@ -499,9 +608,55 @@ def analyse(
                 encoding="utf-8",
             )
             summary.chains_path = str(chains_path)
+        if summary.pocs:
+            # Written beside the readable pack, not instead of it. The pack is
+            # for a responder working through a procedure; this is for the
+            # console, which needs the fields separately to show a draft next
+            # to the finding it belongs to rather than a wall of Markdown.
+            (out_dir / "pocs.json").write_text(
+                json.dumps(
+                    [poc.model_dump(mode="json") for poc in summary.pocs], indent=2
+                ),
+                encoding="utf-8",
+            )
         pack = to_markdown(summary, findings, repo)
         if pack:
             pocs_path = out_dir / "pocs.md"
             pocs_path.write_text(pack, encoding="utf-8")
             summary.pocs_path = str(pocs_path)
+    return summary
+
+
+def draft_requested(
+    findings: list[ScoredFinding],
+    dispatcher: Dispatcher,
+    deployment: str,
+    finding_ids: list[str],
+) -> AnalysisSummary:
+    """Draft PoCs for findings a person asked for by id.
+
+    The counterpart to the automatic rule: a run drafts for what came out
+    critical, and everything else is available here, on request, from the CLI
+    and from the console. It writes no artifact of its own — the caller decides
+    where a requested draft belongs, which for the console is a response and for
+    the CLI is a file beside the run.
+
+    Like every other stage it spends through the dispatcher, so a requested
+    draft is metered, audited and refused against the same ceiling as an
+    automatic one. Being asked for by a person is authority to spend, not
+    permission to spend without limit.
+    """
+    summary = AnalysisSummary()
+    if not finding_ids:
+        summary.warnings.append("poc: no finding ids were requested")
+        return summary
+    if not findings:
+        summary.warnings.append("poc: this run has no queue to draft against")
+        return summary
+
+    before = dispatcher.ledger.calls
+    summary.pocs = PocEngine(dispatcher, deployment).draft_for(
+        findings, finding_ids, summary
+    )
+    summary.model_calls = dispatcher.ledger.calls - before
     return summary

@@ -12,6 +12,8 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import pytest
+
 from engagement.contracts import ScoredFinding
 from engagement.export import (
     COLUMNS,
@@ -19,6 +21,7 @@ from engagement.export import (
     dedupe,
     movement_summary,
     neutralize,
+    read_manifest,
     to_rows,
     write_manifest,
     write_queue,
@@ -269,3 +272,28 @@ def test_the_manifest_carries_what_the_csv_flattens(tmp_path: Path) -> None:
     assert payload["run_id"] == "run-1"
     assert payload["findings"][0]["detected_by"] == ["snyk"]
     assert payload["movement"]["unchanged"] + payload["movement"]["new"] >= 0
+
+
+def test_the_manifest_reads_back_as_the_findings_that_were_written(
+    tmp_path: Path,
+) -> None:
+    """A requested PoC draft is made against this, so it has to survive a round
+    trip — past the worklist columns the manifest writes beside each finding,
+    which ScoredFinding forbids."""
+    original = _finding(score=91.0, severity="critical")
+    path = write_manifest(to_rows([original], "run-1"), tmp_path / "queue.json", "run-1")
+
+    loaded = read_manifest(path)
+
+    assert [f.id for f in loaded] == ["f1"]
+    assert loaded[0].risk_score == 91.0
+    assert loaded[0].severity == "critical"
+
+
+def test_a_manifest_that_is_not_one_is_refused(tmp_path: Path) -> None:
+    """The caller is about to spend model budget against whatever this returns."""
+    path = tmp_path / "queue.json"
+    path.write_text('{"findings": "not a list"}', encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        read_manifest(path)

@@ -19,6 +19,7 @@ from pathlib import Path
 from engagement import analysis, cli, lifecycle, siem
 from engagement.audit import AuditLog, MemorySink
 from engagement.contracts import ScoredFinding
+from engagement.signals import SignalReport
 from engagement.triage import TriageSummary
 
 
@@ -207,7 +208,13 @@ def test_analysis_without_a_deployment_reports_rather_than_guessing() -> None:
     args.model = ""  # type: ignore[attr-defined]
 
     result = cli._run_analysis(
-        args, TriageSummary(), driver=None, repo="r", run_dir=Path("."), audit_log=AuditLog()  # type: ignore[arg-type]
+        args,  # type: ignore[arg-type]
+        TriageSummary(),
+        driver=None,  # type: ignore[arg-type]
+        repo="r",
+        run_dir=Path("."),
+        audit_log=AuditLog(),
+        signals=SignalReport(),
     )
 
     assert result is not None
@@ -219,7 +226,13 @@ def test_analysis_is_skipped_entirely_when_neither_flag_is_given() -> None:
 
     assert (
         cli._run_analysis(
-            args, TriageSummary(), driver=None, repo="r", run_dir=Path("."), audit_log=AuditLog()  # type: ignore[arg-type]
+            args,  # type: ignore[arg-type]
+            TriageSummary(),
+            driver=None,  # type: ignore[arg-type]
+            repo="r",
+            run_dir=Path("."),
+            audit_log=AuditLog(),
+            signals=SignalReport(),
         )
         is None
     )
@@ -231,6 +244,58 @@ def test_the_report_renderer_accepts_what_the_run_produces() -> None:
 
     parameters = list(inspect.signature(write).parameters)
     assert parameters == ["report", "out", "triage", "lifecycle", "analysis", "movement"]
+
+
+def test_the_request_path_refuses_before_it_spends(tmp_path: Path) -> None:
+    """Each refusal has to happen before a provider is built, because building
+    one is where a key is read and a call becomes possible."""
+    empty: dict[str, str] = {}
+    naming_nobody = {"ENGAGEMENT_MODEL": "m"}
+    named = {"ENGAGEMENT_MODEL": "m", "ENGAGEMENT_OPERATOR": "ada"}
+
+    no_ids = _parse("draft-poc", str(tmp_path))
+    assert cli._cmd_draft_poc(no_ids, named) == cli.EXIT_CONFIG  # type: ignore[arg-type]
+
+    unattributable = _parse("draft-poc", str(tmp_path), "--finding", "f1")
+    assert cli._cmd_draft_poc(unattributable, naming_nobody) == cli.EXIT_CONFIG  # type: ignore[arg-type]
+
+    no_queue = _parse("draft-poc", str(tmp_path), "--finding", "f1")
+    assert cli._cmd_draft_poc(no_queue, named) == cli.EXIT_CONFIG  # type: ignore[arg-type]
+
+    (tmp_path / "queue.json").write_text('{"findings": []}', encoding="utf-8")
+    no_model = _parse("draft-poc", str(tmp_path), "--finding", "f1")
+    assert cli._cmd_draft_poc(no_model, empty) == cli.EXIT_CONFIG  # type: ignore[arg-type]
+
+
+def test_a_requested_draft_takes_ids_as_a_list_or_repeated() -> None:
+    args = _parse("draft-poc", ".", "--finding", "a,b", "--finding", "c")
+
+    assert args.finding == ["a,b", "c"]  # type: ignore[attr-defined]
+
+
+def test_both_entrypoints_map_the_same_directory_values_to_the_same_roles() -> None:
+    """Two deployments, two role tables. They are separate on purpose — one
+    changing its directory must not silently change the other — which is
+    exactly why they need a test that notices when they disagree."""
+    from engagement import asgi
+
+    assert cli.CONSOLE_ROLE_CLAIMS == asgi._ROLE_CLAIMS
+
+
+def test_the_documented_cache_minimums_are_the_ones_the_code_applies() -> None:
+    """The README states per-model floors. A reader sizing a prompt against a
+    number the code does not use is worse off than one told nothing."""
+    from engagement.caching import CACHE_MINIMUM_TOKENS
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    for family, minimum in (
+        ("claude-opus-5", CACHE_MINIMUM_TOKENS["claude-opus-5"]),
+        ("claude-sonnet-5", CACHE_MINIMUM_TOKENS["claude-sonnet-5"]),
+        ("claude-haiku-4-5", CACHE_MINIMUM_TOKENS["claude-haiku-4-5"]),
+    ):
+        assert str(minimum) in readme, f"the floor for {family} is undocumented"
 
 
 def test_the_documented_caps_are_the_ones_the_code_applies() -> None:

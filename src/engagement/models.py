@@ -127,11 +127,13 @@ PROFILES: dict[Task, TaskProfile] = {
     Task.poc: TaskProfile(
         task=Task.poc,
         tier=Tier.economy,
-        volume="1 per 10 findings, top 40 only",
+        volume="1 per 10 critical findings, cap 40",
         rationale=(
             "Drafting a procedure for a finding that is already established. The "
             "hard part was finding it; this is writing it up, and it is advisory "
-            "output that a human reviews before acting on."
+            "output that a human reviews before acting on. Only findings that come "
+            "out critical are drafted automatically, so the volume tracks the "
+            "top of the queue rather than the size of it."
         ),
     ),
 }
@@ -422,6 +424,7 @@ def build_plan(
     findings: int = 0,
     poc_batch: int = 10,
     max_poc: int = 40,
+    critical_findings: int | None = None,
 ) -> Plan:
     """Project each task's model and call count before anything is dispatched.
 
@@ -430,14 +433,20 @@ def build_plan(
     of PoC drafts up to the cap. Getting this wrong in the optimistic direction
     would be the worst kind of error — a budget that looks affordable until the
     run is already halfway through it.
+
+    Drafting is critical-only, so ``critical_findings`` is what drives the PoC
+    count. Left unset it falls back to the whole queue, which over-projects: a
+    projection that is too high costs an operator a raised eyebrow, and one that
+    is too low costs them a run that stops halfway.
     """
     plan = Plan()
+    drafted = findings if critical_findings is None else max(0, critical_findings)
     counts = {
         Task.router: 1 if scenarios or candidates else 0,
         Task.scenarios: max(0, scenarios),
         Task.triage: max(0, candidates),
         Task.chains: max(0, services),
-        Task.poc: -(-min(max(0, findings), max_poc) // poc_batch) if findings else 0,
+        Task.poc: -(-min(max(0, drafted), max_poc) // poc_batch) if drafted else 0,
     }
 
     for task, profile in PROFILES.items():

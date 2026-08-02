@@ -32,6 +32,7 @@ from pydantic import Field
 
 from .audit import AuditLog
 from .budget import BudgetExceeded, Ledger
+from .caching import split_manifest
 from .contracts import (
     PRIORITY_RANK,
     Disposition,
@@ -236,7 +237,9 @@ class Driver:
 
     # -- model dispatch -----------------------------------------------------
 
-    def _ask(self, phase: Phase, system: str, prompt: str) -> str:
+    def _ask(
+        self, phase: Phase, system: str, prompt: str, cache_prefix: str = ""
+    ) -> str:
         """One metered model call, through the shared dispatcher.
 
         Credentials are removed on the way out and put back in the answer on
@@ -250,6 +253,7 @@ class Driver:
             deployment=self._policy.model_for(phase),
             system=system,
             prompt=prompt,
+            cache_prefix=cache_prefix,
         )
         self._redactions = self._dispatcher.redactions
         return answer
@@ -278,10 +282,21 @@ class Driver:
 
     def _do_scenario(self, ref: RunRef, scenario: ScenarioRef) -> WorkOutcome:
         prompt = self._workspace.render_scenario_prompt(ref, scenario.scenario_id)
+        # The expert manifest is hoisted ahead of the scenario and cached. Only
+        # the manifest moves: it is reference material the renderer appends
+        # last and nothing refers to it by position, whereas the instruction
+        # block above it says "listed above" about the scenario header and
+        # would be answering a different question if it were hoisted too.
+        # `prompt.digest` is deliberately still the digest of the *whole*
+        # rendered prompt, because that is the artifact the workspace recorded
+        # and what the result is bound to.
+        body, manifest = split_manifest(prompt.text)
         last = ""
         for _ in range(self._policy.max_retries + 1):
             try:
-                answer = self._ask(Phase.scenarios, EXPERT_SYSTEM, prompt.text)
+                answer = self._ask(
+                    Phase.scenarios, EXPERT_SYSTEM, body, cache_prefix=manifest
+                )
                 stamped = _stamp(
                     answer,
                     {
@@ -374,10 +389,15 @@ class Driver:
             return self._park(ref, scenario, parked)
 
         try:
+            # Same hoist as the first attempt, so the expansion reads the cache
+            # entry that attempt already wrote rather than paying for the
+            # manifest a second time on the same scenario.
+            body, manifest = split_manifest(prompt.text)
             answer = self._ask(
                 Phase.scenarios,
                 EXPERT_SYSTEM,
-                f"{prompt.text}\n\n{expansion.text}",
+                f"{body}\n\n{expansion.text}",
+                cache_prefix=manifest,
             )
             stamped = _stamp(
                 answer,
@@ -742,6 +762,12 @@ class Driver:
         """
         report.parked = list(self._parked)
         report.redactions = self._redactions
+        report.cache_read_tokens = self._dispatcher.caching.read_tokens
+        report.cache_write_tokens = self._dispatcher.caching.written_tokens
+        # A cache that was offered and never read is more expensive than no
+        # cache at all, and nothing fails when that happens — so it is said out
+        # loud rather than left as a zero in a report nobody reads twice.
+        report.warnings.extend(self._dispatcher.caching.warnings())
         if self._redactions:
             # a bound like any other: what was withheld from the model is
             # reported, so a thin result is not mistaken for a clean one

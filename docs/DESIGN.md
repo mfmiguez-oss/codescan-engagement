@@ -343,7 +343,11 @@ flowchart LR
 
   Q["ranked queue"]:::in --> G["group by service"]:::proc
   G --> CH["chain discovery<br/><i>1 call per service</i>"]:::proc
-  Q --> B["batch by risk<br/><i>10 per call, top 40</i>"]:::proc
+  CH --> FB["chaining fed back<br/><i>scores now final</i>"]:::proc
+  FB --> S{"critical?"}:::proc
+  S -->|yes| B["batch by risk<br/><i>10 per call, cap 40</i>"]:::proc
+  S -->|no| R["on request only"]:::proc
+  R -.->|"analyst asks by id"| B
   B --> P["PoC drafting"]:::proc
   CH --> N["narrow<br/><i>ids allow-listed</i>"]:::proc
   P --> N
@@ -357,12 +361,41 @@ unattended, because the worst outcome of a bad model answer is a missing
 appendix rather than a missing vulnerability. A chain call that fails costs its
 service's chains; a PoC batch that fails costs its own drafts.
 
+### Drafting is critical-only, and the rest is on request
+
+An unattended run drafts for a finding **only when the finding comes out
+critical** — declared so, or scored at or above the KEV floor once every
+adjustment has landed. The word *final* is load-bearing, and it is why the two
+stages are ordered the way the diagram shows: chaining is produced by the chain
+stage, so it is fed back into the score *before* selection reads it. A finding
+that becomes critical only by being a link in a chain is exactly the finding the
+chaining dimension exists to surface, and selecting on a pre-chaining score
+would drop it.
+
+The rule is narrow on purpose. Drafting the whole queue spends the most
+expensive stage on the findings least likely to be acted on this week, and a
+pack where everything has a draft stops telling a responder where to start. It
+is not a judgement that the rest cannot be demonstrated, so everything below the
+line is available **on request** — `engagement draft-poc` from a shell,
+`POST /api/findings/{id}/poc` from the console. Criticality is not consulted
+there: the request *is* the judgement. What is still enforced is that the id
+exists in the run's queue, because a draft against an id no run produced would
+be a model inventing a finding.
+
+Requesting is authorized as `draft_poc`, and a **machine actor is refused it
+even holding every role** — a run that could authorise its own exceptions to the
+rule does not have one. The identity check is derived from the subject rather
+than the role set, because a role can be granted by mistake while the subject is
+minted by whatever issued the credential.
+
 The caps are not tuning. A PoC per finding makes the *output* grow with the
 finding count, and a large queue overruns the output limit and truncates
 mid-JSON — losing every draft in the response rather than the last one. Batching
-bounds the output by bounding the input. Because a cap can drop something, every
-capped, unaffordable and unanswered finding is named in the summary and in the
-pack: **no PoC means not attempted, never implausible.**
+bounds the output by bounding the input, and the cap applies to a requested
+batch too: an explicit request is still a request to spend. Because a cap can
+drop something, every capped, unaffordable, below-critical and unanswered
+finding is named in the summary and in the pack: **no PoC means not attempted,
+never implausible.**
 
 Chains are scoped per service because a chain between components that never talk
 is not a chain, and the fingerprint hashes the *finding set* rather than the
@@ -632,22 +665,171 @@ That makes the file-based state machine an asset for unattended operation
 rather than a quirk of its attended origins: crash-safety comes free, and the
 same run can be picked up by a different worker on a different host.
 
+## Preflight: the check that must not become a fallback
+
+```mermaid
+flowchart LR
+  classDef guard fill:#1e5f3a,stroke:#4ad990,color:#fff
+  classDef proc fill:#3a1e5f,stroke:#904ad9,color:#fff
+  classDef bad fill:#5f1e1e,stroke:#d94a4a,color:#fff
+
+  CFG["configured deployments<br/><i>every task a run could reach</i>"]:::proc --> CMP{"compare"}:::guard
+  PROV["provider listing"]:::proc --> CMP
+  CMP -->|"all present"| GO["run proceeds"]:::guard
+  CMP -->|"known absent"| STOP["refuse before dispatch,<br/>name what is missing"]:::guard
+  CMP -->|"could not list"| UNK["unchecked:<br/>proceed, warn, exit 3"]:::guard
+  STOP -.->|"never"| SWAP["pick a model that is present"]:::bad
+```
+
+Two distinctions do all the work here, and both are easy to collapse.
+
+**Missing is not unknown.** A provider that reports its deployments and does
+not include the configured one has told us the run is broken. A provider that
+cannot answer has told us nothing. Treating the second as the first blocks
+every run the moment a listing endpoint goes down or an IAM policy omits
+`bedrock:ListFoundationModels`; treating the first as the second wastes a run.
+So an empty listing means *unknown* — never *serves nothing* — and the two
+produce different verdicts and different exit codes.
+
+**Reporting is not choosing.** The check ends up holding the list of models
+that *are* available, which makes pairing each missing one with a replacement
+the obvious next line of code. It is the line that must never be written. A
+silent swap changes the bill and the findings while the call count, the ledger
+and every count in the report stay identical — the exact shape of failure this
+package is otherwise built to make impossible. Two more reasons here
+specifically: a substituted model can share a vendor with the second detection
+pass, which turns `check_two_vendor_passes` into a formality and corroboration
+into two models sharing a blind spot; and `sampling_for` and
+`caching.minimum_tokens` are both per-family, so a swap quietly re-decides
+whether determinism parameters are sent and whether a prefix caches at all.
+
+The refusal message is bounded for the same reason it exists. A Foundry
+resource can serve several hundred deployments, and printing all of them turns
+a precise error into a wall an operator scrolls past — so it lists the ones
+sharing a family stem with what was asked for, in name order rather than by
+similarity, because a ranked list reads as a recommendation.
+
+## The analyst console
+
+Two surfaces render a run, and the difference between them is authority. The
+report is an artifact: self-contained, opened with no server, attached to a
+ticket, and structurally incapable of changing anything. The console is an
+application you sign in to, and it is the only place a person changes a state.
+
+```mermaid
+flowchart LR
+  classDef human fill:#5f4a1e,stroke:#d9a94a,color:#fff
+  classDef guard fill:#1e5f3a,stroke:#4ad990,color:#fff
+  classDef art fill:#1e3a5f,stroke:#4a90d9,color:#fff
+
+  RUN["queue.json"]:::art --> Q["ManifestQueue<br/><i>re-read per request</i>"]:::guard
+  Q --> API["control plane"]:::guard
+  DEC["decisions.jsonl"]:::art <--> API
+  IDP["identity provider"]:::guard -->|"code + PKCE"| PAGE["console"]:::human
+  PAGE -->|"bearer, in memory"| API
+  API -->|"may_set, computed by<br/>the authorizing function"| PAGE
+  REPORT["report.html"]:::art -.->|"no write path"| API
+```
+
+**The authentication decision.** OIDC authorization code with PKCE, token in
+memory, sent as a bearer. No cookie and no server-side session, because the
+control plane was already bearer-only and that property is worth preserving
+rather than working around: a cookie is attached by the browser automatically
+on every request to the origin, which is exactly what makes CSRF possible,
+while a token that exists only in a variable is attached deliberately or not at
+all. PKCE rather than an implicit flow because the page is a public client and
+cannot hold a secret. The cost is that a refresh signs you out, which for a
+console an analyst opens to work a queue is a fair trade.
+
+**The page decides nothing about authority.** `/api/whoami` returns the exact
+set of states the principal may set, computed by iterating the same `authorize`
+function that enforces them. The console renders that list. This is not
+defence-in-depth theatre — the server refuses regardless, and the test that
+matters asserts precisely that: hiding a control is a courtesy, and an analyst
+who forges a request still gets a 403 with no detail about which check failed.
+
+**The queue is re-read per request** rather than cached in the process, because
+a run can be re-executed underneath an open console and an analyst working from
+a silently stale queue is worse off than one who sees it change.
+
+**Everything rendered is hostile by construction.** Titles, paths and evidence
+come from a repository under review. The page builds nodes and assigns
+`textContent`; nothing from the queue is ever written as markup, under a CSP
+that admits no origin but the document itself.
+
+## Making the same prompt cheaper without making it a different prompt
+
+Prompt caching bills a repeated span at roughly a tenth of the input rate. The
+scenario stage sends one call per scenario, and each of those prompts ends with
+an expert manifest that is byte-identical across every scenario routed to that
+expert. Twelve manifests exist; a sixty-scenario run sends them sixty times.
+
+```mermaid
+flowchart LR
+  classDef guard fill:#1e5f3a,stroke:#4ad990,color:#fff
+  classDef proc fill:#3a1e5f,stroke:#904ad9,color:#fff
+  classDef art fill:#1e3a5f,stroke:#4a90d9,color:#fff
+
+  P["rendered prompt"]:::art --> S["split at the manifest heading"]:::guard
+  S --> H["header + instructions<br/><i>stays in the user turn</i>"]:::art
+  S --> M["expert manifest"]:::art
+  M --> R["redacted"]:::guard
+  R --> F{"above the model's<br/>minimum?"}:::guard
+  F -->|yes| B["system block +<br/>cache breakpoint"]:::proc
+  F -->|no| I["appended to the system<br/>prompt, uncached"]:::guard
+  H --> U["user turn"]:::proc
+```
+
+The judgement worth recording is **what does not move**. The instruction block
+is bigger and would cache better, and it contains the sentence "answer every
+required proof obligation listed above" — where "above" is the per-scenario
+header. Hoisting it leaves that reference pointing at nothing. The manifest is
+appended last by the renderer, referred to only as "read the expert manifest",
+and carries no positional reference, so moving it ahead changes nothing about
+what is asked. A prompt that is cheaper because it asks something slightly
+different is not an optimisation; it is a regression with a good excuse.
+
+Three properties keep it honest:
+
+- **Nothing is lost.** A surface with no `cache_control` — the OpenAI shapes on
+  Foundry, a Bedrock family with no system channel — receives the prefix folded
+  into the system prompt. The model sees the same prompt either way; only the
+  billing differs. A hoisted manifest that vanished on one deployment would be
+  a correctness bug wearing a cost optimisation's clothes.
+- **The floor is checked, not assumed.** The minimum cacheable prefix varies by
+  family and is *not* monotonic across generations — 512 on Opus 5, 4096 on
+  Opus 4.6. Below it, the API accepts the breakpoint and caches nothing, with
+  no error. An unrecognised deployment assumes the largest floor, because
+  guessing low costs a write premium on every call for an entry that can never
+  be read, while guessing high costs only a missed discount.
+- **The meter can see the discount.** Cache reads and writes are parsed from
+  the provider's own usage numbers into the ledger, the run report and the
+  audit trail. Without that, a run that got cheaper is indistinguishable from
+  one that did not — and a cache that is offered and never read, which is
+  *more* expensive than no cache, would be perfectly silent. It warns instead.
+
 ## What this does not do yet
 
 - **No multi-host work claims.** One driver, one run. Distribution across a
   repo list belongs in the platform's lease table, not here.
-- **The analyst view is still read-only.** The control plane can accept a state
-  change over HTTP, but the generated HTML does not call it — it renders a run
-  and links nothing. Wiring the two together is a small piece of work and a
-  deliberate next decision rather than an oversight.
 - **`PostgresClaimStore` is untested against a live database.** The SQL mirrors
   the platform's proven claim table, and the properties are covered against the
   in-memory store, but no integration test runs the real thing.
 - **JWKS fetching is untested against a live issuer.** Verification is proven
   against real RSA keys and real forgeries, but the network hop that retrieves
   Entra's published keys is stubbed in the suite.
-- **No rate limiting on the control plane.** A valid token can call it as fast
-  as it likes; that belongs at the ingress, and is not implemented here.
-- **No control-plane authentication.** This is a batch job with no listening
-  surface, which makes the gap inapplicable rather than ignored — but it
-  becomes load-bearing the moment a UI or API is put in front of it.
+- **The console's token exchange is untested against a live issuer** for the
+  same reason: the PKCE flow is standard and the page is small, but no test in
+  this repository completes a real authorization code exchange.
+- **Rate limiting bounds one process.** Per-principal buckets are in the
+  control plane, which is what a single-analyst console and a small deployment
+  need; four replicas of a per-process limit is four times the limit, so a
+  fleet still needs one at the ingress.
+- **Run progress is polled, not streamed.** The console asks every few seconds
+  and reports the outcome. Server-sent events would be live, and would add
+  reconnect and replay handling for a signal that changes once a minute.
+- **No SBOM, VEX or ML-BOM.** The queue holds exactly the exploitability
+  judgements VEX exists to publish, and publishes none of them.
+- **No alerting on the audit trail.** It is append-only and exports cleanly to
+  a SIEM; nothing fires on it, which is what keeps "treat agents as an
+  insider-threat class" at partial.

@@ -40,6 +40,28 @@ def _partial() -> RunReport:
     )
 
 
+def test_a_hostile_title_is_escaped_in_the_report() -> None:
+    """The page renders text recovered from a repository under review, and is
+    mailed to people who did not run the scan. Every value it prints is
+    attacker-influenced by construction."""
+    report = _partial()
+    report.parked = [
+        ParkedScenario(
+            scenario_id="<script>alert(1)</script>",
+            expert="<img src=x onerror=alert(1)>",
+            missing_context=["</td><td onmouseover=alert(1)>"],
+            reason="<svg onload=alert(1)>",
+        )
+    ]
+
+    html = render(report)
+
+    assert "<script>alert(1)</script>" not in html
+    assert "onerror=alert(1)>" not in html
+    assert "onload=alert(1)>" not in html
+    assert "&lt;script&gt;" in html, "the value was dropped rather than escaped"
+
+
 def test_coverage_is_the_first_thing_the_page_says() -> None:
     """A queue is only meaningful against the denominator that produced it."""
     html = render(_partial())

@@ -13,12 +13,15 @@ import json
 from pathlib import Path
 
 from engagement.analysis import (
+    CRITICAL_SCORE,
     MAX_POC_FINDINGS,
     POC_BATCH,
     AnalysisSummary,
     ChainEngine,
     PocEngine,
     analyse,
+    draft_requested,
+    is_critical,
     to_markdown,
 )
 from engagement.audit import AuditLog, MemorySink
@@ -26,12 +29,33 @@ from engagement.budget import Budget, Ledger
 from engagement.contracts import ScoredFinding
 from engagement.dispatch import Dispatcher
 from engagement.providers import FakeProvider
+from engagement.signals import CHAIN_POINTS, SignalReport
 
 
-def _finding(id: str, score: float = 50.0, repo: str = "acme/app") -> ScoredFinding:
+def _finding(
+    id: str,
+    score: float = 50.0,
+    repo: str = "acme/app",
+    severity: str = "medium",
+) -> ScoredFinding:
     return ScoredFinding(
-        id=id, repo=repo, title=f"finding {id}", risk_score=score, path=f"src/{id}.py"
+        id=id,
+        repo=repo,
+        title=f"finding {id}",
+        severity=severity,
+        risk_score=score,
+        path=f"src/{id}.py",
     )
+
+
+def _critical(id: str, score: float = 90.0, repo: str = "acme/app") -> ScoredFinding:
+    """A finding the automatic rule will draft for.
+
+    Spelled out in the PoC tests rather than made the default, because "which
+    findings get drafted for" is the rule under test and a helper that quietly
+    satisfied it would let the rule regress without a single test noticing.
+    """
+    return _finding(id, score=score, repo=repo, severity="critical")
 
 
 def _dispatcher(answers: list[str], max_calls: int = 50) -> Dispatcher:
@@ -223,7 +247,7 @@ def test_a_scalar_out_of_range_is_clamped() -> None:
 
 
 def test_a_poc_is_drafted_only_against_a_finding_in_its_request() -> None:
-    findings = [_finding("a")]
+    findings = [_critical("a")]
     pocs = PocEngine(_dispatcher([_poc_answer("a", "ghost")]), "m").draft(
         findings, AnalysisSummary()
     )
@@ -232,7 +256,7 @@ def test_a_poc_is_drafted_only_against_a_finding_in_its_request() -> None:
 
 
 def test_poc_drafting_batches_so_one_response_cannot_truncate_them_all() -> None:
-    findings = [_finding(f"f{n}") for n in range(POC_BATCH * 2)]
+    findings = [_critical(f"f{n}") for n in range(POC_BATCH * 2)]
     ids = [finding.id for finding in findings]
     dispatcher = _dispatcher(
         [_poc_answer(*ids[:POC_BATCH]), _poc_answer(*ids[POC_BATCH:])]
@@ -244,7 +268,7 @@ def test_poc_drafting_batches_so_one_response_cannot_truncate_them_all() -> None
 
 
 def test_a_failed_batch_costs_only_its_own_drafts() -> None:
-    findings = [_finding(f"f{n}") for n in range(POC_BATCH * 2)]
+    findings = [_critical(f"f{n}") for n in range(POC_BATCH * 2)]
     ids = [finding.id for finding in findings]
     summary = AnalysisSummary()
     dispatcher = _dispatcher(["}} not json", _poc_answer(*ids[POC_BATCH:])])
@@ -255,7 +279,7 @@ def test_a_failed_batch_costs_only_its_own_drafts() -> None:
 
 
 def test_findings_past_the_poc_cap_are_reported_not_silently_skipped() -> None:
-    findings = [_finding(f"f{n}", score=float(n)) for n in range(MAX_POC_FINDINGS + 5)]
+    findings = [_critical(f"f{n}", score=float(n)) for n in range(MAX_POC_FINDINGS + 5)]
     summary = AnalysisSummary()
     PocEngine(_dispatcher(["{}"] * 10), "m").draft(findings, summary)
 
@@ -264,7 +288,7 @@ def test_findings_past_the_poc_cap_are_reported_not_silently_skipped() -> None:
 
 
 def test_poc_drafting_takes_the_highest_risk_findings_first() -> None:
-    findings = [_finding(f"f{n}", score=float(n)) for n in range(MAX_POC_FINDINGS + 5)]
+    findings = [_critical(f"f{n}", score=float(n)) for n in range(MAX_POC_FINDINGS + 5)]
     summary = AnalysisSummary()
     dispatcher = _dispatcher(["{}"] * 10)
     PocEngine(dispatcher, "m").draft(findings, summary)
@@ -274,7 +298,7 @@ def test_poc_drafting_takes_the_highest_risk_findings_first() -> None:
 
 
 def test_a_finding_the_model_ignored_is_recorded_as_undrafted() -> None:
-    findings = [_finding("a"), _finding("b")]
+    findings = [_critical("a"), _critical("b")]
     summary = AnalysisSummary()
     PocEngine(_dispatcher([_poc_answer("a")]), "m").draft(findings, summary)
 
@@ -282,7 +306,7 @@ def test_a_finding_the_model_ignored_is_recorded_as_undrafted() -> None:
 
 
 def test_model_prose_cannot_carry_markup_into_the_pack() -> None:
-    findings = [_finding("a")]
+    findings = [_critical("a")]
     answer = json.dumps(
         {
             "pocs": [
@@ -302,7 +326,7 @@ def test_model_prose_cannot_carry_markup_into_the_pack() -> None:
 
 
 def test_a_step_that_numbers_itself_is_not_numbered_twice() -> None:
-    findings = [_finding("a")]
+    findings = [_critical("a")]
     poc = PocEngine(_dispatcher([_poc_answer("a")]), "m").draft(
         findings, AnalysisSummary()
     )[0]
@@ -310,11 +334,129 @@ def test_a_step_that_numbers_itself_is_not_numbered_twice() -> None:
     assert poc.steps[0].startswith("send"), f"leading enumeration survived: {poc.steps[0]}"
 
 
+# -- who gets drafted for ----------------------------------------------------
+
+
+def test_only_critical_findings_are_drafted_for_automatically() -> None:
+    findings = [_critical("crit"), _finding("mid", score=50.0)]
+    summary = AnalysisSummary()
+    dispatcher = _dispatcher([_poc_answer("crit", "mid")])
+    pocs = PocEngine(dispatcher, "m").draft(findings, summary)
+
+    assert [poc.finding_id for poc in pocs] == ["crit"]
+    assert "mid" in summary.pocs_undrafted
+
+
+def test_a_high_finding_pushed_over_the_line_by_enrichment_is_drafted_for() -> None:
+    """The reason the rule reads the final score and not the declared severity.
+
+    A high finding that KEV, lifecycle, exposure and chaining together lifted
+    into the critical band is exactly the finding those adjustments exist to
+    surface, and drafting it is the point of running them.
+    """
+    lifted = _finding("lifted", score=CRITICAL_SCORE, severity="high")
+    summary = AnalysisSummary()
+    pocs = PocEngine(_dispatcher([_poc_answer("lifted")]), "m").draft(
+        [lifted], summary
+    )
+
+    assert [poc.finding_id for poc in pocs] == ["lifted"]
+
+
+def test_a_scanners_own_critical_is_drafted_for_without_any_intelligence() -> None:
+    """The other half: knowing nothing extra is not grounds to demote."""
+    declared = _finding("declared", score=10.0, severity="critical")
+
+    assert is_critical(declared)
+
+
+def test_a_non_critical_finding_costs_no_call_at_all() -> None:
+    dispatcher = _dispatcher([_poc_answer("mid")])
+    PocEngine(dispatcher, "m").draft([_finding("mid")], AnalysisSummary())
+
+    assert dispatcher.ledger.calls == 0, "the queue was drafted for after all"
+
+
+def test_findings_below_critical_are_named_and_pointed_at_the_request_path() -> None:
+    summary = AnalysisSummary()
+    PocEngine(_dispatcher(["{}"]), "m").draft([_finding("mid")], summary)
+
+    assert summary.pocs_undrafted == ["mid"]
+    warning = " ".join(summary.warnings)
+    assert "requested" in warning, "the analyst was not told drafts can be asked for"
+    assert "not implausible" in warning, "absence read as a judgement"
+
+
+def test_chain_membership_reaches_the_score_before_poc_selection_reads_it() -> None:
+    """The ordering bug this rule would otherwise have: a finding that only
+    becomes critical *because* it is a link in a chain must still be drafted."""
+    below = CRITICAL_SCORE - 5.0
+    findings = [_finding("a", score=below), _finding("b", score=below)]
+    dispatcher = _dispatcher([_chain_answer(["a", "b"]), _poc_answer("a", "b")])
+
+    summary = analyse(findings, dispatcher, "m")
+
+    assert all(f.chaining_adjust > 0 for f in findings), "chaining never landed"
+    assert {poc.finding_id for poc in summary.pocs} == {"a", "b"}
+
+
+def test_chaining_is_applied_exactly_once() -> None:
+    findings = [_finding("a", score=50.0), _finding("b", score=50.0)]
+    signals = SignalReport()
+    analyse(findings, _dispatcher([_chain_answer(["a", "b"]), "{}"]), "m", signals=signals)
+
+    assert signals.chaining_applied == 2
+    assert findings[0].chaining_adjust == CHAIN_POINTS, "double-counted"
+
+
+# -- drafting on request -----------------------------------------------------
+
+
+def test_a_requested_draft_ignores_criticality_entirely() -> None:
+    findings = [_finding("mid", score=12.0), _finding("low", score=3.0)]
+    summary = draft_requested(findings, _dispatcher([_poc_answer("mid")]), "m", ["mid"])
+
+    assert [poc.finding_id for poc in summary.pocs] == ["mid"]
+
+
+def test_a_requested_draft_still_cannot_invent_a_finding() -> None:
+    summary = draft_requested(
+        [_finding("mid")], _dispatcher([_poc_answer("ghost")]), "m", ["ghost"]
+    )
+
+    assert summary.pocs == []
+    assert any("not in this run's queue" in w for w in summary.warnings)
+
+
+def test_a_request_for_nothing_spends_nothing() -> None:
+    dispatcher = _dispatcher([_poc_answer("mid")])
+    summary = draft_requested([_finding("mid")], dispatcher, "m", [])
+
+    assert dispatcher.ledger.calls == 0
+    assert summary.warnings
+
+
+def test_a_repeated_id_is_drafted_for_once() -> None:
+    dispatcher = _dispatcher([_poc_answer("mid")])
+    draft_requested([_finding("mid")], dispatcher, "m", ["mid", "mid", "mid"])
+
+    assert dispatcher.ledger.calls == 1
+
+
+def test_a_request_is_metered_and_bounded_like_any_other_spend() -> None:
+    findings = [_finding(f"f{n}") for n in range(MAX_POC_FINDINGS + 3)]
+    summary = draft_requested(
+        findings, _dispatcher(["{}"] * 10), "m", [f.id for f in findings]
+    )
+
+    assert any("still a request to spend" in w for w in summary.warnings)
+
+
 # -- the pack and the orchestrator -------------------------------------------
 
 
 def test_the_pack_says_nothing_was_executed() -> None:
-    findings = [_finding("a"), _finding("b")]
+    findings = [_critical("a"), _critical("b")]
     summary = AnalysisSummary(
         chains=ChainEngine(_dispatcher([_chain_answer(["a", "b"])]), "m").find(
             findings, AnalysisSummary()
@@ -330,7 +472,7 @@ def test_the_pack_says_nothing_was_executed() -> None:
 
 
 def test_the_pack_names_what_it_does_not_cover() -> None:
-    findings = [_finding("a")]
+    findings = [_critical("a")]
     summary = AnalysisSummary(
         pocs=PocEngine(_dispatcher([_poc_answer("a")]), "m").draft(
             findings, AnalysisSummary()
@@ -362,7 +504,7 @@ def test_analysis_never_raises_when_every_call_fails(tmp_path: Path) -> None:
 
 
 def test_analysis_spends_from_the_run_ledger(tmp_path: Path) -> None:
-    findings = [_finding("a"), _finding("b")]
+    findings = [_critical("a"), _critical("b")]
     dispatcher = _dispatcher([_chain_answer(["a", "b"]), _poc_answer("a", "b")])
     analyse(findings, dispatcher, "m", out_dir=tmp_path)
 
@@ -370,7 +512,7 @@ def test_analysis_spends_from_the_run_ledger(tmp_path: Path) -> None:
 
 
 def test_analysis_writes_both_artifacts(tmp_path: Path) -> None:
-    findings = [_finding("a"), _finding("b")]
+    findings = [_critical("a"), _critical("b")]
     dispatcher = _dispatcher([_chain_answer(["a", "b"]), _poc_answer("a", "b")])
     summary = analyse(findings, dispatcher, "m", out_dir=tmp_path, repo="acme/app")
 

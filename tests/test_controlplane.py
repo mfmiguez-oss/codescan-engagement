@@ -50,7 +50,23 @@ def _claims(*roles: str, oid: str = "oid-1", tid: str = "acme") -> dict[str, obj
     }
 
 
-def _plane(**kwargs: object) -> tuple[ControlPlane, MemoryDecisionStore]:
+class _Drafter:
+    """A drafter that records who asked, and never calls a model."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.asked: list[tuple[str, str]] = []
+        self._fail = fail
+
+    def draft(self, principal: Principal, fingerprint: str) -> dict[str, object]:
+        if self._fail:
+            raise RuntimeError("the provider was unreachable")
+        self.asked.append((principal.actor(), fingerprint))
+        return {"finding_id": fingerprint, "drafted": True}
+
+
+def _plane(
+    drafter: _Drafter | None = None, **kwargs: object
+) -> tuple[ControlPlane, MemoryDecisionStore]:
     store = MemoryDecisionStore()
     verifier = StaticVerifier(
         tokens={
@@ -60,10 +76,11 @@ def _plane(**kwargs: object) -> tuple[ControlPlane, MemoryDecisionStore]:
             ),
             "stranger-token": _claims(oid="oid-3"),
             "other-tenant": _claims("Engagement.Approver", oid="oid-4", tid="other"),
+            "scanner-token": _claims("Engagement.Scanner", oid="oid-5"),
         }
     )
     config = ApiConfig(tenant="acme", **kwargs)  # type: ignore[arg-type]
-    return ControlPlane(verifier, store, config, MAPPING), store
+    return ControlPlane(verifier, store, config, MAPPING, drafter), store
 
 
 # -- authentication ---------------------------------------------------------
@@ -252,3 +269,59 @@ def test_a_corrupt_line_is_an_error_not_a_skip(tmp_path: Path) -> None:
     path.write_text('{"not":"a decision"}\n', encoding="utf-8")
     with pytest.raises(DecisionError):
         JsonlDecisionStore(path).get("fp1")
+
+
+# -- requesting a PoC -------------------------------------------------------
+
+
+def test_an_analyst_can_request_a_draft_for_a_finding_the_run_passed_over() -> None:
+    drafter = _Drafter()
+    plane, _ = _plane(drafter)
+
+    result = plane.request_poc("Bearer analyst-token", "fp1")
+
+    assert result["drafted"] is True
+    assert drafter.asked == [("oid-1", "fp1")], "the request lost who made it"
+
+
+def test_requesting_a_draft_without_a_credential_is_refused() -> None:
+    drafter = _Drafter()
+    plane, _ = _plane(drafter)
+
+    with pytest.raises(Problem) as exc:
+        plane.request_poc(None, "fp1")
+
+    assert exc.value.status == 401
+    assert drafter.asked == [], "an unauthenticated caller reached the model budget"
+
+
+def test_a_principal_without_a_queue_role_may_not_spend_on_drafts() -> None:
+    """A scanner runs scans; asking for a draft outside the critical set is a
+    judgement about the queue, which is an analyst's call and not a runner's."""
+    drafter = _Drafter()
+    plane, _ = _plane(drafter)
+
+    with pytest.raises(Problem) as exc:
+        plane.request_poc("Bearer scanner-token", "fp1")
+
+    assert exc.value.status == 403
+    assert drafter.asked == []
+
+
+def test_a_deployment_with_no_drafter_says_so_rather_than_404ing() -> None:
+    plane, _ = _plane(None)
+
+    with pytest.raises(Problem) as exc:
+        plane.request_poc("Bearer analyst-token", "fp1")
+
+    assert exc.value.status == 503
+
+
+def test_a_drafting_failure_is_not_reported_as_a_server_fault() -> None:
+    plane, _ = _plane(_Drafter(fail=True))
+
+    with pytest.raises(Problem) as exc:
+        plane.request_poc("Bearer analyst-token", "fp1")
+
+    assert exc.value.status == 502
+    assert "unreachable" not in exc.value.message, "the failure leaked outward"

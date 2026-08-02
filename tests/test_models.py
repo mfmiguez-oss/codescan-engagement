@@ -154,7 +154,32 @@ def test_the_poc_projection_respects_the_cap() -> None:
     plan = build_plan(_ALL, scenarios=1, findings=500)
     poc = next(a for a in plan.allocations if a.task is Task.poc)
 
-    assert poc.projected_calls == 4  # top 40 only, in batches of 10
+    assert poc.projected_calls == 4  # cap of 40, in batches of 10
+
+
+def test_the_projection_counts_drafts_for_criticals_not_the_whole_queue() -> None:
+    """The rule changed what drafting costs, and a projection that did not follow
+    would quote a bill for work the run no longer does."""
+    whole_queue = build_plan(_ALL, findings=40)
+    critical_only = build_plan(_ALL, findings=40, critical_findings=5)
+
+    assert next(
+        a.projected_calls for a in whole_queue.allocations if a.task is Task.poc
+    ) == 4
+    assert next(
+        a.projected_calls for a in critical_only.allocations if a.task is Task.poc
+    ) == 1
+
+
+def test_an_unstated_critical_count_over_projects_rather_than_under() -> None:
+    """Too high costs an operator a raised eyebrow; too low costs them a run
+    that stops halfway through."""
+    unstated = build_plan(_ALL, findings=40)
+    every_finding_critical = build_plan(_ALL, findings=40, critical_findings=40)
+
+    assert [a.projected_calls for a in unstated.allocations] == [
+        a.projected_calls for a in every_finding_critical.allocations
+    ]
 
 
 def test_a_task_with_no_deployment_is_reported_not_defaulted() -> None:

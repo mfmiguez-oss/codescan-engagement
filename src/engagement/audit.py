@@ -89,8 +89,16 @@ class AuditLog:
         output_tokens: int,
         redactions: int,
         calls_so_far: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> AuditEvent:
-        """One model call. The digest identifies the prompt without carrying it."""
+        """One model call. The digest identifies the prompt without carrying it.
+
+        Cache counts sit beside the token counts rather than folded into them:
+        what a call cost and what it would have cost uncached are different
+        questions, and a trail that recorded only a total could answer neither
+        after the fact.
+        """
         return self.record(
             "model_call",
             phase=phase,
@@ -100,6 +108,8 @@ class AuditLog:
             output_tokens=output_tokens,
             redactions=redactions,
             calls_so_far=calls_so_far,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
 

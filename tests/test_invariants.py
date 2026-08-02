@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 THREATMODEL = ROOT / "docs" / "THREATMODEL.md"
+OUTPUTS = ROOT / "docs" / "OUTPUTS.md"
 FRAMEWORKS = ROOT / "docs" / "SECURITY_FRAMEWORKS.md"
 TESTS_DIR = Path(__file__).parent
 SRC_DIR = ROOT / "src" / "engagement"
@@ -67,6 +68,71 @@ def test_every_open_risk_declines_to_name_a_test() -> None:
         if status == "open" and test_name not in {"", "—", "-"}
     ]
     assert not wrong, f"open rows naming a test: {wrong}"
+
+
+def test_every_per_output_threat_names_a_test_that_exists() -> None:
+    """OUTPUTS.md is organised by artifact rather than by risk, so the
+    register's meta-test does not reach it. It gets its own, for the same
+    reason: a control named in a document and nowhere else is a description of
+    an intention.
+
+    An em dash is allowed where the control is structural — "the page has no
+    write path" cannot be tested by asserting the absence of code that was
+    never written.
+    """
+    source = _all_test_source()
+    named = set(re.findall(r"`(test_[a-z0-9_]+)`", OUTPUTS.read_text(encoding="utf-8")))
+    assert named, "OUTPUTS.md names no tests at all"
+    missing = sorted(name for name in named if f"def {name}(" not in source)
+    assert not missing, f"per-output rows naming tests that do not exist: {missing}"
+
+
+def test_every_output_of_the_pipeline_has_a_threat_model() -> None:
+    """The failure this catches: a new artifact ships and nobody asks what it
+    could mislead a reader into believing."""
+    headings = "\n".join(
+        line
+        for line in OUTPUTS.read_text(encoding="utf-8").splitlines()
+        if line.startswith("### ")
+    )
+    missing = [
+        artifact
+        for artifact in (
+            "findings.sarif",
+            "queue.csv",
+            "queue.json",
+            "chains.json",
+            "pocs.md",
+            "audit.jsonl",
+            "decisions.jsonl",
+            "report.html",
+            "threat-model.md",
+            "SIEM export",
+            "cached prompt prefix",
+        )
+        if artifact not in headings
+    ]
+    assert not missing, f"outputs this package produces with no threat model: {missing}"
+
+
+def test_every_per_output_diagram_renders_in_the_document() -> None:
+    """"Readable directly in the md file" is the requirement: a diagram that
+    needs a build step or an external renderer is a diagram nobody looks at."""
+    text = OUTPUTS.read_text(encoding="utf-8")
+
+    opened = text.count("```mermaid")
+    closed = text.count("```")
+    assert opened >= 9, f"only {opened} diagrams in OUTPUTS.md"
+    assert closed == opened * 2, "an unbalanced fence would swallow the rest of the file"
+    assert "![" not in text, "an image reference is not readable in the file itself"
+
+
+def test_the_outputs_document_lists_every_artifact_a_run_writes() -> None:
+    """The map at the top and the sections below it must not drift: a file in
+    one and not the other is an output nobody can look up."""
+    text = OUTPUTS.read_text(encoding="utf-8")
+    for artifact in ("threat-model.md", "queue.csv", "report.html", "decisions.jsonl"):
+        assert f"`{artifact}`" in text, f"{artifact} is missing from OUTPUTS.md"
 
 
 def test_the_frameworks_document_is_dated() -> None:

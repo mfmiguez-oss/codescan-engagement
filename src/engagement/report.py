@@ -240,7 +240,9 @@ def _pocs(analysis: AnalysisSummary | None) -> str:
     )
     undrafted = (
         f"<p class='warn'>{len(analysis.pocs_undrafted)} finding(s) carry no draft. "
-        "That is a bound on this appendix, not a judgement that no PoC exists.</p>"
+        "Drafting is automatic only for findings that come out critical, so this "
+        "is a bound on the appendix and not a judgement that no PoC exists — a "
+        "draft for any of them can be requested by id.</p>"
         if analysis.pocs_undrafted
         else ""
     )

@@ -283,6 +283,13 @@ class RunReport(StrictModel):
     parked_path: str | None = None
     #: Credential-shaped values withheld from the model. A bound, so reported.
     redactions: int = 0
+    #: Prompt tokens served from cache, and written to it. Recorded because the
+    #: discount is invisible in every other number a run reports: the call count
+    #: is unchanged and the provider bills cached tokens separately.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    #: Where this run's threat model was written, when one was.
+    threat_model_path: str | None = None
 
     def _count(self, items: list[WorkOutcome], disposition: Disposition) -> int:
         return sum(1 for item in items if item.disposition == disposition)

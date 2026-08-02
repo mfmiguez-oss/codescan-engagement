@@ -17,25 +17,35 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from .analysis import AnalysisSummary, analyse
+from .analysis import AnalysisSummary, analyse, draft_requested, to_markdown
+from .api import ApiConfig, ControlPlane, build_app
 from .audit import AuditLog, FileSink, default_audit_path, read_events
+from .auth import OidcVerifier, RoleMapping, StaticVerifier, TokenVerifier
 from .budget import Budget, Ledger
+from .console import render as render_console
 from .contracts import Disposition, Phase, RunRef, RunReport
+from .decisions import JsonlDecisionStore
+from .dispatch import Dispatcher
 from .driver import Driver, Policy
 from .egress import build_policy
-from .export import movement_summary, write_manifest, write_queue
+from .export import movement_summary, read_manifest, write_manifest, write_queue
 from .feeds import CISA_KEV_URL, FeedError, fetch_kev, load_snyk, write_kev
 from .governance import RiskTier, review
-from .identity import Action, Unauthorized, authorize, machine
+from .identity import Action, Role, Unauthorized, authorize, machine, operator
 from .lifecycle import LifecycleError, LifecycleReport, assess, load_feed
 from .models import SingleVendorError, Task, build_plan, check_two_vendor_passes, render_plan
-from .providers import ProviderError, build_provider
+from .preflight import PreflightReport, deployments_for
+from .preflight import check as preflight_check
+from .providers import ModelProvider, ProviderError, build_provider
 from .report import write as write_report
+from .runs import RunLauncher
 from .secrets import SecretError, SecretResolver, resolve_optional
 from .secrets import build_plan as build_secret_plan
+from .serving import ManifestQueue, RunPocDrafter
 from .siem import FORMATS, summarize
 from .siem import export as siem_export
-from .signals import apply_chaining, apply_exposure, load_boundaries
+from .signals import SignalReport, apply_exposure, load_boundaries
+from .threatmodel import write as write_threat_model
 from .triage import TriageError, TriageSummary, ingest_run
 from .workspace import CliWorkspace, WorkspaceError, seed_workspace, vendored_workspace
 
@@ -43,6 +53,17 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_CONFIG = 2
 EXIT_INCOMPLETE = 3
+
+#: Provider group or app-role values mapped to this system's roles. Duplicated
+#: from `asgi` rather than shared because the two entrypoints serve different
+#: deployments and one changing its directory should not silently change the
+#: other; `test_wiring` asserts they agree.
+CONSOLE_ROLE_CLAIMS = {
+    "Engagement.Scanner": Role.scanner,
+    "Engagement.Analyst": Role.analyst,
+    "Engagement.Approver": Role.approver,
+    "Engagement.Admin": Role.admin,
+}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -90,7 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--pocs",
         action="store_true",
-        help="Draft a proof of concept per finding, highest risk first. Never executed.",
+        help="Draft a proof of concept for each finding that comes out critical. "
+        "Never executed. Anything below critical: see the draft-poc command.",
     )
     run.add_argument(
         "--analysis-model",
@@ -164,7 +186,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Audit trail path (default: <run>/audit.jsonl). Always written.",
     )
     run.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    run.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="Skip the check that every configured deployment exists. The check "
+        "costs one listing call and refuses before anything is spent.",
+    )
     run.set_defaults(func=_cmd_run)
+
+    pre = sub.add_parser(
+        "preflight",
+        help="Check that every configured deployment exists, before spending.",
+    )
+    pre.add_argument("--model", default="", help="Deployment for every phase.")
+    pre.add_argument("--router-model", default="")
+    pre.add_argument("--expert-model", default="")
+    pre.add_argument("--triage-model", default="")
+    pre.add_argument("--analysis-model", default="")
+    pre.add_argument("--second-model", default="")
+    pre.set_defaults(func=_cmd_preflight)
 
     init = sub.add_parser(
         "init-workspace",
@@ -198,6 +238,69 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     secrets.set_defaults(func=_cmd_secrets)
 
+    console = sub.add_parser(
+        "console",
+        help="Serve the analyst console over a run directory.",
+    )
+    console.add_argument("run_dir", type=Path, help="Run directory holding queue.json.")
+    console.add_argument("--host", default="127.0.0.1")
+    console.add_argument("--port", type=int, default=8000)
+    console.add_argument(
+        "--decisions",
+        type=Path,
+        default=None,
+        help="Decision log (default: <run_dir>/decisions.jsonl).",
+    )
+    console.add_argument(
+        "--model",
+        default="",
+        help="Deployment for on-request PoC drafts. Omitted, drafting is off.",
+    )
+    console.add_argument(
+        "--dev-token",
+        default="",
+        help="Accept this bearer token as a local analyst+approver, for "
+        "development only. Refused unless --host is a loopback address.",
+    )
+    console.add_argument(
+        "--allow-runs",
+        action="store_true",
+        help="Let a signed-in scanner start scans from the console. Off by "
+        "default: a control plane serving a queue has no business starting "
+        "runs, and this one reads repositories and spends money.",
+    )
+    console.add_argument(
+        "--run-max-calls",
+        type=int,
+        default=200,
+        help="Ceiling for a run started from the console. The deployment's "
+        "choice, never the caller's.",
+    )
+    console.set_defaults(func=_cmd_console)
+
+    poc = sub.add_parser(
+        "draft-poc",
+        help="Draft a PoC for findings a run did not draft for automatically.",
+    )
+    poc.add_argument("run_dir", type=Path, help="Run directory holding queue.json.")
+    poc.add_argument(
+        "--finding",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Finding id to draft for. Repeat, or pass a comma-separated list.",
+    )
+    poc.add_argument("--model", default="", help="Deployment to draft with.")
+    poc.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Where to write the pack (default: <run_dir>/pocs-requested.md).",
+    )
+    poc.add_argument("--max-calls", type=int, default=None)
+    poc.add_argument("--audit", type=Path, default=None)
+    poc.set_defaults(func=_cmd_draft_poc)
+
     plan = sub.add_parser("plan", help="Show the model allocation and projected spend.")
     plan.add_argument("--model", default="", help="Deployment for every task.")
     plan.add_argument("--router-model", default="")
@@ -208,6 +311,13 @@ def _build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--candidates", type=int, default=0)
     plan.add_argument("--services", type=int, default=1)
     plan.add_argument("--findings", type=int, default=0)
+    plan.add_argument(
+        "--critical",
+        type=int,
+        default=None,
+        help="Findings expected to come out critical — only those are drafted "
+        "for. Omitted, the projection assumes every finding is, and over-projects.",
+    )
     plan.set_defaults(func=_cmd_plan)
 
     return parser
@@ -250,6 +360,315 @@ def _cmd_secrets(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     return EXIT_OK
 
 
+def _run_preflight(
+    provider: ModelProvider,
+    deployments: dict[str, str],
+    quiet: bool = False,
+) -> PreflightReport:
+    """Ask the provider what it serves and report against what is configured."""
+    report = preflight_check(deployments, provider.list_deployments())
+    if not quiet:
+        for line in report.describe():
+            print(line, file=sys.stderr if not report.ok else sys.stdout)
+    for warning in report.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return report
+
+
+def _cmd_preflight(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """Check the deployments a run would use, without running it."""
+    deployments = deployments_for(
+        model=args.model or env.get("ENGAGEMENT_MODEL", ""),
+        router_model=args.router_model,
+        expert_model=args.expert_model,
+        triage_model=args.triage_model,
+        analysis_model=args.analysis_model,
+        second_model=args.second_model,
+    )
+    if not deployments:
+        print(
+            "nothing to check: no deployment named. Pass --model or set "
+            "ENGAGEMENT_MODEL.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    try:
+        api_key = resolve_optional(SecretResolver(env), build_secret_plan(env).refs[0])
+        provider = build_provider(env, egress=build_policy(env), api_key=api_key or None)
+    except (SecretError, ProviderError) as exc:
+        print(f"cannot preflight: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    report = _run_preflight(provider, deployments)
+    if not report.ok:
+        return EXIT_CONFIG
+    # An unchecked result is not a pass and not a failure. Exit 3 is this CLI's
+    # existing "finished, but not cleanly" code, and a scheduler that treats it
+    # as success is making the same mistake as one that ignores a parked run.
+    return EXIT_OK if report.checked else EXIT_INCOMPLETE
+
+
+def _workspace_root(run_dir: Path) -> Path:
+    """`<workspace>/runs/<target>/<run-id>` back to `<workspace>`.
+
+    Derived rather than asked for, so the operator names one path and the
+    console can still discover sibling runs. A run directory that is not of
+    that shape yields itself, which means the console serves exactly the run it
+    was pointed at — the previous behaviour, and the safe one.
+    """
+    resolved = run_dir.resolve()
+    if len(resolved.parents) >= 3 and resolved.parent.parent.name == "runs":
+        return resolved.parents[2]
+    return resolved
+
+
+def _cmd_console(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """Serve the analyst console over one run.
+
+    Two ways to authenticate, and the second one is fenced. Normally the
+    console verifies OIDC tokens exactly as the deployed control plane does.
+    ``--dev-token`` accepts one fixed string instead, so an analyst can work a
+    queue on their own machine without standing up an identity provider — and
+    it is **refused unless the listener is on loopback**, because the whole
+    point of the identity model is that "human" has a referent, and a shared
+    string reachable from a network is not one.
+    """
+    if not (args.run_dir / "queue.json").exists():
+        print(
+            f"no queue manifest at {args.run_dir / 'queue.json'} — the console "
+            "shows a run's findings, so the run has to have produced some",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    loopback = args.host in {"127.0.0.1", "::1", "localhost"}
+    if args.dev_token and not loopback:
+        print(
+            "refusing to serve: --dev-token is a shared string, not an "
+            f"identity, and --host {args.host} is reachable from a network. "
+            "Bind to 127.0.0.1, or configure OIDC.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    verifier: TokenVerifier
+    if args.dev_token:
+        # The development principal is granted exactly what this invocation
+        # enabled: `scanner` only when `--allow-runs` was passed. A token that
+        # always carried it would make the opt-in meaningless locally, which is
+        # where the opt-in is most likely to be tested.
+        dev_roles = ["Engagement.Analyst", "Engagement.Approver"]
+        if args.allow_runs:
+            dev_roles.append("Engagement.Scanner")
+        verifier = StaticVerifier(
+            tokens={
+                args.dev_token: {
+                    "oid": f"dev:{env.get('ENGAGEMENT_OPERATOR', 'local')}",
+                    "name": env.get("ENGAGEMENT_OPERATOR", "local operator"),
+                    "roles": dev_roles,
+                }
+            }
+        )
+        print("warning: serving with a development token; identity is asserted, "
+              "not verified", file=sys.stderr)
+    else:
+        missing = [
+            name
+            for name in ("ENGAGEMENT_JWKS_URI", "ENGAGEMENT_ISSUER", "ENGAGEMENT_API_AUDIENCE")
+            if not env.get(name, "").strip()
+        ]
+        if missing:
+            print(
+                "refusing to serve: " + ", ".join(missing) + " not set. Without "
+                "them every token would be accepted on trust. Pass --dev-token "
+                "on a loopback host to work locally instead.",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
+        verifier = OidcVerifier(
+            jwks_uri=env["ENGAGEMENT_JWKS_URI"],
+            issuer=env["ENGAGEMENT_ISSUER"],
+            audience=env["ENGAGEMENT_API_AUDIENCE"],
+        )
+
+    drafter = None
+    deployment = args.model or env.get("ENGAGEMENT_MODEL", "")
+    if deployment:
+        try:
+            api_key = resolve_optional(
+                SecretResolver(env), build_secret_plan(env).refs[0]
+            )
+            provider = build_provider(
+                env, egress=build_policy(env), api_key=api_key or None
+            )
+        except (SecretError, ProviderError) as exc:
+            print(f"refusing to serve: {exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        drafter = RunPocDrafter(args.run_dir, provider, deployment)
+
+    runner = None
+    workspace = _workspace_root(args.run_dir)
+    if args.allow_runs:
+        if not deployment:
+            print(
+                "refusing to serve: --allow-runs needs a deployment to run "
+                "with. Pass --model or set ENGAGEMENT_MODEL.",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
+        runner = RunLauncher(
+            workspace=workspace,
+            env=dict(env),
+            model=deployment,
+            max_calls=args.run_max_calls,
+        )
+
+    plane = ControlPlane(
+        verifier,
+        JsonlDecisionStore(args.decisions or args.run_dir / "decisions.jsonl"),
+        ApiConfig(
+            tenant=env.get("ENGAGEMENT_TENANT_ID", ""),
+            authorize_url=env.get("ENGAGEMENT_AUTHORIZE_URL", ""),
+            token_url=env.get("ENGAGEMENT_TOKEN_URL", ""),
+            client_id=env.get("ENGAGEMENT_CLIENT_ID", ""),
+            api_audience=env.get("ENGAGEMENT_API_AUDIENCE", ""),
+            environment=env.get("ENGAGEMENT_ENVIRONMENT", str(args.run_dir.name)),
+            allow_token_entry=bool(args.dev_token),
+        ),
+        RoleMapping(mapping=CONSOLE_ROLE_CLAIMS),
+        drafter,
+        ManifestQueue(args.run_dir, workspace=workspace),
+        runner,
+    )
+
+    try:
+        import uvicorn
+    except ImportError:
+        print(
+            "serving the console needs the 'api' extra: pip install "
+            "'codescan-engagement[api]'",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    print(f"console on http://{args.host}:{args.port}/ over {args.run_dir}")
+    print(f"  workspace : {workspace}")
+    print(f"  drafting  : {'on (' + deployment + ')' if drafter else 'off'}")
+    print(
+        "  runs      : "
+        + (f"on, ceiling {args.run_max_calls} calls" if runner else "off")
+    )
+    uvicorn.run(
+        build_app(plane, console_html=render_console()),
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+    )
+    return EXIT_OK
+
+
+def _cmd_draft_poc(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """Draft PoCs for findings the automatic critical-only rule passed over.
+
+    The command exists because the rule is deliberately narrow: a run drafts for
+    what came out critical, and an analyst who wants one for anything else asks
+    for it here, by id, against the queue that run produced.
+    """
+    wanted = [
+        item.strip()
+        for raw in args.finding
+        for item in str(raw).split(",")
+        if item.strip()
+    ]
+    if not wanted:
+        print(
+            "refusing to draft: name at least one finding with --finding",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    try:
+        principal = operator(env.get("ENGAGEMENT_OPERATOR", ""))
+        authorize(principal, Action.draft_poc)
+    except Unauthorized as exc:
+        print(f"refusing to draft: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    manifest = args.run_dir / "queue.json"
+    if not manifest.exists():
+        print(
+            f"no queue manifest at {manifest} — a requested draft is made against "
+            "a run's own findings, so the run has to have produced some",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+    try:
+        findings = read_manifest(manifest)
+    except (OSError, ValueError) as exc:
+        print(f"could not read {manifest}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    deployment = args.model or env.get("ENGAGEMENT_MODEL", "")
+    if not deployment:
+        print(
+            "refusing to draft: no model deployment — pass --model or set "
+            "ENGAGEMENT_MODEL",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG
+
+    egress = build_policy(env)
+    try:
+        api_key = resolve_optional(SecretResolver(env), build_secret_plan(env).refs[0])
+        provider = build_provider(env, egress=egress, api_key=api_key or None)
+    except (SecretError, ProviderError) as exc:
+        print(f"refusing to draft: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    try:
+        budget = Budget(
+            max_calls=_bound(
+                args.max_calls, env, "ENGAGEMENT_MAX_CALLS", Budget().max_calls
+            )
+        )
+    except ValueError as exc:
+        print(f"refusing to draft: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    audit_log = AuditLog(FileSink(args.audit or args.run_dir / "audit.jsonl"))
+    audit_log.record(
+        "poc_requested",
+        actor=principal.actor(),
+        findings=len(wanted),
+        deployment=deployment,
+    )
+    summary = draft_requested(
+        findings, Dispatcher(provider, Ledger(budget=budget), audit_log), deployment, wanted
+    )
+    audit_log.record(
+        "poc_request_finished",
+        actor=principal.actor(),
+        drafted=len(summary.drafted),
+        undrafted=len(summary.pocs_undrafted),
+        calls=summary.model_calls,
+    )
+
+    out = args.out or args.run_dir / "pocs-requested.md"
+    pack = to_markdown(summary, findings)
+    if pack:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(pack, encoding="utf-8")
+        summary.pocs_path = str(out)
+        print(f"{len(summary.drafted)} draft(s) -> {out}")
+    else:
+        print("nothing was drafted")
+    print(f"  requested : {len(wanted)}")
+    print(f"  calls     : {summary.model_calls}")
+    for warning in summary.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return EXIT_OK if summary.drafted else EXIT_ERROR
+
+
 def _cmd_plan(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     """Print the allocation before a run, so spend is a decision not a surprise."""
     shared = args.model or env.get("ENGAGEMENT_MODEL", "")
@@ -266,6 +685,7 @@ def _cmd_plan(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         candidates=args.candidates,
         services=args.services,
         findings=args.findings,
+        critical_findings=args.critical,
     )
     print(render_plan(plan))
     for warning in plan.warnings:
@@ -371,6 +791,33 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return EXIT_CONFIG
 
+    # Before the workspace is touched and before a single call is dispatched:
+    # a run that discovers a missing deployment three phases in has already
+    # spent everything it took to get there.
+    if not args.no_preflight:
+        checked = _run_preflight(
+            provider,
+            deployments_for(
+                model=policy.model,
+                router_model=policy.router_model,
+                expert_model=policy.expert_model,
+                triage_model=policy.triage_model,
+                analysis_model=args.analysis_model,
+                second_model=policy.second_expert_model,
+            ),
+            quiet=True,
+        )
+        if not checked.ok:
+            for line in checked.describe():
+                print(line, file=sys.stderr)
+            return EXIT_CONFIG
+        if not checked.checked:
+            print(
+                "warning: preflight could not verify the deployments; the run "
+                "is proceeding unchecked",
+                file=sys.stderr,
+            )
+
     try:
         authorize(machine(), Action.run_scan)
     except Unauthorized as exc:  # pragma: no cover - defensive
@@ -447,14 +894,17 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     if summary is not None:
         lifecycle_report = _run_lifecycle(args, summary, repo, audit_log)
         warnings.extend(lifecycle_report.warnings)
-        analysis = _run_analysis(args, summary, driver, repo, run_dir, audit_log)
-        if analysis is not None:
-            warnings.extend(analysis.warnings)
-        signal_report = apply_exposure(
-            summary.queue, load_boundaries(run_dir / "recon-output" / "recon-items.jsonl")
+        # exposure first: PoC drafting selects on the *final* score, so every
+        # deterministic adjustment has to be in before the advisory stages read
+        # it. Chaining is the one exception — it is produced by the chain stage
+        # itself, so `analyse` applies it between its own two stages.
+        boundaries = load_boundaries(run_dir / "recon-output" / "recon-items.jsonl")
+        signal_report = apply_exposure(summary.queue, boundaries)
+        analysis = _run_analysis(
+            args, summary, driver, repo, run_dir, audit_log, signal_report
         )
         if analysis is not None:
-            apply_chaining(summary.queue, analysis.chains, signal_report)
+            warnings.extend(analysis.warnings)
         warnings.extend(signal_report.warnings)
 
         # written last, so the worklist reflects lifecycle findings and the
@@ -470,6 +920,21 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         write_manifest(rows, run_dir / "queue.json", args.run_id)
         summary.csv_path = str(queue_path)
         movement = movement_summary(rows)
+
+        # Written last, from every stage's output, and with no model call: the
+        # threat model is a projection of evidence already gathered, so it has
+        # to come after the evidence is complete.
+        report.threat_model_path = str(
+            write_threat_model(
+                report,
+                summary.queue,
+                out_dir=run_dir,
+                repo=repo,
+                exposure=boundaries,
+                lifecycle=lifecycle_report,
+                analysis=analysis,
+            )
+        )
 
     governance = review(
         {item.item_id: item.detail for item in report.candidates},
@@ -651,6 +1116,7 @@ def _run_analysis(
     repo: str,
     run_dir: Path,
     audit_log: AuditLog,
+    signals: SignalReport,
 ) -> AnalysisSummary | None:
     """Run the advisory stages, spending from the run's own ledger."""
     if not (args.chains or args.pocs):
@@ -671,6 +1137,7 @@ def _run_analysis(
         repo=repo,
         want_chains=args.chains,
         want_pocs=args.pocs,
+        signals=signals,
     )
     audit_log.record(
         "analysis_finished",
@@ -697,6 +1164,8 @@ def _print_report(report: RunReport) -> None:
     print(f"  reviewed  : {report.reviewed_fraction:.0%} of the backlog")
     if report.sarif_path:
         print(f"  sarif     : {report.sarif_path}")
+    if report.threat_model_path:
+        print(f"  threat    : {report.threat_model_path}")
     if report.redactions:
         print(f"  redacted  : {report.redactions} credential-shaped value(s)")
 

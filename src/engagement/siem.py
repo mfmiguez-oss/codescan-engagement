@@ -59,6 +59,8 @@ ALLOWED_DETAILS: dict[str, frozenset[str]] = {
             "output_tokens",
             "redactions",
             "calls_so_far",
+            "cache_read_tokens",
+            "cache_write_tokens",
         }
     ),
     "run_started": frozenset({"target", "run_id"}),
