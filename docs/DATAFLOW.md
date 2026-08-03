@@ -59,6 +59,19 @@ dependency — nothing here imports it. And since the backbone was ported,
 `codescan-triage` is not a dependency either; the only external code that ships
 with this package is the vendored OpenHack workspace.
 
+Both absences are held in place by a frozen artifact rather than by an import
+that might not resolve: `vendor/openhack/vendor-manifest.json` for the
+workspace, `tests/data/backbone_vectors.json` for the backbone. Neither can be
+skipped by an environment that lacks the thing it checks against, which is the
+whole point — the backbone's previous check *was* skippable that way and so
+never ran anywhere.
+
+`codescan-mcp`'s absence is stronger than "not imported": its fingerprints are
+a different scheme (32 chars over `(vuln, locus, repo)`, CWEs collapsed to
+their family) and no input agrees with this one's (64 chars over a
+`dep|`/`code|`-discriminated key). Findings are not correlatable across the
+two estates, and no code on either side notices the attempt.
+
 ---
 
 ## 2. The pipeline, end to end

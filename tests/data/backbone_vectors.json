@@ -1,0 +1,221 @@
+{
+  "dependency_fingerprints": [
+    {
+      "component": {
+        "ecosystem": "npm",
+        "name": "lodash"
+      },
+      "digest": "eab022c4c4b461535660badf201f36de30f5abb1e17f5d775ac04dbf463e3e9c",
+      "repo": "acme/app",
+      "vuln_id": "CVE-2020-8203"
+    },
+    {
+      "component": {
+        "ecosystem": "npm",
+        "name": "lodash"
+      },
+      "digest": "eab022c4c4b461535660badf201f36de30f5abb1e17f5d775ac04dbf463e3e9c",
+      "repo": "acme/app",
+      "vuln_id": "cve-2020-8203"
+    },
+    {
+      "component": {
+        "ecosystem": "maven",
+        "name": "log4j-core",
+        "version": "2.14.1"
+      },
+      "digest": "fa53eb7af15d0b87223f31c46ae9a1779e54d6129c428a1682928547707ced5a",
+      "repo": "acme/app",
+      "vuln_id": "CVE-2021-44228"
+    }
+  ],
+  "fingerprints": [
+    {
+      "digest": "9aedf79fb091cba744b22bc71b88b730a484cfafb32f7d442cf4fce521a66dfb",
+      "kwargs": {
+        "path": "src/a.py",
+        "weakness_id": "CWE-79"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "9aedf79fb091cba744b22bc71b88b730a484cfafb32f7d442cf4fce521a66dfb",
+      "kwargs": {
+        "path": "src/a.py",
+        "weakness_id": "79"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "9aedf79fb091cba744b22bc71b88b730a484cfafb32f7d442cf4fce521a66dfb",
+      "kwargs": {
+        "path": "src/a.py",
+        "weakness_id": "cwe-079"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "9aedf79fb091cba744b22bc71b88b730a484cfafb32f7d442cf4fce521a66dfb",
+      "kwargs": {
+        "path": "src/a.py",
+        "weakness_id": "XSS"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "9aedf79fb091cba744b22bc71b88b730a484cfafb32f7d442cf4fce521a66dfb",
+      "kwargs": {
+        "path": "src/a.py",
+        "weakness_id": "cross site scripting"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "560a47954b4837f9775e1a39aa645656e17813d7ebc4a7f5a4c038738bc2022b",
+      "kwargs": {
+        "path": "./src/b.py",
+        "weakness_id": "PATH-TRAVERSAL"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "560a47954b4837f9775e1a39aa645656e17813d7ebc4a7f5a4c038738bc2022b",
+      "kwargs": {
+        "path": "src\\b.py",
+        "weakness_id": "path_traversal"
+      },
+      "repo": "acme/app"
+    },
+    {
+      "digest": "893e6b73b5eb7f4935f4d34746b450cd53031a7f6383f9029221881335147f65",
+      "kwargs": {
+        "path": "/src/c.py",
+        "weakness_id": "some_novel_label"
+      },
+      "repo": "ACME/App"
+    }
+  ],
+  "frozen_at": "2026-08-03T08:57:03+00:00",
+  "kev_floor": 85.0,
+  "path_normalisation": {
+    "././x.py": "x.py",
+    "./src/a.py": "src/a.py",
+    "/src/a.py": "src/a.py",
+    "a/../b.py": "a/../b.py",
+    "src/a.py": "src/a.py",
+    "src\\A.py": "src/a.py"
+  },
+  "scores": [
+    {
+      "case": {
+        "severity": "info"
+      },
+      "risk_score": 6.5
+    },
+    {
+      "case": {
+        "severity": "low"
+      },
+      "risk_score": 19.5
+    },
+    {
+      "case": {
+        "severity": "medium"
+      },
+      "risk_score": 35.75
+    },
+    {
+      "case": {
+        "severity": "high"
+      },
+      "risk_score": 52.0
+    },
+    {
+      "case": {
+        "severity": "critical"
+      },
+      "risk_score": 65.0
+    },
+    {
+      "case": {
+        "epss": 0.75,
+        "severity": "medium"
+      },
+      "risk_score": 42.75
+    },
+    {
+      "case": {
+        "ai_exploitability": 90.0,
+        "severity": "high"
+      },
+      "risk_score": 55.5
+    },
+    {
+      "case": {
+        "ai_exploitability": 90.0,
+        "epss": 0.2,
+        "severity": "high"
+      },
+      "risk_score": 45.7
+    },
+    {
+      "case": {
+        "kev": true,
+        "severity": "low"
+      },
+      "risk_score": 85.0
+    },
+    {
+      "case": {
+        "ai_exploitability": 99.0,
+        "kev": true,
+        "severity": "critical"
+      },
+      "risk_score": 85.0
+    },
+    {
+      "case": {
+        "chaining": 40.0,
+        "exposure": 60.0,
+        "severity": "medium"
+      },
+      "risk_score": 53.75
+    },
+    {
+      "case": {
+        "ai_exploitability": 100.0,
+        "chaining": 100.0,
+        "exposure": 100.0,
+        "severity": "critical"
+      },
+      "risk_score": 100.0
+    }
+  ],
+  "source_commit": "c683905727df5b7d94e69f15198e3dfa857990ec",
+  "source_dirty": [],
+  "source_repo": "codescan-triage",
+  "weakness_table": {
+    "42": "CWE-42",
+    "COMMAND_INJECTION": "CWE-78",
+    "CSRF": "CWE-352",
+    "CWE-1234": "CWE-1234",
+    "Cross Site Scripting": "CWE-79",
+    "INSECURE_DESERIALIZATION": "CWE-502",
+    "LFI": "CWE-98",
+    "OPEN_REDIRECT": "CWE-601",
+    "PATH_TRAVERSAL": "CWE-22",
+    "SQLI": "CWE-89",
+    "WEAK_SESSION_ID": "CWE-330",
+    "XSS": "CWE-79",
+    "broken access control": "BROKEN_ACCESS_CONTROL",
+    "cwe-079": "CWE-79",
+    "insecure cookie": "INSECURE_COOKIE",
+    "some novel label": "SOME_NOVEL_LABEL"
+  },
+  "weights": {
+    "chaining": 0.15,
+    "exploitability": 0.35,
+    "exposure": 0.2,
+    "severity": 0.3
+  }
+}

@@ -109,9 +109,35 @@ score looked like a run that found nothing worth scoring.
 Fingerprinting and the weakness-synonym table are ported **verbatim**: a
 fingerprint is a finding's identity, and a port that hashed differently would
 orphan every analyst decision and every baseline at the moment of the switch.
-`tests/test_backbone_conformance.py` holds the port byte-for-byte against the
-original whenever `triagekit` happens to be installed beside it, and skips
-cleanly when it is not.
+`tests/test_backbone_conformance.py` holds the port to
+`tests/data/backbone_vectors.json` — the original's own answers for every
+branch of the identity path, the weakness table, path normalisation, the
+weights and the scores, frozen against a named `triagekit` commit by
+`scripts/freeze_backbone_vectors.py`. That check runs offline on every machine.
+The live import-and-compare is still there and still skips when `triagekit` is
+absent, but it is now the second opinion rather than the whole mechanism: the
+original is a private repo and not a dependency, so it was never installed
+anywhere, and for as long as skipping *was* the mechanism the port was
+unverified on every run that has ever executed.
+
+Re-freeze on any deliberate backbone change:
+
+```bash
+python scripts/freeze_backbone_vectors.py --from ../codescan-triage
+```
+
+A diff in that file is a change to what a finding *is*. Read it like a
+migration, not like a fixture update.
+
+**These fingerprints are not portable to `codescan-mcp`.** It computes a
+32-character digest over `(vuln, locus, repo)` — collapsing CWEs to their
+family and falling back to the title — while this backbone and `triagekit`
+compute a 64-character digest over a `dep|`/`code|`-discriminated key. Two
+identity schemes, deliberately, and no input produces the same digest under
+both. A decision recorded in one estate cannot be matched to a finding in the
+other, and nothing on either side detects the mismatch — so do not build a
+shared decision history, baseline, or ticket correlation across them without
+migrating one scheme onto the other first.
 
 Without feeds it still scores, and says so: an unexploited finding and an
 unchecked one otherwise rank the same.

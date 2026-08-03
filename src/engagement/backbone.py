@@ -19,9 +19,21 @@ fingerprint is a finding's identity: every analyst decision, every validation
 state, and every baseline comparison is keyed on it. A port that hashed even
 slightly differently would silently orphan all of them at the moment of the
 switch — every finding would read as new, and every prior decision would stop
-matching the finding it was made about. `tests/test_backbone_conformance.py`
-holds this to the original byte-for-byte whenever `triagekit` happens to be
-installed, the same way the vendored workspace is held to its upstream.
+matching the finding it was made about.
+
+`tests/test_backbone_conformance.py` holds this to the original the same way
+the vendored workspace is held to its upstream: against a frozen artifact
+(`tests/data/backbone_vectors.json`) rather than against whatever happens to be
+importable. It used to compare by importing `triagekit` and skip when that
+failed — and since `triagekit` is a private repo and not a dependency, it
+failed everywhere, so the check never once ran. Re-freeze with
+`scripts/freeze_backbone_vectors.py` on any deliberate change here.
+
+The scheme is **incompatible with `codescan-mcp`**, which digests
+`(vuln, locus, repo)` to 32 characters with CWEs collapsed to their family;
+this one digests a `dep|`/`code|`-discriminated key to 64. Neither is wrong,
+but no input agrees under both, so a decision recorded in one estate cannot be
+matched to a finding in the other and nothing detects the attempt.
 """
 
 from __future__ import annotations

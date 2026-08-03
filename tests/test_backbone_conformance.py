@@ -7,12 +7,20 @@ floor, deterministic ranking. These are the invariants the estate depends on and
 they hold whether or not `triagekit` is installed.
 
 **Conformance** — the same inputs must produce the same fingerprints and the
-same scores as `triagekit` itself. Skipped when the original is not installed,
-exactly as `test_vendor.py` skips its upstream-drift check when no OpenHack
-checkout sits beside the repo. A fingerprint is a finding's *identity*: every
-analyst decision, validation state and baseline comparison is keyed on it, so a
-port that hashed differently would orphan all of them silently — every finding
-would read as new and every prior decision would stop matching.
+same scores as `triagekit` itself. A fingerprint is a finding's *identity*:
+every analyst decision, validation state and baseline comparison is keyed on it,
+so a port that hashed differently would orphan all of them silently — every
+finding would read as new and every prior decision would stop matching.
+
+That comparison used to run by importing the original, and skip when it was
+absent. The original is a private repo and not a dependency, so it was absent
+everywhere — in CI and in the development venv alike — and the conformance
+tests skipped every run since they were written. A drift check that has never
+executed is not a check. So the answers are **frozen** into
+`data/backbone_vectors.json` by `scripts/freeze_backbone_vectors.py`, and read
+from there: offline, always, everywhere. The live comparison is kept as well,
+for the case where a checkout does happen to be importable, but it is now the
+bonus rather than the whole mechanism.
 """
 
 from __future__ import annotations
@@ -50,7 +58,11 @@ except ImportError:  # pragma: no cover
     HAVE_ORIGINAL = False
 
 needs_original = pytest.mark.skipif(
-    not HAVE_ORIGINAL, reason="triagekit is not installed; conformance not checkable here"
+    not HAVE_ORIGINAL, reason="triagekit is not installed; the frozen vectors carry this"
+)
+
+VECTORS = json.loads(
+    (Path(__file__).parent / "data" / "backbone_vectors.json").read_text(encoding="utf-8")
 )
 
 #: Inputs chosen to exercise every branch of the identity path: a plain CWE id,
@@ -304,7 +316,69 @@ def test_a_sarif_without_runs_is_reported_not_crashed(tmp_path: Path) -> None:
     assert report.errors and report.errors[0].message == "no 'runs'"
 
 
-# -- conformance with the original -------------------------------------------
+# -- conformance against the frozen vectors ----------------------------------
+#
+# These run offline, on every machine, on every commit. They are the reason the
+# port is safe to keep; the live comparisons below are a second opinion when a
+# checkout happens to be importable.
+
+
+def test_the_frozen_vectors_name_the_commit_they_came_from() -> None:
+    """A vector set that cannot say what produced it is a set of magic numbers.
+
+    `source_dirty` must be empty for the same reason the vendor manifest's must:
+    frozen against a modified tree, the digests are not reproducible from the
+    commit recorded beside them, and the next person to re-freeze gets a diff
+    they cannot explain.
+    """
+    assert VECTORS["source_commit"] and len(VECTORS["source_commit"]) == 40
+    assert VECTORS["source_dirty"] == []
+
+
+def test_frozen_code_fingerprints_still_reproduce() -> None:
+    """Identity must survive the port, or every stored decision is orphaned."""
+    assert VECTORS["fingerprints"], "the vector file lost its identity cases"
+    for case in VECTORS["fingerprints"]:
+        assert compute_fingerprint(case["repo"], **case["kwargs"]) == case["digest"], case
+
+
+def test_frozen_dependency_fingerprints_still_reproduce() -> None:
+    assert VECTORS["dependency_fingerprints"]
+    for case in VECTORS["dependency_fingerprints"]:
+        digest = compute_fingerprint(
+            case["repo"],
+            vuln_id=case["vuln_id"],
+            component=Component(**case["component"]),
+        )
+        assert digest == case["digest"], case
+
+
+def test_the_frozen_weakness_table_still_reproduces() -> None:
+    """A divergent synonym merges findings the original keeps distinct."""
+    assert VECTORS["weakness_table"]
+    for label, canonical in VECTORS["weakness_table"].items():
+        assert canonical_weakness(label) == canonical, label
+
+
+def test_frozen_path_normalisation_still_reproduces() -> None:
+    assert VECTORS["path_normalisation"]
+    for raw, normalised in VECTORS["path_normalisation"].items():
+        assert normalize_path(raw) == normalised, raw
+
+
+def test_frozen_scores_still_reproduce() -> None:
+    assert VECTORS["scores"]
+    for case in VECTORS["scores"]:
+        scored = score_finding(_finding(**case["case"]))
+        assert scored.risk_score == case["risk_score"], case["case"]
+
+
+def test_the_frozen_weights_and_floor_still_match() -> None:
+    assert WEIGHTS == VECTORS["weights"]
+    assert KEV_FLOOR == VECTORS["kev_floor"]
+
+
+# -- conformance with the original, when it is importable --------------------
 
 
 @needs_original
