@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable, cast
 
-from .expert_scope import require_run_expert_scope, set_run_expert_scope, scope_summary
 from .coverage import write_coverage
+from .expert_scope import require_run_expert_scope, scope_summary, set_run_expert_scope
 from .inventory import hits, signals, write_jsonl
 from .inventory_patterns import DETAILS, SKIP
 from .log import emit

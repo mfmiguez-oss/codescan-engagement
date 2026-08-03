@@ -10,7 +10,6 @@ from .paths import root, run_path
 from .router_context import load_inventory, read_jsonl, routing_paths
 from .template_contract import strip_markers
 
-
 MAX_RECON_ITEMS_PER_PATH = 3
 MAX_RECON_ITEMS = 300
 

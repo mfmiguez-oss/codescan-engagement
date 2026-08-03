@@ -6,7 +6,6 @@ from typing import Any
 
 from .inventory_patterns import SKIP
 
-
 MAX_FILE_BYTES = 500000
 SECURITY_KEYS = {
     "check_path",

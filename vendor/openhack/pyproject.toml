@@ -30,6 +30,19 @@ where = ["src"]
 [tool.ruff]
 target-version = "py39"
 
+# Declared, not inherited. The dev extra pins ruff only as >=0.6, so CI
+# resolves whatever is newest, and a default rule set is a moving target: 0.16
+# reported 57 errors here that 0.15 did not, none of them from a code change.
+# A gate that shifts when a tool is released is a statement about the machine
+# rather than the repo, so the rules are named.
+#
+# These catch defects: pyflakes, the pycodestyle errors that are not
+# formatting, import order, and bugbear. E501 and W are deliberately out --
+# this code runs long lines on purpose, and reflowing 140 of them would be a
+# style migration wearing a bug fix's clothes.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
 [tool.mypy]
 files = ["src"]
 disallow_untyped_defs = true

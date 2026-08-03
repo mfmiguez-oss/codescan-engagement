@@ -16,7 +16,6 @@ from typing import Iterable
 from .expert_scope import read_run_expert_scope, scope_summary
 from .paths import root, run_path
 
-
 PROCEED_PROMPT = "Summarize this checkpoint, then ask the user whether to proceed."
 CONTINUE_LOOP_PROMPT = (
     "If the full scenario loop was already approved, summarize status and "

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from hashlib import sha256
 from collections import Counter
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 

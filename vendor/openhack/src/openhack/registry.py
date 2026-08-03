@@ -8,7 +8,6 @@ from typing import Any, Iterable, Literal, cast
 import yaml  # type: ignore[import-untyped]
 
 from .models import AgentRegistry, Expert, OrchestrationAgent, ReconAgent
-
 from .paths import root
 
 AgentKind = Literal["experts", "orchestration", "reconnaissance"]

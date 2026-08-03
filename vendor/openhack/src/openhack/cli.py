@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .log import emit
-from .expert_scope import expert_options_text, read_run_expert_scope, scope_summary
-from .paths import run_path
 from .backlog import record_backlog
+from .expert_scope import expert_options_text, read_run_expert_scope, scope_summary
+from .log import emit
+from .paths import run_path
 from .queue import expert_queue
 from .recon import run_recon
 from .results import record_bundle, record_result
@@ -53,7 +53,7 @@ def _cmd_run_recon(args: argparse.Namespace) -> None:
         )
     except ValueError as exc:
         print(exc)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     path = run_path(args.target, args.run_id)
     recon = path / "recon-output"
     artifacts = [recon / name for name in [
@@ -192,7 +192,7 @@ def _cmd_emit_sarif(args: argparse.Namespace) -> None:
         out, count = emit_sarif(args.target, args.run_id, args.out)
     except ValueError as exc:
         print(exc)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     note = (
         "No triage-accepted findings in this run yet, so the log is empty by "
         "design — candidates and rejected findings are never exported."
