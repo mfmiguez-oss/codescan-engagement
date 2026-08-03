@@ -97,13 +97,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-tokens", type=int, help="Overrides ENGAGEMENT_MAX_TOKENS.")
     run.add_argument("--max-retries", type=int, default=1)
     run.add_argument(
-        "--router-chunk-units",
+        "--router-chunk-obligations",
         type=int,
-        default=Policy().router_chunk_units,
+        default=Policy().router_chunk_obligations,
         help=(
-            "Routing units per router call. The backlog is split across calls "
-            "and merged; lower this if a chunk keeps overrunning its output "
-            "ceiling. Note --max-tokens is a whole-run token budget, not this."
+            "Coverage obligations per router call — the path, each expert it "
+            "owes, and each expert its mandatory units owe. The backlog is "
+            "split on this and merged; lower it if chunks keep coming back with "
+            "obligations undischarged. Note --max-tokens is a whole-run token "
+            "budget, not this."
         ),
     )
     run.add_argument(
@@ -111,6 +113,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=Policy().router_max_output_tokens,
         help="Output ceiling for one router call (default sized for a chunk).",
+    )
+    run.add_argument(
+        "--scenario-max-output-tokens",
+        type=int,
+        default=Policy().scenario_max_output_tokens,
+        help=(
+            "Output ceiling for one scenario answer. Raise it if scenarios come "
+            "back parked as 'truncated' — that reason means the answer hit this "
+            "ceiling, not that the review failed."
+        ),
+    )
+    run.add_argument(
+        "--triage-max-output-tokens",
+        type=int,
+        default=Policy().triage_max_output_tokens,
+        help="Output ceiling for one triage answer.",
     )
     run.add_argument(
         "--scenario-concurrency",
@@ -811,8 +829,10 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         expert_model=args.expert_model,
         triage_model=args.triage_model,
         max_retries=args.max_retries,
-        router_chunk_units=args.router_chunk_units,
+        router_chunk_obligations=args.router_chunk_obligations,
         router_max_output_tokens=args.router_max_output_tokens,
+        scenario_max_output_tokens=args.scenario_max_output_tokens,
+        triage_max_output_tokens=args.triage_max_output_tokens,
         scenario_concurrency=args.scenario_concurrency,
         effort=args.effort,
         emit_sarif=not args.no_sarif,

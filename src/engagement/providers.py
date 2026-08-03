@@ -261,6 +261,18 @@ class ProviderError(RuntimeError):
     """Configuration that would produce a silently degraded run."""
 
 
+class ProviderUnavailable(RuntimeError):
+    """The connection failed or died part-way through a stream.
+
+    The third transport failure, and the only one that is neither free nor a
+    stall: a reset mid-stream means the model generated tokens that were billed
+    and then lost with the connection. Retried anyway — discarding a phase of
+    dozens of calls over one network blip costs far more than re-asking — but
+    kept distinct from :class:`ProviderThrottled`, which costs nothing, so spend
+    reporting can tell a blip apart from a quota.
+    """
+
+
 class ProviderThrottled(RuntimeError):
     """The resource refused every attempt with a retryable status.
 
@@ -518,6 +530,22 @@ class FoundryProvider:
                     "generated are billed and are NOT in this run's ledger or "
                     "audit trail."
                 ) from exc
+            except httpx.TransportError as exc:
+                # The connection failed, or died part-way through a stream — a
+                # reset, a dropped proxy. Retried because losing a phase of
+                # dozens of calls to one blip costs far more than re-asking,
+                # but note this retry is *not* free the way a 429's is: what the
+                # model produced before the drop was billed and is gone.
+                if attempt >= RETRY_ATTEMPTS - 1:
+                    raise ProviderUnavailable(
+                        f"connection to {request.deployment} failed on all "
+                        f"{RETRY_ATTEMPTS} attempts: {exc}. Tokens generated "
+                        "before each drop are billed and are NOT in this run's "
+                        "ledger or audit trail."
+                    ) from exc
+                delay = _retry_after({}, attempt)
+                waited += delay
+                time.sleep(delay)
         return ModelResponse(
             deployment=request.deployment,
             content=content,

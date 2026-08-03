@@ -26,13 +26,15 @@ import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .contracts import (
     ParkedScenario,
     Phase,
     Priority,
     RenderedPrompt,
+    RoutingPath,
+    RoutingUnit,
     RunRef,
     RunState,
     ScenarioOutcome,
@@ -114,6 +116,21 @@ def _rendered(path: Path) -> RenderedPrompt:
     return RenderedPrompt(text=raw.decode("utf-8"), digest=sha256(raw).hexdigest())
 
 
+#: Fields the backlog recorder requires on every scenario before it will even
+#: reach the schema. Mirrored here so a chunk carrying an incomplete scenario is
+#: re-asked for one call, rather than failing the merge after the whole phase.
+_REQUIRED_SCENARIO_FIELDS = frozenset({
+    "id",
+    "recon_item_id",
+    "expert",
+    "target_path",
+    "proof_question",
+    "evidence_required",
+    "security_invariant",
+    "proof_obligations",
+})
+
+
 class WorkspaceError(RuntimeError):
     """The workspace refused an answer or could not complete an operation."""
 
@@ -125,7 +142,11 @@ class Workspace(Protocol):
 
     def run_recon(self, ref: RunRef, experts: list[str]) -> None: ...
 
-    def routing_units(self, ref: RunRef) -> list[str]: ...
+    def routing_paths(self, ref: RunRef) -> list[RoutingPath]: ...
+
+    def scenario_errors(self, scenarios: list[Any]) -> list[str]: ...
+
+    def valid_experts(self) -> list[str]: ...
 
     def read_router_chunk(self, ref: RunRef, key: str) -> str | None: ...
 
@@ -186,12 +207,25 @@ class CliWorkspace:
     # -- process plumbing ---------------------------------------------------
 
     def _run(self, *args: str) -> str:
-        env = {**os.environ, "OPENHACK_ROOT": str(self._root)}
+        env = {
+            **os.environ,
+            "OPENHACK_ROOT": str(self._root),
+            # UTF-8 mode, because the CLI writes prompt and result files with
+            # `write_text` and no explicit encoding. On Windows that resolves to
+            # cp1252, which cannot represent most of what a security review
+            # writes down — a live run died on `≥` in a scenario after the
+            # router phase had completed. The subprocess is where the writes
+            # happen, so this is where the default has to be corrected; it is
+            # not something the caller can fix by encoding its own input.
+            "PYTHONUTF8": "1",
+        }
         try:
             completed = subprocess.run(
                 [*self._command, *args],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._timeout,
                 env=env,
                 check=False,
@@ -266,8 +300,56 @@ class CliWorkspace:
             args.append("--all-agents")
         self._run(*args)
 
-    def routing_units(self, ref: RunRef) -> list[str]:
-        """The routing unit ids recon found, in the order recon emitted them.
+    def routing_paths(self, ref: RunRef) -> list[RoutingPath]:
+        """Routing units grouped by the path they belong to, in recon's order.
+
+        Grouped rather than flat because **the coverage gate judges paths**, not
+        units: every path with an input and a sink needs a scenario or a
+        path-level decision, and every path/expert requirement needs one too. A
+        split that cut a path across two assignments would leave neither able to
+        speak for it, and the merged backlog would be refused for a path that
+        every chunk thought the other one owned. A live run was rejected with
+        430 such errors.
+        """
+        grouped: dict[str, list[RoutingUnit]] = {}
+        for path, unit in self._routing_units(ref):
+            grouped.setdefault(path, []).append(unit)
+        required = self._required_experts(ref)
+        return [
+            RoutingPath(
+                path=path,
+                units=units,
+                required_experts=sorted(required.get(path, ())),
+            )
+            for path, units in grouped.items()
+        ]
+
+    def _required_experts(self, ref: RunRef) -> dict[str, set[str]]:
+        """Path/expert pairs recon says the backlog must account for.
+
+        Read from the same `coverage-gaps.json` the recorder's coverage gate
+        reads, so an assignment can state exactly what will be asked of it
+        rather than leaving the router to infer it from the raw material.
+        """
+        gaps = self._run_dir(ref) / "recon-output" / "coverage-gaps.json"
+        if not gaps.exists():
+            return {}
+        try:
+            data = json.loads(gaps.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:  # pragma: no cover - recon writes this
+            return {}
+        required: dict[str, set[str]] = {}
+        for entry in data.get("routing_requirements", []):
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", "")).strip()
+            expert = str(entry.get("expert", "")).strip()
+            if path and expert:
+                required.setdefault(path, set()).add(expert)
+        return required
+
+    def _routing_units(self, ref: RunRef) -> list[tuple[str, RoutingUnit]]:
+        """Every routing unit id with its path, in the order recon emitted them.
 
         Read rather than derived: the router prompt names these ids and the
         backlog recorder validates against them, so the driver has to split the
@@ -280,7 +362,7 @@ class CliWorkspace:
             raise WorkspaceError(
                 "routing-units.jsonl is missing; run recon before routing"
             )
-        units: list[str] = []
+        units: list[tuple[str, RoutingUnit]] = []
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
@@ -291,9 +373,94 @@ class CliWorkspace:
                     f"unreadable routing unit on line {number}: {exc}"
                 ) from exc
             unit_id = str(data.get("unit_id", "")).strip()
-            if unit_id:
-                units.append(unit_id)
+            if not unit_id:
+                continue
+            experts = data.get("required_experts")
+            units.append((
+                str(data.get("path", "")).strip(),
+                RoutingUnit(
+                    unit_id=unit_id,
+                    required_experts=[str(e) for e in experts]
+                    if isinstance(experts, list)
+                    else [],
+                    # The two the gate treats as obligations; anything else is
+                    # a suggestion recon offers and the router may decline.
+                    mandatory=data.get("coverage") in {"mandatory", "mandatory_path"},
+                ),
+            ))
         return units
+
+    def scenario_errors(self, scenarios: list[Any]) -> list[str]:
+        """Which scenarios the backlog recorder would refuse, and why.
+
+        The recorder's *own* schema, asked earlier. The router is dozens of
+        calls and one merged answer, so a single malformed scenario otherwise
+        discards the whole phase at its last step — a live run lost 51 calls to
+        one `recon_item_id: []` among 776 good ones. Checking per chunk turns
+        that into one re-ask.
+
+        This does not relax the recorder's check; it is the same check, run
+        sooner. If the schema cannot be read the answer goes forward unjudged,
+        because the recorder is still the authority and inventing a local
+        opinion of admissibility is exactly what this must not do.
+
+        The schema file is read from the workspace root rather than through
+        OpenHack's own loader: that loader resolves the root from
+        ``OPENHACK_ROOT``, which this adapter sets only in the *subprocess*
+        environment, so importing it in-process would fail wherever the driver
+        happens to be running. Reading the file directly also keeps this
+        thread-safe, which matters now that scenarios dispatch concurrently.
+        """
+        errors: list[str] = []
+        experts = set(self.valid_experts())
+        validator = self._scenario_validator()
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                errors.append("scenario is not an object")
+                continue
+            name = scenario.get("id")
+            missing = _REQUIRED_SCENARIO_FIELDS - set(scenario)
+            if missing:
+                errors.append(f"scenario {name} missing: {sorted(missing)}")
+            if validator is not None:
+                for error in validator.iter_errors(scenario):
+                    path = "$" + "".join(f".{part}" for part in error.path)
+                    errors.append(f"scenario {name}: {path}: {error.message}")
+            expert = scenario.get("expert")
+            if experts and expert not in experts:
+                errors.append(f"scenario {name}: unknown expert {expert!r}")
+            obligations = scenario.get("proof_obligations")
+            if isinstance(obligations, list):
+                ids = [
+                    o.get("id") for o in obligations if isinstance(o, dict)
+                ]
+                if len(ids) != len(set(ids)):
+                    errors.append(f"scenario {name}: duplicate proof obligation ids")
+        return errors
+
+    def valid_experts(self) -> list[str]:
+        """Expert ids this workspace actually has, from the same files the
+        recorder reads. Empty when the directory is absent, which leaves the
+        judgement to the recorder rather than inventing one."""
+        directory = self._root / "agents" / "experts"
+        if not directory.is_dir():
+            return []
+        return sorted(path.stem for path in directory.glob("*.md"))
+
+    def _scenario_validator(self) -> Any:
+        schema_path = self._root / "config" / "scenario-schema.json"
+        if not schema_path.exists():
+            return None
+        try:
+            from jsonschema import (  # type: ignore[import-untyped]
+                Draft202012Validator,
+            )
+
+            return Draft202012Validator(
+                json.loads(schema_path.read_text(encoding="utf-8"))
+            )
+        except (ImportError, json.JSONDecodeError, OSError):  # pragma: no cover
+            return None
 
     def _router_chunk_path(self, ref: RunRef, key: str) -> Path:
         return self._run_dir(ref) / "scenarios" / "router-chunks" / f"{key}.json"

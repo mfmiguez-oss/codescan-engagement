@@ -6,6 +6,8 @@ import sys
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
+
 from engagement.workspace import CliWorkspace, _rendered
 
 
@@ -38,3 +40,29 @@ def test_adapter_defaults_to_the_interpreter_running_it(tmp_path: Path) -> None:
     workspace = CliWorkspace(root=tmp_path)
     assert workspace._command[0] == sys.executable
     assert workspace._command[1:] == ["-m", "openhack"]
+
+
+def test_the_cli_runs_in_utf8_mode_whatever_the_platform_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenHack writes prompt and result files with no explicit encoding, so it
+    inherits the platform default — cp1252 on Windows, which cannot represent
+    most of what a security review writes down. A live run completed the whole
+    router phase and then died on a `≥` in a scenario."""
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def _capture(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _capture)
+    CliWorkspace(root=tmp_path)._run("state")
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["PYTHONUTF8"] == "1"
+    # And the pipes this end are read as UTF-8 too, so a character the child
+    # can now write is not lost on the way back.
+    assert captured["encoding"] == "utf-8"

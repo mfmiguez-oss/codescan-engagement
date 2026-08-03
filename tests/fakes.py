@@ -22,6 +22,8 @@ from engagement.contracts import (
     Phase,
     Priority,
     RenderedPrompt,
+    RoutingPath,
+    RoutingUnit,
     RunRef,
     RunState,
     ScenarioOutcome,
@@ -82,6 +84,15 @@ class FakeWorkspace:
         self.max_concurrent_workspace_calls = 0
         self._depth = 0
         self._depth_lock = Lock()
+        #: expert ids this workspace has files for. The router may use no others.
+        self.experts = ["injection", "crypto", "access"]
+        #: which path each routing unit belongs to. The coverage gate judges
+        #: paths, so chunking keeps them whole; unset means one path per unit.
+        self.unit_paths: dict[str, str] = {}
+        #: experts recon says a path owes a scenario or an explicit decision.
+        self.required_experts: dict[str, list[str]] = {}
+        #: experts a mandatory routing unit owes, checked against the unit id.
+        self.unit_experts: dict[str, list[str]] = {}
 
     # -- prompts ------------------------------------------------------------
 
@@ -119,8 +130,48 @@ class FakeWorkspace:
         self.recon_calls += 1
         self.recon_done = True
 
-    def routing_units(self, ref: RunRef) -> list[str]:
-        return list(self.units)
+    def routing_paths(self, ref: RunRef) -> list[RoutingPath]:
+        grouped: dict[str, list[str]] = {}
+        for unit in self.units:
+            grouped.setdefault(self.unit_paths.get(unit, f"src/{unit}.py"), []).append(
+                unit
+            )
+        return [
+            RoutingPath(
+                path=path,
+                units=[
+                    RoutingUnit(
+                        unit_id=unit,
+                        required_experts=self.unit_experts.get(unit, []),
+                        mandatory=bool(self.unit_experts.get(unit)),
+                    )
+                    for unit in units
+                ],
+                required_experts=self.required_experts.get(path, []),
+            )
+            for path, units in grouped.items()
+        ]
+
+    def valid_experts(self) -> list[str]:
+        return list(self.experts)
+
+    def scenario_errors(self, scenarios: list[object]) -> list[str]:
+        # Mirrors the two rules a live run actually tripped: the recorder wants
+        # `recon_item_id` to be a non-empty string, and the expert to be one it
+        # has a file for rather than a plausible-sounding invention.
+        errors = []
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                continue
+            value = scenario.get("recon_item_id", "")
+            if not isinstance(value, str) or not value:
+                errors.append(f"scenario {scenario.get('id')}: recon_item_id {value!r}")
+            if scenario.get("expert") not in self.experts:
+                errors.append(
+                    f"scenario {scenario.get('id')}: unknown expert "
+                    f"{scenario.get('expert')!r}"
+                )
+        return errors
 
     def read_router_chunk(self, ref: RunRef, key: str) -> str | None:
         return self.router_chunks.get(key)

@@ -42,6 +42,7 @@ from .contracts import (
     ParkedScenario,
     Phase,
     RenderedPrompt,
+    RoutingPath,
     RunRef,
     RunReport,
     ScenarioOutcome,
@@ -51,7 +52,7 @@ from .contracts import (
 )
 from .dispatch import Dispatcher
 from .expansion import ExpansionBounds, build_expansion, requested_paths
-from .providers import ModelProvider, unwrap_json
+from .providers import ModelProvider, ProviderTimeout, unwrap_json
 from .workspace import Workspace, WorkspaceError
 
 ROUTER_SYSTEM = (
@@ -90,7 +91,7 @@ ROUTER_ASSIGNMENT = """\
 The material above describes the whole target. Route **only** the routing units
 listed here. This is chunk {index} of {total}.
 
-Assigned routing unit ids ({count}):
+Assigned paths, with the routing unit ids belonging to each ({count} units):
 
 {units}
 
@@ -99,14 +100,74 @@ Rules for this call:
 - Emit a `scenarios` entry only for an assigned routing unit id.
 - Emit a `coverage_decisions` entry for every assigned routing unit id you do
   not route, carrying that id in `routing_unit_id`.
-- Every assigned id must appear exactly once, in `scenarios` or in
+- Every assigned unit id must appear exactly once, in `scenarios` or in
   `coverage_decisions` — never in both, never in neither.
-- Say nothing about a routing unit outside this list. Another call owns it.
+- **Every assigned path must also end up covered.** A path is covered when at
+  least one scenario targets it, or when you add a path-level
+  `coverage_decisions` entry for it with `expert: "*"` saying why none is
+  warranted. These paths are yours alone — no other call can speak for them, so
+  a path you leave silent is refused for the whole backlog, not just this chunk.
+- **Every REQUIRED expert listed against a path is a separate obligation.** For
+  each one, either route a scenario for that path with that `expert`, or add a
+  `coverage_decisions` entry naming both the path and that `expert` and saying
+  why it does not apply. A path-level decision with `expert: "*"` does *not*
+  discharge these — they are checked pair by pair, and an uncovered pair is
+  refused exactly like an uncovered path.
+- **A unit marked `MUST cover` owes one answer per expert named there.** This is
+  the finest check and the one that sizes the backlog: for each such expert,
+  either route a scenario carrying that `routing_unit_id` *and* that `expert`,
+  or add a `coverage_decisions` entry naming that `routing_unit_id` and that
+  `expert`. Neither a path-level nor a path/expert decision discharges a unit
+  obligation — it is checked against the unit id itself.
+- Say nothing about a path or routing unit outside this list. Another call owns
+  it.
 - Scenario ids need only be unique within this answer. They are renumbered when
   the chunks are merged.
+- `recon_item_id` is a **single non-empty string**, never a list and never
+  empty, whatever the material above says about "id or ids". Cite the one recon
+  item the scenario rests on; if several apply, name the closest.
+- `expert` must be **exactly one of these ids**, copied verbatim. There are no
+  others; a plausible-sounding id that is not on this list is rejected and the
+  whole backlog with it. If none fits well, choose the closest and say why in
+  the routing rationale rather than inventing a category:
+
+{experts}
 - Answer with a JSON object holding `scenarios` and `coverage_decisions`, in the
   shape the material above specifies.
 """
+
+
+#: Appended to a re-ask after the recorder's own checks refused an answer.
+#: Without it the retry sends byte-identical bytes and gets a byte-identical
+#: answer — the same reasoning that makes retrying a *truncation* pointless. A
+#: live run proved it: the router named the same invented expert on both
+#: attempts because nothing in the second prompt said the first was wrong.
+ROUTER_CORRECTION = """\
+
+## Your Previous Answer Was Rejected
+
+The backlog recorder refused it for these reasons:
+
+{errors}
+
+Send the whole answer again, corrected. Change only what the reasons above
+require; everything else you produced was accepted.
+
+Where a reason gives you a literal JSON object, add exactly that object — with
+the placeholder reason replaced by a real one — rather than something similar.
+These are matched on their keys: a decision keyed by `path` does not discharge
+an obligation keyed by `routing_unit_id`, and vice versa.
+
+An `expert` must be copied verbatim from the list of ids given earlier — a name
+derived from the sink, the template, or the vulnerability class is not one of
+them, however apt it sounds.
+"""
+
+#: Extra attempts granted when an answer fails the recorder's checks, on top of
+#: ``max_retries``. Unlike a truncation, this re-ask is not futile: it carries
+#: the reasons back, so the model is answering a better-specified question than
+#: the one it got wrong.
+VALIDATION_RETRIES = 2
 
 
 class Policy(StrictModel):
@@ -127,23 +188,37 @@ class Policy(StrictModel):
     #: Retries for a *rejected or unparseable* answer. Not for a conclusion of
     #: "needs more context" — that is a result, not a failure.
     max_retries: int = 1
-    #: Routing units per router call. The router is the one phase whose answer
-    #: scales with the size of the target — it emits a scenario or a coverage
-    #: decision for every unit recon found — so on a real repository the whole
-    #: backlog cannot fit in one answer at any ceiling worth setting.
+    #: Coverage obligations per router call: the path itself, one per expert
+    #: the path owes, and one per expert each mandatory unit owes. The router is
+    #: the one phase whose answer scales with the target, so the backlog cannot
+    #: fit in one answer at any ceiling worth setting.
     #:
-    #: Twelve, from measurement rather than arithmetic. A live BenchmarkPython
-    #: chunk of 40 units filled all 16,384 output tokens and was still cut off;
-    #: at 16 units the mean answer was 9,945 tokens but 3 of 38 chunks still hit
-    #: the ceiling, and the longest generations ran past a 600s HTTP timeout.
-    #: Overshoot is survivable — the chunk is halved and re-asked — but each one
-    #: burns a call *and* spends minutes on an answer that gets discarded, so
-    #: the default sits below the observed spread rather than at its middle.
-    router_chunk_units: int = 12
+    #: Sized by obligations rather than units because obligations are the work.
+    #: A live BenchmarkPython run packed 12 units per call, which came to ~23
+    #: obligations, and the router kept dropping a few of them however
+    #: explicitly they were listed — including after four re-asks that named the
+    #: missing ones and gave the literal JSON to add. That is bookkeeping load,
+    #: not comprehension, and unit count is a poor proxy for it.
+    router_chunk_obligations: int = 12
     #: Output ceiling for one router call. The 4096-token default on
     #: ``ModelRequest`` is sized for the phases that return a single verdict; a
     #: router chunk returns a document and needs materially more room.
     router_max_output_tokens: int = 16384
+    #: Output ceiling for one scenario answer. A scenario result is a finding
+    #: with quoted evidence, not a single verdict, and the 4096-token default
+    #: is not enough room: a live BenchmarkPython run had answers land at
+    #: exactly 4096 — the signature of a ceiling, not of a model finishing —
+    #: and every one of them was then re-asked identically and truncated again.
+    #: Set above every answer that phase produced whole (the largest was 3512)
+    #: with room to spare, because a ceiling that is never reached costs
+    #: nothing: output is billed on what is generated, not on what was allowed.
+    scenario_max_output_tokens: int = 8192
+    #: Output ceiling for one triage answer. Same default as the scenario phase
+    #: and for the same reason. A verdict is usually short, but "usually short"
+    #: is what the 4096 default assumed about scenarios too, and the failure it
+    #: produces is silent — a truncated answer is indistinguishable from a
+    #: malformed one until you look at where it stopped.
+    triage_max_output_tokens: int = 8192
     #: Scenarios dispatched at once. The scenario phase is one call per scenario
     #: and hundreds of them, all independent, so wall clock is otherwise just
     #: their generation summed. **One by default** — raising it is a decision
@@ -240,6 +315,41 @@ class TruncatedAnswer(WorkspaceError):
     """
 
 
+def _classify_json_failure(
+    answer: str, exc: json.JSONDecodeError, what: str
+) -> WorkspaceError:
+    """Decide whether a failed parse was a cut-off answer or a malformed one.
+
+    *Where* the parse failed decides which failure this is, and the two want
+    opposite responses. A cut-off answer fails at its very end — there is
+    simply no more text — and only a smaller task or a larger ceiling fixes it;
+    re-asking spends a call to fail identically. A bad escape or stray
+    character fails in the *middle*, with the rest of the answer sitting right
+    there after it: re-asking can help. A live run lost a router chunk to the
+    confusion, an invalid escape at character 4,370 of 16,054 reported as a
+    truncation and sent through pointless halving until there was nothing left
+    to split.
+
+    Every phase parses a model answer, so every phase needs this distinction.
+    It lived inside the router's parser while the router was the only phase
+    that had been taught it, and the phases that had not went on burning a
+    retry per truncation — one live run spent two calls on each of eight
+    scenarios to fail twice identically. Returns the exception rather than
+    raising it, so a caller can attach its own context.
+    """
+    tail = max(64, len(answer) // 10)
+    if exc.pos >= len(answer) - tail:
+        return TruncatedAnswer(
+            f"{what} was not JSON ({exc}); it was {len(answer)} characters and "
+            "was most likely truncated by the output limit"
+        )
+    return WorkspaceError(
+        f"{what} was not valid JSON at character {exc.pos} of {len(answer)}: "
+        f"{exc}. It was not cut off — this is a malformed character partway "
+        "through, so send the same answer again with valid JSON escaping"
+    )
+
+
 def _router_answer(answer: str) -> dict[str, Any]:
     """Parse a router answer, unwrapping a markdown fence if it came in one.
 
@@ -253,10 +363,7 @@ def _router_answer(answer: str) -> dict[str, Any]:
     try:
         data = unwrap_json(answer)
     except json.JSONDecodeError as exc:
-        raise TruncatedAnswer(
-            f"router answer was not JSON ({exc}); it was {len(answer)} characters "
-            "and was most likely truncated by the output limit"
-        ) from exc
+        raise _classify_json_failure(answer, exc, "router answer") from exc
     if not isinstance(data, dict):
         # Parsed cleanly but is the wrong shape: the model answered the wrong
         # question rather than running out of room, so re-asking can help.
@@ -270,10 +377,170 @@ def _items(answer: dict[str, Any], key: str) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def _chunks(units: list[str], size: int) -> list[list[str]]:
-    """Split routing units into assignments, preserving recon's order."""
+def _obligations(entry: RoutingPath) -> int:
+    """How many separate answers the coverage gate will demand for one path.
+
+    The path itself, one per expert the path owes, and one per expert each
+    mandatory unit owes. This — not the unit count — is the work a router call
+    has to complete, and it is what an assignment should be sized by.
+    """
+    return (
+        1
+        + len(entry.required_experts)
+        + sum(len(unit.required_experts) for unit in entry.units if unit.mandatory)
+    )
+
+
+def _chunks(paths: list[RoutingPath], size: int) -> list[list[RoutingPath]]:
+    """Pack whole paths into assignments of roughly ``size`` obligations.
+
+    Paths are atomic because the coverage gate judges them: a path split across
+    two assignments leaves neither able to speak for it, and the merge is
+    refused for a path each chunk thought the other owned.
+
+    Sized by *obligations* rather than units, because obligations are the work.
+    A live run packed 12 units per call, which came to 23 obligations, and the
+    router kept dropping a few of them however explicitly they were listed —
+    the failure was bookkeeping load, and unit count is a poor proxy for it. A
+    single path whose own obligations exceed ``size`` becomes its own oversized
+    chunk rather than being cut; if its answer overruns, halving splits by path.
+    """
     step = max(1, size)
-    return [units[index : index + step] for index in range(0, len(units), step)]
+    chunks: list[list[RoutingPath]] = []
+    current: list[RoutingPath] = []
+    count = 0
+    for entry in paths:
+        weight = _obligations(entry)
+        if current and count + weight > step:
+            chunks.append(current)
+            current, count = [], 0
+        current.append(entry)
+        count += weight
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _units_of(chunk: list[RoutingPath]) -> list[str]:
+    return [unit.unit_id for entry in chunk for unit in entry.units]
+
+
+def _assignment_paths(chunk: list[RoutingPath]) -> str:
+    """Each assigned path and every obligation the gate will check against it.
+
+    All three granularities are spelled out — the path, the experts the path
+    owes, and the experts each mandatory unit owes — because the router cannot
+    be expected to re-derive them from the raw recon material. Two live runs
+    were refused for obligations it was told about only in the abstract.
+    """
+    blocks: list[str] = []
+    for entry in chunk:
+        lines = [f"- {entry.path}"]
+        if entry.required_experts:
+            joined = ", ".join(entry.required_experts)
+            lines.append(f"    REQUIRED experts for this path: {joined}")
+        for unit in entry.units:
+            if unit.mandatory and unit.required_experts:
+                joined = ", ".join(unit.required_experts)
+                lines.append(f"    - unit {unit.unit_id} MUST cover: {joined}")
+            else:
+                lines.append(f"    - unit {unit.unit_id}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def _scenario_paths(scenario: dict[str, Any]) -> set[str]:
+    """Every path a scenario counts as covering, as the recorder resolves it."""
+    paths: set[Any] = {scenario.get("target_path")}
+    for key in ("target_paths", "related_paths", "covered_paths"):
+        value = scenario.get(key, [])
+        if isinstance(value, str):
+            paths.add(value)
+        elif isinstance(value, list):
+            paths.update(value)
+    return {str(path) for path in paths if path}
+
+
+def _covered_units(scenario: dict[str, Any]) -> set[str]:
+    covered = scenario.get("covered_routing_unit_ids", [])
+    if isinstance(covered, str):
+        covered = [covered]
+    units = {str(unit) for unit in covered if unit} if isinstance(covered, list) else set()
+    unit_id = scenario.get("routing_unit_id")
+    if unit_id:
+        units.add(str(unit_id))
+    return units
+
+
+def _coverage_gaps(chunk: list[RoutingPath], answer: dict[str, Any]) -> list[str]:
+    """Obligations this chunk owes that its answer does not discharge.
+
+    The recorder's coverage gate, evaluated over one assignment instead of the
+    whole backlog. It runs at all three granularities the gate uses — the path,
+    the path/expert pair, and the mandatory unit/expert pair — because a chunk
+    that satisfies two of them and not the third is refused exactly the same.
+
+    Checking here is what turns a whole-phase rejection into one re-ask: every
+    obligation belongs to exactly one chunk, so a gap found now is a gap that
+    chunk can still be asked to fill.
+    """
+    scenarios = [s for s in _items(answer, "scenarios") if isinstance(s, dict)]
+    decisions = [d for d in _items(answer, "coverage_decisions") if isinstance(d, dict)]
+    pair_decisions = {(d.get("path"), d.get("expert")) for d in decisions}
+    unit_decisions = {
+        (d.get("routing_unit_id"), d.get("expert"))
+        for d in decisions
+        if d.get("routing_unit_id")
+    }
+    scenario_paths = [(_scenario_paths(s), str(s.get("expert", ""))) for s in scenarios]
+    scenario_units = [(_covered_units(s), str(s.get("expert", ""))) for s in scenarios]
+
+    # Each gap names the exact object that would close it. Prose describing an
+    # obligation was not enough: a live chunk was re-asked four times, with the
+    # obligation spelled out each time, and still did not discharge it. A
+    # literal snippet to paste converges where a description does not.
+    gaps: list[str] = []
+    for entry in chunk:
+        if not any(entry.path in paths for paths, _ in scenario_paths) and not any(
+            (entry.path, marker) in pair_decisions for marker in ("*", None, "")
+        ):
+            gaps.append(
+                f"path {entry.path} is uncovered. Either route a scenario whose "
+                f'"target_path" is "{entry.path}", or add this to '
+                f'coverage_decisions: {{"path": "{entry.path}", "expert": "*", '
+                '"reason": "<why no scenario is warranted>"}'
+            )
+        for expert in entry.required_experts:
+            covered = any(
+                entry.path in paths and found == expert
+                for paths, found in scenario_paths
+            )
+            if not covered and (entry.path, expert) not in pair_decisions:
+                gaps.append(
+                    f"path {entry.path} -> {expert} is uncovered. Either route a "
+                    f'scenario with "target_path": "{entry.path}" and "expert": '
+                    f'"{expert}", or add this to coverage_decisions: '
+                    f'{{"path": "{entry.path}", "expert": "{expert}", '
+                    '"reason": "<why it does not apply>"}'
+                )
+        for unit in entry.units:
+            if not unit.mandatory:
+                continue
+            for expert in unit.required_experts:
+                covered = any(
+                    unit.unit_id in units and found == expert
+                    for units, found in scenario_units
+                )
+                if not covered and (unit.unit_id, expert) not in unit_decisions:
+                    gaps.append(
+                        f"unit {unit.unit_id} ({entry.path}) -> {expert} is "
+                        f'uncovered. Either route a scenario with "routing_unit_id": '
+                        f'"{unit.unit_id}" and "expert": "{expert}", or add this to '
+                        f'coverage_decisions: {{"routing_unit_id": '
+                        f'"{unit.unit_id}", "expert": "{expert}", '
+                        '"reason": "<why it does not apply>"}'
+                    )
+    return gaps
 
 
 def _unaddressed(chunk: list[str], answer: dict[str, Any]) -> list[str]:
@@ -305,15 +572,22 @@ def _renumber(scenarios: list[Any]) -> list[Any]:
     return renumbered
 
 
-def _chunk_key(chunk: list[str]) -> str:
+def _chunk_key(chunk: list[str], deployment: str = "") -> str:
     """A stable filename for one assignment's answer.
 
     Keyed on the assigned unit ids, not the chunk's position: halving renumbers
     every chunk after the split, so a positional key would make a resumed run
     read back an answer to a different question. Hashed rather than joined
     because forty ids do not fit in a filename.
+
+    The deployment is part of the key because the answer is *that model's*
+    judgement. Without it, re-running the same assignment against a different
+    model silently replays the first model's answers and reports them as the
+    second's — a swap that changes the findings while every count still looks
+    healthy, which is the one thing this codebase refuses to do elsewhere.
     """
-    return sha256("\n".join(chunk).encode("utf-8")).hexdigest()[:16]
+    material = "\n".join([deployment, *chunk])
+    return sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _preview(units: list[str], limit: int = 8) -> str:
@@ -333,7 +607,9 @@ def _stamp(answer: str, fields: dict[str, str]) -> str:
     try:
         data = unwrap_json(answer)
     except json.JSONDecodeError as exc:
-        raise WorkspaceError(f"model answer was not JSON: {exc}") from exc
+        # Classified rather than reported flat, so the per-item phases can tell
+        # a cut-off answer from a malformed one and stop retrying the former.
+        raise _classify_json_failure(answer, exc, "model answer") from exc
     if not isinstance(data, dict):
         raise WorkspaceError("model answer was not a JSON object")
     data.update(fields)
@@ -359,6 +635,11 @@ class Driver:
         self._dispatcher = Dispatcher(provider, self._ledger, self._audit)
         self._parked: list[ParkedScenario] = []
         self._redactions = 0
+        #: Streams that went silent and were re-asked. Counted because the spend
+        #: on a stalled call is billed by the vendor and never reaches the
+        #: ledger, so a run that absorbed several is more expensive than its own
+        #: accounting shows.
+        self._stalls = 0
         #: Serialises workspace access. The workspace is a CLI over one run
         #: directory; concurrent scenarios would otherwise run two `openhack`
         #: processes that interleave appends to its shared state and trace.
@@ -425,12 +706,18 @@ class Driver:
         the assignment varies.
         """
         prompt = self._workspace.render_router_prompt(ref)
-        units = self._workspace.routing_units(ref)
+        paths = self._workspace.routing_paths(ref)
         merged = (
-            self._route_chunked(ref, prompt.text, units, report)
-            if units
+            self._route_chunked(ref, prompt.text, paths, report)
+            if paths
             else self._route_whole(prompt.text)
         )
+        if self._stalls:
+            report.warnings.append(
+                f"router: {self._stalls} stream(s) went silent and were re-asked. "
+                "Whatever those calls generated is billed by the vendor and is "
+                "NOT in this run's ledger, so the run cost more than it reports"
+            )
         self._workspace.record_backlog(
             ref, json.dumps(merged, indent=2, sort_keys=True)
         )
@@ -457,7 +744,11 @@ class Driver:
         raise WorkspaceError(f"router answer rejected after retries: {last}")
 
     def _route_chunked(
-        self, ref: RunRef, prompt: str, units: list[str], report: RunReport
+        self,
+        ref: RunRef,
+        prompt: str,
+        paths: list[RoutingPath],
+        report: RunReport,
     ) -> dict[str, Any]:
         """Route units in assignments, halving any chunk that overruns.
 
@@ -465,7 +756,7 @@ class Driver:
         instead of a correctness one: too large merely costs a wasted call
         before the split, and the run still completes.
         """
-        pending = _chunks(units, self._policy.router_chunk_units)
+        pending = _chunks(paths, self._policy.router_chunk_obligations)
         total = len(pending)
         merged: dict[str, Any] = {"scenarios": [], "coverage_decisions": []}
         missing: list[str] = []
@@ -477,9 +768,9 @@ class Driver:
                 answer = self._route_chunk(ref, prompt, chunk, index, max(total, index))
             except TruncatedAnswer:
                 if len(chunk) == 1:
-                    # One unit already, and its answer still does not fit. No
-                    # split is left to make, so the ceiling is genuinely too low
-                    # rather than the assignment too large.
+                    # One path already, and its answer still does not fit. No
+                    # split is left that keeps paths whole, so the ceiling is
+                    # genuinely too low rather than the assignment too large.
                     raise
                 half = len(chunk) // 2
                 pending[:0] = [chunk[:half], chunk[half:]]
@@ -494,7 +785,7 @@ class Driver:
                     merged.setdefault(key, []).extend(value)
                 else:
                     merged.setdefault(key, value)
-            missing.extend(_unaddressed(chunk, answer))
+            missing.extend(_unaddressed(_units_of(chunk), answer))
         merged["scenarios"] = _renumber(merged["scenarios"])
         if missing:
             # Surfaced, not enforced. The backlog recorder owns admissibility —
@@ -508,7 +799,12 @@ class Driver:
         return merged
 
     def _route_chunk(
-        self, ref: RunRef, prompt: str, chunk: list[str], index: int, total: int
+        self,
+        ref: RunRef,
+        prompt: str,
+        chunk: list[RoutingPath],
+        index: int,
+        total: int,
     ) -> dict[str, Any]:
         """One assignment, re-asked while it leaves assigned units unaddressed.
 
@@ -521,41 +817,92 @@ class Driver:
         way through would otherwise discard every paid-for answer before it.
         A live run lost 39 completed calls to a single timeout that way.
         """
-        key = _chunk_key(chunk)
+        units = _units_of(chunk)
+        key = _chunk_key(units, self._policy.model_for(Phase.router))
         cached = self._workspace.read_router_chunk(ref, key)
         if cached is not None:
             try:
-                return _router_answer(cached)
+                answer = _router_answer(cached)
             except WorkspaceError:
                 # A half-written or hand-edited file is not worth trusting;
                 # re-asking costs one call and is always correct.
-                pass
+                answer = None
+            # Re-checked on the way out of the cache, not only on the way in:
+            # a chunk stored before this check existed — or stored by a run that
+            # went on to be rejected — would otherwise be replayed forever, and
+            # the merge would fail at the recorder every single time.
+            if (
+                answer is not None
+                and not self._workspace.scenario_errors(_items(answer, "scenarios"))
+                and not _coverage_gaps(chunk, answer)
+            ):
+                return answer
         best: dict[str, Any] | None = None
         last: str = ""
+        experts = self._workspace.valid_experts()
         assignment = ROUTER_ASSIGNMENT.format(
             index=index,
             total=total,
-            count=len(chunk),
-            units="\n".join(f"- {unit}" for unit in chunk),
+            count=len(units),
+            units=_assignment_paths(chunk),
+            experts="\n".join(f"  - {expert}" for expert in experts)
+            or "  (the material above names them)",
         )
-        for _ in range(self._policy.max_retries + 1):
+        correction = ""
+        for _ in range(self._policy.max_retries + 1 + VALIDATION_RETRIES):
             try:
                 answer = _router_answer(
                     self._ask(
                         Phase.router,
                         ROUTER_SYSTEM,
-                        assignment,
+                        assignment + correction,
                         cache_prefix=prompt,
                         max_output_tokens=self._policy.router_max_output_tokens,
                     )
                 )
             except TruncatedAnswer:
                 raise
-            except WorkspaceError as exc:
+            except ProviderTimeout as exc:
+                # A stalled stream is transient and says nothing about the
+                # assignment, so the chunk is simply asked again on a fresh
+                # connection. Aborting the phase instead is what made three
+                # separate live runs need a human to type `resume` — the one
+                # thing an unattended driver exists to avoid. Bounded by the
+                # same attempt budget, so a resource that is genuinely down
+                # still fails rather than looping.
                 last = str(exc)
+                # Counted here rather than on the way out: a chunk that stalls
+                # and then succeeds returns early, so accounting at the end
+                # missed exactly the case worth reporting.
+                self._stalls += 1
+                continue
+            except WorkspaceError as exc:
+                # Unparseable or wrong-shaped: re-ask *with the reason*, for the
+                # same cause every other retry here carries one — an unchanged
+                # prompt produces an unchanged answer.
+                last = str(exc)
+                correction = ROUTER_CORRECTION.format(errors=f"- {exc}")
+                continue
+            malformed = self._workspace.scenario_errors(_items(answer, "scenarios"))
+            malformed += _coverage_gaps(chunk, answer)
+            if malformed:
+                # Caught here rather than at the merge, where one bad scenario
+                # among hundreds discards every chunk the phase paid for.
+                #
+                # Never kept as `best`, however many attempts remain: the
+                # recorder refuses the entire merged backlog for one bad
+                # scenario, so carrying a known-bad chunk forward only moves the
+                # same failure later and spends the rest of the phase reaching
+                # it. An answer that merely left units *unaddressed* is a
+                # different case — the recorder may still accept it — and is
+                # kept below.
+                last = "; ".join(malformed[:3])
+                correction = ROUTER_CORRECTION.format(
+                    errors="\n".join(f"- {error}" for error in malformed[:10])
+                )
                 continue
             best = answer
-            if not _unaddressed(chunk, answer):
+            if not _unaddressed(units, answer):
                 self._workspace.write_router_chunk(ref, key, json.dumps(answer))
                 return answer
         if best is None:
@@ -588,7 +935,11 @@ class Driver:
         for _ in range(self._policy.max_retries + 1):
             try:
                 answer = self._ask(
-                    Phase.scenarios, EXPERT_SYSTEM, body, cache_prefix=manifest
+                    Phase.scenarios,
+                    EXPERT_SYSTEM,
+                    body,
+                    cache_prefix=manifest,
+                    max_output_tokens=self._policy.scenario_max_output_tokens,
                 )
                 stamped = _stamp(
                     answer,
@@ -606,6 +957,27 @@ class Driver:
                     )
             except BudgetExceeded:
                 raise
+            except TruncatedAnswer as exc:
+                # Cut off, not wrong. The prompt is unchanged and the ceiling is
+                # unchanged, so a retry generates the same answer and loses it at
+                # the same character — a second call bought to fail identically.
+                # Park it instead: the scenario is genuinely unreviewed, and the
+                # reason says so in terms an operator can act on (raise
+                # `scenario_max_output_tokens`) rather than "answer rejected".
+                return self._park(
+                    ref,
+                    scenario,
+                    ParkedScenario(
+                        scenario_id=scenario.scenario_id,
+                        expert=scenario.expert,
+                        priority=scenario.priority,
+                        reason=(
+                            "truncated (answer hit the "
+                            f"{self._policy.scenario_max_output_tokens}-token "
+                            f"output ceiling: {str(exc)[:160]})"
+                        ),
+                    ),
+                )
             except WorkspaceError as exc:
                 # A rejected answer is usually malformed — but not always. A
                 # model that has been shown no source correctly answers
@@ -692,6 +1064,7 @@ class Driver:
                 EXPERT_SYSTEM,
                 f"{body}\n\n{expansion.text}",
                 cache_prefix=manifest,
+                max_output_tokens=self._policy.scenario_max_output_tokens,
             )
             stamped = _stamp(
                 answer,
@@ -770,7 +1143,12 @@ class Driver:
         last = ""
         for _ in range(self._policy.max_retries + 1):
             try:
-                answer = self._ask(Phase.triage, TRIAGE_SYSTEM, prompt.text)
+                answer = self._ask(
+                    Phase.triage,
+                    TRIAGE_SYSTEM,
+                    prompt.text,
+                    max_output_tokens=self._policy.triage_max_output_tokens,
+                )
                 stamped = _stamp(
                     answer,
                     {
@@ -783,6 +1161,20 @@ class Driver:
                 decision = self._workspace.record_triage(ref, candidate_id, stamped)
             except BudgetExceeded:
                 raise
+            except TruncatedAnswer as exc:
+                # Cut off rather than wrong, so the retry below cannot help —
+                # see the scenario phase for the reasoning. Failed rather than
+                # parked: a candidate has no parking record to carry a reason,
+                # and an untriaged candidate must not read as adjudicated.
+                return WorkOutcome(
+                    item_id=candidate_id,
+                    disposition=Disposition.failed,
+                    detail=(
+                        "truncated (answer hit the "
+                        f"{self._policy.triage_max_output_tokens}-token output "
+                        f"ceiling: {str(exc)[:160]})"
+                    ),
+                )
             except WorkspaceError as exc:
                 last = str(exc)
                 continue
@@ -972,7 +1364,11 @@ class Driver:
                 expert=item.expert,
                 priority=item.priority,
             )
-            report.scenarios.append(self._do_scenario(ref, scenario))
+            try:
+                report.scenarios.append(self._do_scenario(ref, scenario))
+            except BudgetExceeded:
+                self._unfunded_mid_item(report.scenarios, scenario.scenario_id)
+                break
 
         report.model_calls = self._ledger.calls
         self._finish(ref, report, sarif_out)
@@ -1004,6 +1400,8 @@ class Driver:
         self, report: RunReport, tail: list[ScenarioRef]
     ) -> None:
         """Account for scenarios the budget never reached."""
+        if not tail:
+            return
         self._record_unfunded(
             report.scenarios,
             [item.scenario_id for item in tail],
@@ -1012,6 +1410,25 @@ class Driver:
         report.warnings.append(
             f"budget: {len(tail)} scenario(s) were never dispatched "
             "and are NOT known to be clean"
+        )
+
+    def _unfunded_mid_item(self, bucket: list[WorkOutcome], item_id: str) -> None:
+        """Account for an item whose *second* call the ceiling refused.
+
+        ``can_afford`` clears one call, but an item can need more than one — a
+        retry on a rejected answer, or a context expansion — so the ceiling can
+        land in the middle of one rather than between two. That is a bounded
+        run behaving correctly, not a failure, and it must be recorded as an
+        outcome instead of raised: a live run crashed here with a traceback and
+        exit 1 where it owed the operator exit 3 and a list of what went
+        unreviewed. Distinct wording from the never-dispatched case because the
+        two are different facts — this one was paid for and produced nothing.
+        """
+        self._record_unfunded(
+            bucket,
+            [item_id],
+            "budget exhausted part-way through this item: it was dispatched but "
+            "never concluded, so it is NOT known to be clean",
         )
 
     def _drain_in_series(
@@ -1027,7 +1444,12 @@ class Driver:
                 self._unfunded_tail(report, pending[index:])
                 return False
             seen.add(scenario.scenario_id)
-            report.scenarios.append(self._do_scenario(ref, scenario))
+            try:
+                report.scenarios.append(self._do_scenario(ref, scenario))
+            except BudgetExceeded:
+                self._unfunded_mid_item(report.scenarios, scenario.scenario_id)
+                self._unfunded_tail(report, pending[index + 1:])
+                return False
             progressed = True
         return progressed
 
@@ -1120,7 +1542,19 @@ class Driver:
                 )
                 return False
             seen.add(candidate_id)
-            report.candidates.append(self._do_candidate(ref, candidate_id))
+            try:
+                report.candidates.append(self._do_candidate(ref, candidate_id))
+            except BudgetExceeded:
+                self._unfunded_mid_item(report.candidates, candidate_id)
+                self._record_unfunded(
+                    report.candidates, pending[index + 1:],
+                    "budget exhausted before this candidate was triaged",
+                )
+                report.warnings.append(
+                    f"budget: {len(pending) - index} candidate(s) were not "
+                    "triaged and remain unadjudicated"
+                )
+                return False
         return True
 
     @staticmethod

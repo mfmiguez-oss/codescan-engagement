@@ -320,6 +320,61 @@ def test_a_quota_that_never_clears_says_so_instead_of_retrying_forever() -> None
     assert "cached prompt prefix still counts against it" in str(throttled.value)
 
 
+def test_a_connection_that_dies_mid_stream_is_retried_not_fatal() -> None:
+    """The third transport failure, and the one that slipped through: a reset is
+    neither a timeout nor a status, so both existing handlers missed it and a
+    live run died on `WinError 10054` with 20 of 51 chunks done."""
+    import httpx
+
+    ok = [
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}',
+        'data: {"type":"message_delta","usage":{"output_tokens":2}}',
+    ]
+    attempts: list[int] = []
+
+    def _flaky(*args: object, **kwargs: object) -> object:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise httpx.ReadError("connection forcibly closed by the remote host")
+        return _FakeStream(ok)
+
+    provider = FoundryProvider(resource="res", api_key="k")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(httpx, "stream", _flaky)
+        patch.setattr("engagement.providers.time.sleep", lambda _: None)
+        response = provider.complete(
+            ModelRequest(deployment="claude-haiku-4-5", system="s", user="u")
+        )
+
+    assert response.content == "{}"
+    assert len(attempts) == 2
+
+
+def test_a_connection_that_never_holds_says_the_lost_tokens_were_billed() -> None:
+    """Unlike a 429, this retry is not free: what the model produced before each
+    drop was billed and is gone. Spend reporting has to be able to tell them
+    apart, which is why it is a distinct type."""
+    import httpx
+
+    from engagement.providers import RETRY_ATTEMPTS, ProviderUnavailable
+
+    def _dead(*args: object, **kwargs: object) -> object:
+        raise httpx.ConnectError("no route to host")
+
+    provider = FoundryProvider(resource="res", api_key="k")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(httpx, "stream", _dead)
+        patch.setattr("engagement.providers.time.sleep", lambda _: None)
+        with pytest.raises(ProviderUnavailable) as failed:
+            provider.complete(
+                ModelRequest(deployment="claude-haiku-4-5", system="s", user="u")
+            )
+
+    message = str(failed.value)
+    assert f"all {RETRY_ATTEMPTS} attempts" in message
+    assert "NOT in this run's ledger" in message
+
+
 def test_the_resources_own_retry_after_beats_a_guess() -> None:
     """It knows when its quota window rolls over; backoff arithmetic does not."""
     from engagement.providers import MAX_BACKOFF_SECONDS, _retry_after

@@ -93,6 +93,39 @@ class ScenarioRef(StrictModel):
     priority: Priority = Priority.normal
 
 
+class RoutingUnit(StrictModel):
+    """One routing unit, and the experts it owes an answer for.
+
+    A *mandatory* unit's ``required_experts`` are checked pair by pair — each
+    needs a scenario carrying this ``unit_id`` and that expert, or a decision
+    naming both. This is the finest of the coverage gate's three granularities
+    and the one that sets the size of the backlog: 348 mandatory units over 448
+    pairs on BenchmarkPython, which is where its "448 scenarios" figure comes
+    from.
+    """
+
+    unit_id: str
+    required_experts: list[str] = Field(default_factory=list)
+    mandatory: bool = False
+
+
+class RoutingPath(StrictModel):
+    """One source path, with everything the coverage gate will ask of it.
+
+    The gate judges at three granularities — the path, the path/expert pair, and
+    the unit/expert pair — so an assignment has to be able to state all three.
+    Carrying them here rather than leaving the router to dig them out of the
+    recon material is the difference between an instruction it can follow and
+    one it has to infer: a live run covered every path and was still refused,
+    first for 292 uncovered path pairs and then for 48 unit pairs.
+    """
+
+    path: str
+    units: list[RoutingUnit] = Field(default_factory=list)
+    #: Experts recon says this path owes a scenario or an explicit decision.
+    required_experts: list[str] = Field(default_factory=list)
+
+
 class RenderedPrompt(StrictModel):
     """A prompt, and the digest the recorder will check an answer against.
 
