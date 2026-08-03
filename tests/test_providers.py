@@ -125,6 +125,19 @@ def test_an_answer_that_really_is_cut_off_still_fails() -> None:
         unwrap_json('{"a": 1, "b": [')
 
 
+def test_prose_that_merely_begins_like_json_is_not_an_answer() -> None:
+    """The tolerance is for trailing *prose*, not for answers that are not JSON.
+
+    `raw_decode` accepts any prefix that is a JSON value, and a bare scalar is
+    one — so "2 files are missing" decodes to the number 2. Every caller guards
+    for a container, so this would not crash; it would slip past
+    `_classify_json_failure` into a flat "not a JSON object", losing the
+    cut-off-versus-malformed distinction the retry policy is built on."""
+    for prose in ("2 files are missing", "null, I cannot tell", "true for both"):
+        with pytest.raises(json.JSONDecodeError):
+            unwrap_json(prose)
+
+
 class _FakeStream:
     """The only part of an httpx streaming response this code path touches."""
 

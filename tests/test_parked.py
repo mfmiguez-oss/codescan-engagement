@@ -207,3 +207,58 @@ def test_the_file_the_prompt_already_embedded_is_never_re_supplied() -> None:
     report = _driver(workspace).run(REF)
 
     assert report.parked[0].supplied_paths == []
+    # and the skip is visible: "nothing could be added" describes a checkout
+    # that failed to produce a file, and sends an operator looking for one that
+    # is present and was in the prompt
+    assert "already in the prompt: helpers/db.py" in report.parked[0].reason
+
+
+def test_the_target_file_is_recognised_however_the_model_spells_it() -> None:
+    """`target_path` comes from the backlog and the paths beside it come from
+    model prose, which writes `./helpers/db.py` as readily as `helpers/db.py`.
+    Compared raw, the skip misses and the expansion spends one of five slots
+    handing back the file the prompt already embedded."""
+    workspace = FakeWorkspace(
+        scenarios=[
+            ScenarioRef(
+                scenario_id="S001",
+                expert="injection",
+                priority=Priority.normal,
+                target_path="helpers/db.py",
+            )
+        ]
+    )
+    workspace.status_for["S001"] = "needs_context"
+    workspace.missing_for["S001"] = ["I still need ./helpers/db.py in full"]
+    workspace.sources["helpers/db.py"] = "def get_connection(): ..."
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.parked[0].supplied_paths == []
+    assert "already in the prompt: helpers/db.py" in report.parked[0].reason
+
+
+def test_a_search_hit_is_never_reported_as_a_path_the_model_asked_for() -> None:
+    """`unresolved_paths` is quoted back to the model as paths it requested and
+    did not get, and carries the same contract in the parked record. A file a
+    search turned up and the jail then refused is not one of those: telling the
+    model it asked for something it never named is a false account of its own
+    request, and invites a second answer reasoning about why that failed.
+    """
+    workspace = FakeWorkspace(
+        scenarios=[
+            ScenarioRef(scenario_id="S001", expert="injection", target_path="db.py")
+        ]
+    )
+    workspace.status_for["S001"] = "needs_context"
+    workspace.missing_for["S001"] = ["the callers of get_connection()"]
+    # findable by the search, refused by the jail — the fake refuses an absolute
+    # path exactly as the real `read_source` does
+    workspace.sources["/opt/vendor/routes.py"] = "get_connection()"
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert "get_connection" in workspace.searches
+    assert report.parked[0].unresolved_paths == []

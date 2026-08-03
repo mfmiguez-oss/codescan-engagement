@@ -27,9 +27,9 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import Field
 
@@ -626,6 +626,36 @@ def _stamp(answer: str, fields: dict[str, str]) -> str:
     return json.dumps(data, indent=2, sort_keys=True)
 
 
+def _normalised(path: str) -> str:
+    """One spelling of a path, so two spellings of one file compare equal.
+
+    ``target_path`` arrives from the backlog and the paths beside it arrive from
+    model prose, which writes ``./helpers/db.py`` as readily as
+    ``helpers/db.py``. Comparing the two raw lets the "already shown" skip miss,
+    and the expansion spends one of five file slots handing back the file the
+    prompt embedded — the exact waste the skip exists to prevent.
+
+    Lexical only. This decides whether two strings name the same file; whether
+    that file may be *read* is the workspace jail's question, and it resolves
+    against the filesystem to answer it.
+    """
+    cleaned = path.strip().replace("\\", "/")
+    return PurePosixPath(cleaned).as_posix() if cleaned else ""
+
+
+class _Gathered(NamedTuple):
+    """What one expansion could assemble, and what it deliberately left out."""
+
+    supplied: dict[str, str]
+    unresolved: list[str]
+    truncated: list[str]
+    #: Files the model asked for that the prompt had already embedded. Not a
+    #: failure and not a supply — a third outcome, and the one that decides
+    #: whether an empty expansion means "the checkout gave nothing" or "you
+    #: already have it".
+    already_had: list[str]
+
+
 class Driver:
     """Runs one engagement to completion, or to the edge of its budget."""
 
@@ -1052,18 +1082,30 @@ class Driver:
                 parked.reason = "needs_context (budget exhausted before expansion)"
             return self._park(ref, scenario, parked)
 
-        supplied, unresolved, truncated = self._gather(
+        gathered = self._gather(
             ref, outcome.missing_context, already_shown=scenario.target_path
         )
         expansion = build_expansion(
-            outcome.missing_context, supplied, unresolved, truncated
+            outcome.missing_context,
+            gathered.supplied,
+            gathered.unresolved,
+            gathered.truncated,
         )
         parked.expanded = True
         parked.attempts = 2
         parked.supplied_paths = expansion.supplied_paths
         parked.unresolved_paths = expansion.unresolved_paths
         if expansion.is_empty:
-            parked.reason = "needs_context (nothing could be added)"
+            # Two different situations end here, and an operator triaging the
+            # parked queue acts on them differently: one sends them looking for
+            # a file the checkout could not produce, the other tells them the
+            # reviewer had the file and still could not conclude.
+            parked.reason = (
+                "needs_context (the only file named was already in the prompt: "
+                f"{', '.join(gathered.already_had)})"
+                if gathered.already_had
+                else "needs_context (nothing could be added)"
+            )
             return self._park(ref, scenario, parked)
 
         try:
@@ -1117,7 +1159,7 @@ class Driver:
 
     def _gather(
         self, ref: RunRef, statements: list[str], already_shown: str = ""
-    ) -> tuple[dict[str, str], list[str], list[str]]:
+    ) -> _Gathered:
         """Resolve what the model asked for, within the checkout only.
 
         Two kinds of request, because a review asks for two kinds of thing. A
@@ -1130,44 +1172,65 @@ class Driver:
         already embedded. It is skipped rather than re-read: a live run spent
         its whole expansion re-supplying the one file the reviewer had in front
         of it, because that was the only path-shaped token in a sentence asking
-        for callers.
+        for callers. It is skipped *visibly* — returned, not dropped — because
+        an expansion that stayed empty for this reason and then parked as
+        "nothing could be added" describes a checkout that failed to produce a
+        file, when what happened is that the reviewer already had it.
         """
         bounds = self._policy.expansion_bounds
+        shown = _normalised(already_shown)
         supplied: dict[str, str] = {}
         unresolved: list[str] = []
         truncated: list[str] = []
+        already_had: list[str] = []
+        seen: set[str] = set()
 
-        def _add(path: str) -> bool:
-            """True when the file was supplied. Bounds are reported, not silent."""
-            if path in supplied or path == already_shown:
+        def _add(path: str, requested: bool) -> bool:
+            """True when the file was supplied. Bounds are reported, not silent.
+
+            ``requested`` separates a path the model named from a file a search
+            turned up. Only the first belongs in ``unresolved``: that list is
+            quoted back to the model as paths it asked for and did not get, and
+            reported to the operator under the same contract, so putting a
+            search hit in it is a false account of the model's own request.
+            """
+            key = _normalised(path)
+            if not key or key in seen:
+                return False
+            seen.add(key)
+            if key == shown:
+                already_had.append(key)
                 return False
             if len(supplied) >= bounds.max_files:
-                unresolved.append(path)
+                # the cap is itself a bound on the re-attempt, so the paths it
+                # excluded are reported rather than forgotten
+                if requested:
+                    unresolved.append(key)
                 return False
             with self._workspace_lock:
-                content = self._workspace.read_source(ref, path)
+                content = self._workspace.read_source(ref, key)
             if content is None:
-                unresolved.append(path)
+                if requested:
+                    unresolved.append(key)
                 return False
             if len(content) > bounds.max_chars_per_file:
                 content = content[: bounds.max_chars_per_file]
-                truncated.append(path)
-            supplied[path] = content
+                truncated.append(key)
+            supplied[key] = content
             return True
 
         for path in requested_paths(statements):
-            _add(path)
+            _add(path, requested=True)
 
-        for symbol in requested_symbols(statements):
-            if len(supplied) >= bounds.max_files:
-                break
+        symbols = requested_symbols(statements)
+        if symbols and len(supplied) < bounds.max_files:
             with self._workspace_lock:
                 hits = self._workspace.search_source(
-                    ref, symbol, bounds.max_files - len(supplied)
+                    ref, symbols, bounds.max_files - len(supplied)
                 )
             for hit in hits:
-                _add(hit)
-        return supplied, unresolved, truncated
+                _add(hit, requested=False)
+        return _Gathered(supplied, unresolved, truncated, already_had)
 
     def _park(
         self, ref: RunRef, scenario: ScenarioRef, parked: ParkedScenario

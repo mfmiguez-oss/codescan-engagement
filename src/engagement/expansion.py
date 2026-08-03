@@ -39,9 +39,12 @@ _SYMBOL_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w{2,})\s*\(")
 #: Identifiers common enough that searching for their callers would match most
 #: of a checkout. Asking "who calls `get`?" is not a question a search can
 #: usefully answer, and a term that matches everything supplies nothing.
+#:
+#: Every entry is three characters or more, because `_SYMBOL_RE` cannot capture
+#: a shorter name — a two-character entry here reads as policy and is dead.
 _TOO_COMMON = frozenset(
     {
-        "def", "class", "if", "for", "while", "return", "print", "str", "int",
+        "def", "class", "for", "while", "return", "print", "str", "int",
         "len", "list", "dict", "set", "get", "post", "put", "delete", "self",
         "super", "range", "open", "format", "type", "isinstance", "append",
     }
@@ -70,8 +73,18 @@ class Expansion(StrictModel):
 
     @property
     def is_empty(self) -> bool:
-        """True when the expansion would add nothing worth a second call."""
-        return not self.text.strip()
+        """True when the expansion would add nothing worth a second call.
+
+        Not "has no text". The block always has text once the model stated a
+        gap, because it opens by quoting that statement back — so testing the
+        text made this permanently False on the one path that consults it, and
+        every inconclusive scenario bought a second call whose only new content
+        was its own words. What makes the call worth its cost is a *file*: one
+        the reviewer did not have, or the fact that one it named is not in the
+        checkout. With neither, the re-attempt is the first attempt with extra
+        framing, and the scenario is better parked with the reason stated.
+        """
+        return not (self.supplied_paths or self.unresolved_paths)
 
 
 def requested_paths(statements: list[str], seen: set[str] | None = None) -> list[str]:

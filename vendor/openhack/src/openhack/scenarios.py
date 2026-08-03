@@ -59,13 +59,21 @@ def _source_block(path: Path, target_path: str) -> str:
             "Cite only files whose contents you have actually been given, and "
             "answer `needs_context` for anything you cannot see."
         )
-    source = (path / "sourcecode" / target_path).resolve()
+    # `target_path` comes from the backlog, which a model wrote, so resolving it
+    # is itself a step that can fail: an embedded NUL raises `ValueError`, and
+    # on Windows an invalid device or over-long name raises `OSError`. Both
+    # belong inside the guard. Left outside it, one malformed scenario aborts
+    # the whole render pass instead of parking itself as `needs_context` — a
+    # bad path is a fact about one scenario, not a reason to stop.
+    checkout = path / "sourcecode"
     try:
-        source.relative_to((path / "sourcecode").resolve())
-    except ValueError:
+        source = (checkout / target_path).resolve()
+        source.relative_to(checkout.resolve())
+    except (OSError, ValueError):
         return (
-            f"`{target_path}` resolves outside this run's checkout and was not "
-            "embedded. Answer `needs_context`; do not infer its contents."
+            f"`{target_path}` does not resolve inside this run's checkout and "
+            "was not embedded. Answer `needs_context`; do not infer its "
+            "contents."
         )
     if not source.is_file():
         return (

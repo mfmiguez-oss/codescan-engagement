@@ -112,21 +112,67 @@ def test_a_caller_search_is_literal_never_a_compiled_pattern(tmp_path: Path) -> 
     ref = RunRef(target="acme", run_id="run-001")
     workspace = CliWorkspace(root=tmp_path)
 
-    assert workspace.search_source(ref, "get_connection") == ["routes.py"]
+    assert workspace.search_source(ref, ["get_connection"]) == ["routes.py"]
     # a regex metacharacter matches nothing, because nothing contains it
-    assert workspace.search_source(ref, ".*") == []
+    assert workspace.search_source(ref, [".*"]) == []
 
 
 def test_a_caller_search_prefers_files_nearer_the_root(tmp_path: Path) -> None:
     """A cheap proxy for relevance: an application's routes sit nearer the root
-    than its vendored dependencies."""
+    than its vendored dependencies.
+
+    Built so the ordering has to *bind*. The earlier version of this test had
+    two matches against a default limit of five, with the shallow file already
+    first in the walk's alphabetical order — so it passed with the depth sort
+    deleted, and passed while the search truncated before sorting and returned
+    nothing but vendored copies. Here there are more matches than slots and the
+    root file sorts last, which is the only arrangement that tells a search
+    ordered by depth from one ordered by name.
+    """
     src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
-    (src / "vendor" / "deep").mkdir(parents=True)
-    (src / "app.py").write_text("token()\n", encoding="utf-8")
-    (src / "vendor" / "deep" / "copy.py").write_text("token()\n", encoding="utf-8")
+    (src / "admin" / "vendor").mkdir(parents=True)
+    (src / "api" / "vendor").mkdir(parents=True)
+    (src / "assets").mkdir(parents=True)
+    (src / "zroutes.py").write_text("token()\n", encoding="utf-8")
+    (src / "assets" / "c.py").write_text("token()\n", encoding="utf-8")
+    (src / "admin" / "vendor" / "a.py").write_text("token()\n", encoding="utf-8")
+    (src / "api" / "vendor" / "b.py").write_text("token()\n", encoding="utf-8")
     ref = RunRef(target="acme", run_id="run-001")
 
-    assert CliWorkspace(root=tmp_path).search_source(ref, "token") == [
-        "app.py",
-        "vendor/deep/copy.py",
+    assert CliWorkspace(root=tmp_path).search_source(ref, ["token"], limit=2) == [
+        "zroutes.py",
+        "assets/c.py",
     ]
+
+
+def test_a_caller_search_refuses_a_symlink_out_of_the_checkout(tmp_path: Path) -> None:
+    """The checkout is a clone of the repository under review, so a link
+    committed into it points wherever its author chose. `read_source` resolves
+    and contains for exactly this reason; a search that walked past the check
+    would read the host's own files and hand them to the model provider."""
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    src.mkdir(parents=True)
+    outside = tmp_path / "host-secret.py"
+    outside.write_text("aws_secret_access_key = 'token'\n", encoding="utf-8")
+    try:
+        (src / "settings.py").symlink_to(outside)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform-gated
+        pytest.skip("creating symlinks needs a privilege this platform withholds")
+    ref = RunRef(target="acme", run_id="run-001")
+
+    assert CliWorkspace(root=tmp_path).search_source(ref, ["token"]) == []
+
+
+def test_every_term_is_matched_in_one_walk(tmp_path: Path) -> None:
+    """Per-term walks re-read the whole checkout once each, under a lock no
+    other worker can take. Four functions asked about is one scan, not four."""
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    src.mkdir(parents=True)
+    (src / "a.py").write_text("get_connection()\n", encoding="utf-8")
+    (src / "b.py").write_text("render_template()\n", encoding="utf-8")
+    (src / "c.py").write_text("unrelated()\n", encoding="utf-8")
+    ref = RunRef(target="acme", run_id="run-001")
+
+    assert CliWorkspace(root=tmp_path).search_source(
+        ref, ["get_connection", "render_template"]
+    ) == ["a.py", "b.py"]

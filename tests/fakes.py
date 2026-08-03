@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -263,12 +263,25 @@ class FakeWorkspace:
             return None
         return self.sources.get(path)
 
-    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]:
-        """Literal substring search over the declared sources, shallowest first,
-        mirroring the real workspace's depth ordering."""
-        self.searches.append(term)
-        hits = [path for path, body in sorted(self.sources.items()) if term in body]
-        return sorted(hits, key=lambda path: path.count("/"))[:limit]
+    def search_source(
+        self, ref: RunRef, terms: Sequence[str], limit: int = 5
+    ) -> list[str]:
+        """Literal substring search over the declared sources, shallowest first.
+
+        Mirrors the real workspace rather than improving on it. This once sorted
+        every match by depth and truncated afterwards — the behavior
+        `CliWorkspace` documents — while `CliWorkspace` truncated first and
+        sorted the remainder, so the double was *more correct* than the code it
+        stood in for, and every driver test exercised a search production could
+        not deliver. A fake may be simpler; it may not be better.
+        """
+        self.searches.extend(terms)
+        hits = [
+            path
+            for path, body in self.sources.items()
+            if any(term in body for term in terms)
+        ]
+        return sorted(hits, key=lambda path: (path.count("/"), path))[:limit]
 
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path:
         self.parked_written = list(parked)

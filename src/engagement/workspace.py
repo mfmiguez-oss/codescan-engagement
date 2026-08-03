@@ -27,7 +27,7 @@ import subprocess
 import sys
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from .contracts import (
     ParkedScenario,
@@ -86,12 +86,19 @@ def seed_workspace(destination: Path, source: Path | None = None) -> Path:
 #: Extensions a caller search will open. A checkout holds binaries, images and
 #: minified bundles that cannot contain a readable call site and would cost a
 #: full read each to prove it.
+#:
+#: ``.env`` is deliberately absent. It was listed here beside ``.cfg`` and
+#: ``.ini`` and never matched anything — ``Path(".env").suffix`` is ``""``,
+#: because a leading dot makes the whole name a stem — and the right resolution
+#: of that was to drop it rather than reach for ``path.name``. A dotenv file
+#: holds credentials, not call sites, and whatever a search finds here is read
+#: verbatim into a prompt sent to the model provider.
 _SEARCHABLE_SUFFIXES = frozenset(
     {
         ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".rb", ".go", ".php",
         ".cs", ".c", ".h", ".cpp", ".hpp", ".rs", ".kt", ".scala", ".swift",
         ".html", ".jinja", ".j2", ".erb", ".yaml", ".yml", ".json", ".toml",
-        ".cfg", ".ini", ".env", ".sh", ".sql",
+        ".cfg", ".ini", ".sh", ".sql",
     }
 )
 
@@ -230,7 +237,9 @@ class Workspace(Protocol):
 
     def read_source(self, ref: RunRef, path: str) -> str | None: ...
 
-    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]: ...
+    def search_source(
+        self, ref: RunRef, terms: Sequence[str], limit: int = 5
+    ) -> list[str]: ...
 
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path: ...
 
@@ -628,41 +637,68 @@ class CliWorkspace:
         except OSError:
             return None
 
-    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]:
-        """Files in the checkout mentioning ``term``, nearest the root first.
+    def search_source(
+        self, ref: RunRef, terms: Sequence[str], limit: int = 5
+    ) -> list[str]:
+        """Files in the checkout mentioning any of ``terms``, shallowest first.
 
         This answers the "who calls this?" half of a context expansion, which no
         amount of path resolution can: a reviewer that asks for the callers of a
         function has named a symbol, not a file, and the file it wants is
         precisely the one it could not name.
 
-        Bounded and read-only, like every other checkout access here. ``term``
+        Every term is matched in **one** walk. Per-term walks re-read the whole
+        checkout once each, and the caller holds a lock across the call, so the
+        cost of asking about four functions was four scans that no other worker
+        could interleave with.
+
+        Bounded and read-only, like every other checkout access here. A term
         arrives from model output, so it is matched as a literal — never
         compiled as a pattern, which would hand untrusted text control over the
-        search itself. Ordering by depth is a cheap proxy for relevance: an
-        application's routes sit nearer the root than its vendored dependencies.
+        search itself. Symlinks are resolved and then contained, the same jail
+        `read_source` applies and for the same reason: a checkout is a clone of
+        the repository under review, and a link committed into it points
+        wherever its author chose — including at the host's own files.
+
+        Ordering by depth is a cheap proxy for relevance: an application's
+        routes sit nearer the root than its vendored dependencies. The **walk**
+        is ordered by depth, rather than the matches being re-ordered after the
+        fact, because sorting a list that has already been cut sorts the wrong
+        list — the walk yields paths alphabetically, so stopping at ``limit``
+        first keeps whichever matches sort early and drops the shallow ones the
+        ordering exists to surface.
         """
         root = (self._run_dir(ref) / "sourcecode").resolve()
-        if not term.strip() or not root.is_dir():
+        needles = [term.strip() for term in terms if term.strip()]
+        if not needles or not root.is_dir():
             return []
-        needle = term.strip()
-        found: list[tuple[int, str]] = []
-        for path in sorted(root.rglob("*")):
+
+        def by_depth(path: Path) -> tuple[int, str]:
+            relative = path.relative_to(root)
+            return len(relative.parts), relative.as_posix()
+
+        found: list[str] = []
+        for path in sorted(root.rglob("*"), key=by_depth):
             if len(found) >= limit:
                 break
-            if not path.is_file() or path.suffix.lower() not in _SEARCHABLE_SUFFIXES:
+            if path.suffix.lower() not in _SEARCHABLE_SUFFIXES:
                 continue
             try:
-                if path.stat().st_size > _MAX_SEARCH_BYTES:
+                resolved = path.resolve()
+                resolved.relative_to(root)
+                if not resolved.is_file():
                     continue
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                if resolved.stat().st_size > _MAX_SEARCH_BYTES:
+                    continue
+                content = resolved.read_text(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
                 continue
-            if needle not in content:
+            if not any(needle in content for needle in needles):
                 continue
-            relative = path.relative_to(root).as_posix()
-            found.append((len(path.relative_to(root).parts), relative))
-        return [relative for _, relative in sorted(found)][:limit]
+            # the lexical path, not the resolved one: it is what the caller
+            # hands back to `read_source`, which resolves and contains it again
+            found.append(path.relative_to(root).as_posix())
+        return found
 
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path:
         """Persist the parked queue beside the run it belongs to."""

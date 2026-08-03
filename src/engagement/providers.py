@@ -865,4 +865,13 @@ def unwrap_json(content: str) -> Any:
         if text.rstrip().endswith("```"):
             text = text.rstrip()[: -len("```")]
     value, _ = json.JSONDecoder().raw_decode(text)
+    if not isinstance(value, (dict, list)):
+        # `raw_decode` accepts any *prefix* that is a JSON value, and a bare
+        # scalar is one: "2 files are missing" decodes to `2`, "null, I cannot
+        # tell" to `None`. Every caller wants a container and guards for it, so
+        # a scalar would not crash — it would slip past `_classify_json_failure`
+        # into a flat "not a JSON object", losing the cut-off-versus-malformed
+        # distinction the retry policy is built on. The tolerance being bought
+        # here is for trailing *prose*, not for answers that are not JSON.
+        raise json.JSONDecodeError("expected a JSON object or array", text, 0)
     return value
