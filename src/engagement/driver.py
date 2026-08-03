@@ -51,9 +51,14 @@ from .contracts import (
     WorkOutcome,
 )
 from .dispatch import Dispatcher
-from .expansion import ExpansionBounds, build_expansion, requested_paths
+from .expansion import (
+    ExpansionBounds,
+    build_expansion,
+    requested_paths,
+    requested_symbols,
+)
 from .providers import ModelProvider, ProviderTimeout, unwrap_json
-from .workspace import Workspace, WorkspaceError
+from .workspace import Workspace, WorkspaceError, missing_context
 
 ROUTER_SYSTEM = (
     "You are the scenario-router. Answer the prompt with JSON only, matching the "
@@ -289,6 +294,13 @@ def _declared_needs_context(answer: str) -> ScenarioOutcome | None:
     driver is not overriding the recorder's judgement that this is not a valid
     *result*; it is recognising that "I need more context" is a conclusion the
     recorder has no shape for, and acting on it.
+
+    The stated gap is read with the *same* helper the accepted path uses,
+    because it is the same fact and two readers of one fact will disagree.
+    This one read only a top-level ``missing_context`` field, which the
+    workspace's schema does not define: a live run parked three scenarios as
+    "no gap stated to act on" while each answer explained, in its obligations,
+    exactly which callers it needed.
     """
     try:
         data = unwrap_json(answer)
@@ -296,10 +308,8 @@ def _declared_needs_context(answer: str) -> ScenarioOutcome | None:
         return None
     if not isinstance(data, dict) or data.get("status") != "needs_context":
         return None
-    missing = data.get("missing_context")
     return ScenarioOutcome(
-        status="needs_context",
-        missing_context=[str(item) for item in missing] if isinstance(missing, list) else [],
+        status="needs_context", missing_context=missing_context(data)
     )
 
 
@@ -1042,7 +1052,9 @@ class Driver:
                 parked.reason = "needs_context (budget exhausted before expansion)"
             return self._park(ref, scenario, parked)
 
-        supplied, unresolved, truncated = self._gather(ref, outcome.missing_context)
+        supplied, unresolved, truncated = self._gather(
+            ref, outcome.missing_context, already_shown=scenario.target_path
+        )
         expansion = build_expansion(
             outcome.missing_context, supplied, unresolved, truncated
         )
@@ -1104,28 +1116,57 @@ class Driver:
         return self._park(ref, scenario, parked)
 
     def _gather(
-        self, ref: RunRef, statements: list[str]
+        self, ref: RunRef, statements: list[str], already_shown: str = ""
     ) -> tuple[dict[str, str], list[str], list[str]]:
-        """Resolve the files the model named, within the checkout only."""
+        """Resolve what the model asked for, within the checkout only.
+
+        Two kinds of request, because a review asks for two kinds of thing. A
+        *path* it can name is read directly. A *symbol* it can name — "the
+        callers of `get_connection()`" — is searched for, because the file it
+        wants is by definition the one it could not name. Paths first: they are
+        the explicit request, and the search only spends what they leave.
+
+        ``already_shown`` is the scenario's own target file, which the prompt
+        already embedded. It is skipped rather than re-read: a live run spent
+        its whole expansion re-supplying the one file the reviewer had in front
+        of it, because that was the only path-shaped token in a sentence asking
+        for callers.
+        """
         bounds = self._policy.expansion_bounds
         supplied: dict[str, str] = {}
         unresolved: list[str] = []
         truncated: list[str] = []
-        for path in requested_paths(statements):
+
+        def _add(path: str) -> bool:
+            """True when the file was supplied. Bounds are reported, not silent."""
+            if path in supplied or path == already_shown:
+                return False
             if len(supplied) >= bounds.max_files:
-                # the cap is itself a bound on the re-attempt, so the paths it
-                # excluded are reported rather than forgotten
                 unresolved.append(path)
-                continue
+                return False
             with self._workspace_lock:
                 content = self._workspace.read_source(ref, path)
             if content is None:
                 unresolved.append(path)
-                continue
+                return False
             if len(content) > bounds.max_chars_per_file:
                 content = content[: bounds.max_chars_per_file]
                 truncated.append(path)
             supplied[path] = content
+            return True
+
+        for path in requested_paths(statements):
+            _add(path)
+
+        for symbol in requested_symbols(statements):
+            if len(supplied) >= bounds.max_files:
+                break
+            with self._workspace_lock:
+                hits = self._workspace.search_source(
+                    ref, symbol, bounds.max_files - len(supplied)
+                )
+            for hit in hits:
+                _add(hit)
         return supplied, unresolved, truncated
 
     def _park(

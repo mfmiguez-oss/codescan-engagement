@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -105,6 +106,23 @@ def test_bedrock_request_carries_no_credential_material() -> None:
 def test_a_fenced_json_answer_is_still_parsed() -> None:
     assert unwrap_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert unwrap_json('{"a": 1}') == {"a": 1}
+
+
+def test_a_closing_remark_after_the_json_does_not_fail_the_answer() -> None:
+    """`json.loads` needs the whole string to be one value, so a model that
+    answers correctly and then signs off raises "Extra data" at the point the
+    object *ended* — near the end of the text, which is exactly where a
+    truncation fails too. A live run parked a complete 15,504-character answer
+    as truncated because the two were indistinguishable by position."""
+    assert unwrap_json('{"a": 1}\n\nHope this helps!') == {"a": 1}
+    assert unwrap_json('```json\n{"a": 1}\n```\n\nLet me know.') == {"a": 1}
+
+
+def test_an_answer_that_really_is_cut_off_still_fails() -> None:
+    """The tolerance above must not swallow the failure it was distinguishing
+    itself from: an object with no closing brace is not a value at all."""
+    with pytest.raises(json.JSONDecodeError):
+        unwrap_json('{"a": 1, "b": [')
 
 
 class _FakeStream:

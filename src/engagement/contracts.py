@@ -91,6 +91,11 @@ class ScenarioRef(StrictModel):
     scenario_id: str
     expert: str
     priority: Priority = Priority.normal
+    #: The file the scenario is about. Carried so a context expansion can tell
+    #: what the reviewer has *already been shown* from what it still needs: the
+    #: rendered prompt embeds this file, so re-supplying it spends a read and
+    #: teaches the second attempt nothing the first did not already know.
+    target_path: str = ""
 
 
 class RoutingUnit(StrictModel):

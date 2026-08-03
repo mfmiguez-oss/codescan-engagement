@@ -61,6 +61,9 @@ class FakeWorkspace:
         self.expanded_status: dict[str, str] = {}
         #: files the jail will resolve; anything else is refused
         self.sources: dict[str, str] = {}
+        #: Terms a context expansion searched for, so a test can assert that a
+        #: "who calls this?" request became a search rather than a re-read.
+        self.searches: list[str] = []
         self.attempts: dict[str, int] = {}
         self.expanded_prompts: list[str] = []
         self.parked_written: list[ParkedScenario] = []
@@ -259,6 +262,13 @@ class FakeWorkspace:
         if ".." in path or path.startswith(("/", "\\")):
             return None
         return self.sources.get(path)
+
+    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]:
+        """Literal substring search over the declared sources, shallowest first,
+        mirroring the real workspace's depth ordering."""
+        self.searches.append(term)
+        hits = [path for path, body in sorted(self.sources.items()) if term in body]
+        return sorted(hits, key=lambda path: path.count("/"))[:limit]
 
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path:
         self.parked_written = list(parked)

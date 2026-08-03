@@ -991,6 +991,39 @@ def test_a_declared_needs_context_reaches_expansion_even_if_the_recorder_refuses
     assert declared.missing_context == ["need src/app.py"]
 
 
+def test_a_gap_stated_only_in_the_obligations_still_reaches_the_expansion() -> None:
+    """Where the model states the gap is the model's choice, not ours.
+
+    `missing_context` is not a field the workspace schema defines, so a model
+    that followed the prompt exactly states its gap in the obligations instead —
+    which is where the *accepted* path has always read it from. Reading only the
+    undefined top-level field parked three scenarios of a live run as "no gap
+    stated to act on" while each answer named, in its obligations, precisely the
+    callers it needed.
+    """
+    from engagement.driver import _declared_needs_context
+
+    declared = _declared_needs_context(
+        json.dumps(
+            {
+                "status": "needs_context",
+                "proof_obligations": [
+                    {"id": "sinks", "status": "proven_safe", "summary": "no sinks"},
+                    {
+                        "id": "callers",
+                        "status": "needs_context",
+                        "summary": "need the callers of get_connection()",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert declared is not None
+    # only the unresolved obligation, not the one it already answered
+    assert declared.missing_context == ["need the callers of get_connection()"]
+
+
 def test_a_genuinely_malformed_answer_still_fails_rather_than_expanding() -> None:
     """The narrowness is the point: only a *declared* needs_context is rescued."""
     from engagement.driver import _declared_needs_context

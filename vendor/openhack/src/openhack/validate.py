@@ -16,6 +16,7 @@ from .schemas import (
     validate_result,
     validate_scenario,
 )
+from .template_contract import template_contract_errors
 from .triage import ACCEPTING_DECISIONS, triage_prompt_sha256
 
 BULK_EXACT_THRESHOLD = 20
@@ -249,6 +250,10 @@ def validate_repo() -> list[str]:
             json.loads((base / "config" / name).read_text())
         except Exception as exc:
             errors.append(f"invalid schema file {name}: {exc}")
+    errors.extend(
+        f"template no longer matches its schema: {error}"
+        for error in template_contract_errors(base)
+    )
     if (base / "tools").exists():
         errors.append("top-level tools/ is not allowed")
     commands = list((base / "scripts" / "commands").glob("*.py"))

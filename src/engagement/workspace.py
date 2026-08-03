@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,12 +83,75 @@ def seed_workspace(destination: Path, source: Path | None = None) -> Path:
     return destination
 
 
-def _missing_context(result: dict[str, object]) -> list[str]:
+#: Extensions a caller search will open. A checkout holds binaries, images and
+#: minified bundles that cannot contain a readable call site and would cost a
+#: full read each to prove it.
+_SEARCHABLE_SUFFIXES = frozenset(
+    {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".rb", ".go", ".php",
+        ".cs", ".c", ".h", ".cpp", ".hpp", ".rs", ".kt", ".scala", ".swift",
+        ".html", ".jinja", ".j2", ".erb", ".yaml", ".yml", ".json", ".toml",
+        ".cfg", ".ini", ".env", ".sh", ".sql",
+    }
+)
+
+#: Files above this are generated, vendored, or data — never the hand-written
+#: call site a reviewer is asking for, and reading them is most of the cost.
+_MAX_SEARCH_BYTES = 2_000_000
+
+#: A Python traceback line naming the exception that ended it, e.g.
+#: ``ValueError: result S001 does not match scenario-result-schema.json:``.
+_EXCEPTION_LINE = re.compile(r"^\w[\w.]*(Error|Exception)\b\s*:")
+
+
+def _complaint(detail: str) -> str:
+    """The recorder's own message, lifted out of the traceback around it.
+
+    The CLI reports a refusal by raising, so what arrives here is a traceback
+    whose *last* lines carry the reason and whose opening frames say only that a
+    subprocess was run. Callers then abbreviate for a parked reason or a report
+    line, and abbreviating keeps the front — so the useful half was exactly the
+    half being thrown away: a live run parked two scenarios with a reason that
+    said `File "cli.py", line 327, in main` and nothing about why.
+
+    Leading with the exception line is what makes the first 200 characters worth
+    reading, and it keeps the detail lines beneath it — a schema refusal lists
+    one line per offending field, and those are the actionable part.
+    """
+    lines = detail.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if _EXCEPTION_LINE.match(lines[index].strip()):
+            return "\n".join(lines[index:])[:2000]
+    # No recognisable exception line: the tail is still the best guess, since
+    # whatever the process last said is closer to why it stopped than its first
+    # words were.
+    return "\n".join(lines[-12:])[:2000]
+
+
+def missing_context(result: dict[str, object]) -> list[str]:
     """The model's own account of what it could not resolve.
 
-    Read from the proof obligations it left unresolved, which the workspace
-    already requires to carry a concrete summary rather than a shrug.
+    Three sources, most direct first, because a model states this gap wherever
+    the prompt gave it room and the fact is the same one either way:
+
+    1. A top-level ``missing_context`` list. The workspace's schema does not
+       define this field, but a model told to return "the smallest missing
+       facts" sometimes emits it anyway, and a live DSVW run did.
+    2. The summaries of proof obligations left ``needs_context``, which the
+       workspace *does* require to carry a concrete summary rather than a shrug.
+       This is the usual source.
+    3. The overall summary, as a last resort.
+
+    Reading only (1) is what this used to do, and it meant a live run parked
+    three scenarios as "no gap stated to act on" while every one of them
+    explained in its obligations exactly which callers it needed.
     """
+    declared = result.get("missing_context")
+    if isinstance(declared, list):
+        stated = [str(item).strip() for item in declared if str(item).strip()]
+        if stated:
+            return stated
+
     obligations = result.get("proof_obligations")
     statements: list[str] = []
     if isinstance(obligations, list):
@@ -166,6 +230,8 @@ class Workspace(Protocol):
 
     def read_source(self, ref: RunRef, path: str) -> str | None: ...
 
+    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]: ...
+
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path: ...
 
     def read_parked(self, ref: RunRef) -> list[ParkedScenario]: ...
@@ -237,11 +303,8 @@ class CliWorkspace:
         except subprocess.TimeoutExpired as exc:
             raise WorkspaceError(f"openhack {' '.join(args)} timed out") from exc
         if completed.returncode != 0:
-            # the last lines carry the recorder's own message; a traceback's
-            # opening frames say only that a subprocess was run
             detail = (completed.stderr or completed.stdout or "").strip()
-            tail = "\n".join(detail.splitlines()[-12:])
-            raise WorkspaceError(f"openhack {args[0]} failed: {tail[:2000]}")
+            raise WorkspaceError(f"openhack {args[0]} failed: {_complaint(detail)}")
         return completed.stdout
 
     def _run_dir(self, ref: RunRef) -> Path:
@@ -516,6 +579,7 @@ class CliWorkspace:
                     scenario_id=str(data.get("id", path.stem)),
                     expert=str(data.get("expert", "")),
                     priority=priority,
+                    target_path=str(data.get("target_path", "")),
                 )
             )
         return pending
@@ -538,7 +602,7 @@ class CliWorkspace:
         data = json.loads(finished.read_text(encoding="utf-8"))
         return ScenarioOutcome(
             status=str(data.get("status", "")),
-            missing_context=_missing_context(data),
+            missing_context=missing_context(data),
         )
 
     def read_source(self, ref: RunRef, path: str) -> str | None:
@@ -563,6 +627,42 @@ class CliWorkspace:
             return resolved.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
+
+    def search_source(self, ref: RunRef, term: str, limit: int = 5) -> list[str]:
+        """Files in the checkout mentioning ``term``, nearest the root first.
+
+        This answers the "who calls this?" half of a context expansion, which no
+        amount of path resolution can: a reviewer that asks for the callers of a
+        function has named a symbol, not a file, and the file it wants is
+        precisely the one it could not name.
+
+        Bounded and read-only, like every other checkout access here. ``term``
+        arrives from model output, so it is matched as a literal — never
+        compiled as a pattern, which would hand untrusted text control over the
+        search itself. Ordering by depth is a cheap proxy for relevance: an
+        application's routes sit nearer the root than its vendored dependencies.
+        """
+        root = (self._run_dir(ref) / "sourcecode").resolve()
+        if not term.strip() or not root.is_dir():
+            return []
+        needle = term.strip()
+        found: list[tuple[int, str]] = []
+        for path in sorted(root.rglob("*")):
+            if len(found) >= limit:
+                break
+            if not path.is_file() or path.suffix.lower() not in _SEARCHABLE_SUFFIXES:
+                continue
+            try:
+                if path.stat().st_size > _MAX_SEARCH_BYTES:
+                    continue
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if needle not in content:
+                continue
+            relative = path.relative_to(root).as_posix()
+            found.append((len(path.relative_to(root).parts), relative))
+        return [relative for _, relative in sorted(found)][:limit]
 
     def write_parked(self, ref: RunRef, parked: list[ParkedScenario]) -> Path:
         """Persist the parked queue beside the run it belongs to."""

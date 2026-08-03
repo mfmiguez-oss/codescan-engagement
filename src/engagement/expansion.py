@@ -31,6 +31,22 @@ _PATH_RE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]{1,8})(?![
 #: sentence is extracted as ``e.g``, with ``g`` read as the extension.
 _NOT_PATHS = frozenset({"e.g", "i.e", "etc", "vs", "a.k.a"})
 
+#: A function-ish token: an identifier immediately followed by ``(``. The most
+#: common thing a reviewer asks for that is *not* a path is the callers of a
+#: function it can see, and it names that function this way.
+_SYMBOL_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w{2,})\s*\(")
+
+#: Identifiers common enough that searching for their callers would match most
+#: of a checkout. Asking "who calls `get`?" is not a question a search can
+#: usefully answer, and a term that matches everything supplies nothing.
+_TOO_COMMON = frozenset(
+    {
+        "def", "class", "if", "for", "while", "return", "print", "str", "int",
+        "len", "list", "dict", "set", "get", "post", "put", "delete", "self",
+        "super", "range", "open", "format", "type", "isinstance", "append",
+    }
+)
+
 
 class ExpansionBounds(StrictModel):
     """Limits on what one expansion may carry.
@@ -69,6 +85,32 @@ def requested_paths(statements: list[str], seen: set[str] | None = None) -> list
                 continue
             already.add(candidate)
             out.append(candidate)
+    return out
+
+
+def requested_symbols(statements: list[str]) -> list[str]:
+    """Function names the model named, for a "who calls this?" search.
+
+    The single most common thing an inconclusive review asks for is not a file
+    but a *relationship*: which routes reach this helper, who passes user input
+    to this sink. A live run made that request three times — "the callers of
+    `get_connection()`" — and the path extractor answered it by re-supplying the
+    one file the reviewer already had, because that was the only path-shaped
+    token in the sentence. A name is not a path, and resolving it needs a search.
+
+    Deliberately narrow, like the path pattern: identifiers of three characters
+    or more, immediately followed by a parenthesis, minus a small set of words
+    so common that searching for them would match most of a checkout.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for statement in statements:
+        for match in _SYMBOL_RE.finditer(statement):
+            name = match.group(1)
+            if name in seen or name.lower() in _TOO_COMMON:
+                continue
+            seen.add(name)
+            out.append(name)
     return out
 
 

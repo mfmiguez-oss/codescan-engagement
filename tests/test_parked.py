@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from engagement.budget import Budget, Ledger
-from engagement.contracts import Disposition, Priority, RunRef
+from engagement.contracts import Disposition, Priority, RunRef, ScenarioRef
 from engagement.driver import Driver, Policy
 from engagement.expansion import build_expansion, requested_paths
 from engagement.providers import FakeProvider
@@ -152,3 +152,58 @@ def test_expansion_delimits_supplied_files_as_untrusted() -> None:
 
 def test_an_empty_expansion_is_not_worth_a_second_call() -> None:
     assert build_expansion([], {}, []).is_empty
+
+
+def test_a_request_for_callers_becomes_a_search_not_a_re_read() -> None:
+    """The most common thing an inconclusive review asks for is a *relationship*
+    — which routes reach this helper — and it names a function, not a file. A
+    live run asked for "the callers of `get_connection()`" three times; the path
+    extractor found the one path-shaped token in that sentence, which was the
+    file the reviewer already had embedded, and spent the whole expansion
+    handing it straight back.
+    """
+    workspace = FakeWorkspace(
+        scenarios=[
+            ScenarioRef(
+                scenario_id="S001",
+                expert="injection",
+                priority=Priority.normal,
+                target_path="helpers/db.py",
+            )
+        ]
+    )
+    workspace.status_for["S001"] = "needs_context"
+    workspace.missing_for["S001"] = [
+        "need the callers of get_connection() in helpers/db.py"
+    ]
+    workspace.sources["helpers/db.py"] = "def get_connection(): ..."
+    workspace.sources["routes.py"] = "from helpers.db import get_connection()"
+    workspace.expanded_status["S001"] = "verified"
+
+    report = _driver(workspace).run(REF)
+
+    assert "get_connection" in workspace.searches
+    assert report.scenarios_completed == 1
+
+
+def test_the_file_the_prompt_already_embedded_is_never_re_supplied() -> None:
+    """`target_path` is in the rendered prompt. Reading it again costs a slot of
+    a five-file budget and tells the second attempt nothing the first knew."""
+    workspace = FakeWorkspace(
+        scenarios=[
+            ScenarioRef(
+                scenario_id="S001",
+                expert="injection",
+                priority=Priority.normal,
+                target_path="helpers/db.py",
+            )
+        ]
+    )
+    workspace.status_for["S001"] = "needs_context"
+    workspace.missing_for["S001"] = ["helpers/db.py needs its callers checked"]
+    workspace.sources["helpers/db.py"] = "def get_connection(): ..."
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.parked[0].supplied_paths == []

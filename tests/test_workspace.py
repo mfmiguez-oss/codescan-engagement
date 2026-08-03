@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from engagement.workspace import CliWorkspace, _rendered
+from engagement.contracts import RunRef
+from engagement.workspace import CliWorkspace, _complaint, _rendered
 
 
 def test_prompt_digest_hashes_bytes_not_decoded_text(tmp_path: Path) -> None:
@@ -42,6 +43,38 @@ def test_adapter_defaults_to_the_interpreter_running_it(tmp_path: Path) -> None:
     assert workspace._command[1:] == ["-m", "openhack"]
 
 
+def test_a_refusal_leads_with_the_reason_not_the_traceback() -> None:
+    """Callers abbreviate this for a parked reason, and abbreviating keeps the
+    front — so a message that opens with stack frames throws away exactly the
+    half worth reading. A live run parked two scenarios with a reason naming
+    `cli.py, line 327, in main` and nothing about why."""
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "C:\\repo\\src\\openhack\\cli.py", line 327, in main\n'
+        "    args.func(args)\n"
+        '  File "C:\\repo\\src\\openhack\\results.py", line 480, in _record\n'
+        "    validate_result(result, scenario_id)\n"
+        "ValueError: result S001 does not match scenario-result-schema.json:\n"
+        "- $.same_root_expansion: 'prose' is not of type 'array'"
+    )
+
+    complaint = _complaint(traceback)
+
+    assert complaint.startswith("ValueError: result S001 does not match")
+    # the per-field detail is the actionable part and must survive
+    assert "$.same_root_expansion" in complaint
+    # and the first 200 characters — all a parked reason keeps — are now useful
+    assert "cli.py" not in complaint[:200]
+
+
+def test_a_refusal_with_no_exception_line_still_reports_something() -> None:
+    """Not every non-zero exit is a Python traceback. Whatever the process last
+    said is still closer to why it stopped than its opening words."""
+    assert _complaint("usage: openhack ...\nerror: unrecognized arguments").endswith(
+        "error: unrecognized arguments"
+    )
+
+
 def test_the_cli_runs_in_utf8_mode_whatever_the_platform_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -66,3 +99,34 @@ def test_the_cli_runs_in_utf8_mode_whatever_the_platform_default(
     # And the pipes this end are read as UTF-8 too, so a character the child
     # can now write is not lost on the way back.
     assert captured["encoding"] == "utf-8"
+
+
+def test_a_caller_search_is_literal_never_a_compiled_pattern(tmp_path: Path) -> None:
+    """The term comes from model output. Compiling it would hand untrusted text
+    control over the search — `.*` would match every file, and a pathological
+    pattern would hang the run."""
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    src.mkdir(parents=True)
+    (src / "routes.py").write_text("from db import get_connection\n", encoding="utf-8")
+    (src / "unrelated.py").write_text("x = 1\n", encoding="utf-8")
+    ref = RunRef(target="acme", run_id="run-001")
+    workspace = CliWorkspace(root=tmp_path)
+
+    assert workspace.search_source(ref, "get_connection") == ["routes.py"]
+    # a regex metacharacter matches nothing, because nothing contains it
+    assert workspace.search_source(ref, ".*") == []
+
+
+def test_a_caller_search_prefers_files_nearer_the_root(tmp_path: Path) -> None:
+    """A cheap proxy for relevance: an application's routes sit nearer the root
+    than its vendored dependencies."""
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    (src / "vendor" / "deep").mkdir(parents=True)
+    (src / "app.py").write_text("token()\n", encoding="utf-8")
+    (src / "vendor" / "deep" / "copy.py").write_text("token()\n", encoding="utf-8")
+    ref = RunRef(target="acme", run_id="run-001")
+
+    assert CliWorkspace(root=tmp_path).search_source(ref, "token") == [
+        "app.py",
+        "vendor/deep/copy.py",
+    ]

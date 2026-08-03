@@ -175,3 +175,51 @@ def test_the_vendored_copy_has_not_fallen_behind_upstream() -> None:
         f"vendored workspace has fallen behind upstream: {stale[:5]} — "
         "re-run scripts/vendor_openhack.py"
     )
+
+
+@pytest.mark.skipif(
+    not (UPSTREAM / "src" / "openhack").is_dir(),
+    reason="upstream OpenHack checkout not present alongside this repo",
+)
+def test_upstream_has_not_gained_a_file_the_mirror_never_took() -> None:
+    """The half of drift the manifest cannot see by itself.
+
+    Walking the manifest catches a vendored file that changed or vanished
+    upstream, because both are questions *about a file the manifest lists*. An
+    added one is not: it appears nowhere in `files`, so the loop never asks. A
+    commit that only adds — a new expert manifest, a new schema, a new module —
+    leaves the mirror silently one file short.
+
+    Found the way it would bite in production: an upstream change added
+    `template_contract.py`, and the drift check named the three files it also
+    touched while saying nothing about the new one. Had that commit added only
+    the module, the mirror would have gone on reporting itself current.
+
+    The traversal rules are restated here rather than imported from
+    `vendor_openhack.py`, so a mistake in the script's idea of what to copy is
+    something this can still catch.
+    """
+    manifest = _manifest()
+    files = manifest["files"]
+    trees = manifest["trees"]
+    assert isinstance(files, dict)
+    assert isinstance(trees, list)
+
+    missing: list[str] = []
+    for tree in sorted(trees):
+        source = UPSTREAM / str(tree)
+        if not source.is_dir():
+            continue
+        for item in sorted(source.rglob("*")):
+            relative = item.relative_to(UPSTREAM)
+            if not item.is_file():
+                continue
+            if "__pycache__" in relative.parts or item.suffix in {".pyc", ".pyo"}:
+                continue
+            if relative.as_posix() not in files:
+                missing.append(relative.as_posix())
+
+    assert not missing, (
+        f"upstream has {len(missing)} file(s) the mirror never took, e.g. "
+        f"{missing[:5]} — re-run scripts/vendor_openhack.py"
+    )

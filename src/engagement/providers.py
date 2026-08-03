@@ -847,6 +847,15 @@ def unwrap_json(content: str) -> Any:
 
     Tolerant unwrapping only — the result still goes through the workspace's own
     schema validation, so nothing here decides that the content is trustworthy.
+
+    Trailing content after the JSON value is ignored rather than fatal.
+    ``json.loads`` requires the *entire* string to be one value, so a model that
+    answers correctly and then adds a closing remark fails with "Extra data" at
+    the point the object ended. That failure sits near the end of the text and
+    is therefore indistinguishable, by position alone, from a truncation — a
+    live run parked a complete 15,504-character answer as "truncated" because of
+    it. Decoding the leading value removes the ambiguity at its source instead
+    of teaching every caller to recognise one more error message.
     """
     text = content.strip()
     if text.startswith("```"):
@@ -855,4 +864,5 @@ def unwrap_json(content: str) -> Any:
             text = text[newline + 1 :]
         if text.rstrip().endswith("```"):
             text = text.rstrip()[: -len("```")]
-    return json.loads(text)
+    value, _ = json.JSONDecoder().raw_decode(text)
+    return value

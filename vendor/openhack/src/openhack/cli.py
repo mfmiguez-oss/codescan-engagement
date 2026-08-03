@@ -16,6 +16,7 @@ from .run import init_run
 from .sarif import emit_sarif
 from .scenarios import prepare_scenario_router, render_prompt
 from .summary import format_checkpoint, next_step, summarize_run
+from .template_contract import template_contract_errors
 from .triage import record_triage, render_triage_prompt
 from .validate import validate_run
 
@@ -242,6 +243,18 @@ def _cmd_validate_run(args: argparse.Namespace) -> None:
     ))
 
 
+def _cmd_check_templates(args: argparse.Namespace) -> None:
+    errors = template_contract_errors()
+    if errors:
+        print("\n".join(errors))
+        raise SystemExit(1)
+    print(format_checkpoint(
+        "Check Templates",
+        "Every marked template block matches the schema it is bound to.",
+        review="Re-run after editing a schema in config/ or a field list in templates/.",
+    ))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="openhack")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -313,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
     summary = subparsers.add_parser("summarize-run", help="Summarize run state.")
     _add_target_run(summary)
     summary.set_defaults(func=_cmd_summarize_run)
+
+    templates = subparsers.add_parser(
+        "check-templates",
+        help="Check every marked template field list against its schema.",
+    )
+    templates.set_defaults(func=_cmd_check_templates)
 
     validate = subparsers.add_parser("validate-run", help="Validate the repo or a run.")
     validate.add_argument("target", nargs="?")
