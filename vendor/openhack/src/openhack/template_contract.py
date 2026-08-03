@@ -148,8 +148,10 @@ def _block_errors(label: str, block: _Block, schema: dict[str, Any]) -> list[str
         node = _resolve(schema, block.path)
     except KeyError:
         return [
-            f"{label}:{block.line}: {block.schema} defines no `{block.path}` "
-            "for this block to describe"
+            (
+                f"{label}:{block.line}: {block.schema} defines no "
+                f"`{block.path}` for this block to describe"
+            )
         ]
     properties = node.get("properties", {})
     if not isinstance(properties, dict):
@@ -206,8 +208,13 @@ def template_contract_errors(base: Path | None = None) -> list[str]:
                     schemas[block.schema] = json.loads(
                         source.read_text(encoding="utf-8")
                     )
-                except Exception as exc:
-                    errors.append(f"{label}:{block.line}: cannot read {block.schema}: {exc}")
+                except (OSError, ValueError) as exc:
+                    # A marker naming a schema that is absent or malformed is
+                    # the check's own subject matter, so it is reported rather
+                    # than raised. ValueError covers JSONDecodeError.
+                    errors.append(
+                        f"{label}:{block.line}: cannot read {block.schema}: {exc}"
+                    )
                     continue
             errors.extend(_block_errors(label, block, schemas[block.schema]))
     return errors

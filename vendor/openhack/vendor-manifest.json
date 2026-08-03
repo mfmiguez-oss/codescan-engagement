@@ -50,7 +50,7 @@
     "src/openhack/schemas.py": "4a5ad472101922ef27df62799f290b6e69f590343fabe1282f162851b5bf15d2",
     "src/openhack/semgrep_recon.py": "66aca1a46bdaca5bb06058112b8b4f037dd4fcc660ec98715a07bf3d8aa8198e",
     "src/openhack/summary.py": "7e33c4e0c1dee06b14c8926fc8681f0018d200734c5948a09c00043eb95b0140",
-    "src/openhack/template_contract.py": "3e8c560193e83dbdfbe5588c8ec78be78dcf42900dc2e639c5337ae86175b9b9",
+    "src/openhack/template_contract.py": "e178bf6d674fadfbb058a961da8a42fdef6162f7591b1429a49543f821f09ec4",
     "src/openhack/triage.py": "c298e93bb983ecaee58bdd03890a912cce9fe6d167e7c402dd9172a5e1783ce8",
     "src/openhack/validate.py": "68bc580f1915d98ba7a195d6c7c8577854f17ba32f6f2171d1840bf4e4b248c7",
     "templates/finding-triage-prompt.md": "ac2a223fff65ea52e810e6ec5d8b37a4567f3a8ae6f05cb4dbb8449999b90b81",
@@ -60,7 +60,7 @@
     "templates/scenario-result.json": "786cd4d1091a0ed096f200deadc9366298983dd8cc91725fe50f34ab7212dd53",
     "templates/scenario-router-prompt.md": "0877648625a68f61ee3b815529614ab7dce9626967b99583e482ec194c79c399"
   },
-  "source_commit": "f943a929c608c5dc6622a1dcab802bbcffce5e7e",
+  "source_commit": "6787e413eff99561f420702dfb25176718357c8a",
   "source_dirty": [],
   "source_repo": "OpenHack",
   "source_url": "https://github.com/mfmiguez-oss/OpenHack-main.git",
@@ -71,5 +71,5 @@
     "config"
   ],
   "upstream_origin": "https://github.com/hadriansecurity/openhack",
-  "vendored_at": "2026-08-03T07:29:15.912695+00:00"
+  "vendored_at": "2026-08-03T07:39:48.477094+00:00"
 }
