@@ -21,18 +21,21 @@ Framework conformance, dated: [docs/SECURITY_FRAMEWORKS.md](docs/SECURITY_FRAMEW
 
 The workspace it drives is **vendored** into `vendor/openhack`, so a checkout
 installs into something that can actually scan — no sibling repository, no
-private fetch at build time:
+private fetch at build time. `init-workspace` copies that methodology into a
+writable root, which is the step that makes the vendored claim runnable: the
+mirror is read-only by policy, and a run writes into the workspace it drives.
 
 ```bash
 pip install -e ".[dev]" ./vendor/openhack
+engagement init-workspace ./workspace
 
 # Azure Foundry (default)
 export FOUNDRY_RESOURCE=... FOUNDRY_API_KEY=...
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini
 
 # AWS Bedrock — same image, same command
 export BEDROCK_REGION=us-east-1 BEDROCK_INFERENCE_GEO=us
-engagement run acme run-001 --workspace ../OpenHack-main \
+engagement run acme run-001 --workspace ./workspace \
   --model anthropic.claude-opus-5 --max-calls 400
 ```
 
@@ -91,7 +94,7 @@ remainder is reported as `unfunded` — never silently dropped.
 ## Scoring the findings
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini \
   --triage --feeds ./feeds --repo acme/app
 ```
 
@@ -121,7 +124,7 @@ no finding and reads as clean. It is not clean — it is the one exposure that
 cannot be patched, because nobody is left to publish the patch.
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini \
   --triage --feeds ./feeds --inventory ./sbom.json
 ```
 
@@ -159,7 +162,7 @@ A ranked queue answers "which finding first?" but not the two questions a
 responder asks next:
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini \
   --triage --chains --pocs
 ```
 
@@ -399,7 +402,7 @@ ranked list does not:
 | `severity_delta`, `score_delta`, `movement_reason` | **What moved, and why** — lifecycle state, exploit intelligence, or new corroboration |
 
 ```bash
-engagement run acme run-002 --workspace ../OpenHack-main --model claude-opus-5 \
+engagement run acme run-002 --workspace ./workspace --model claude-opus-5 \
   --triage --baseline ./state/acme.baseline.json
 ```
 
@@ -439,7 +442,7 @@ assigned a guessed one.
 ## Two detection passes, from two vendors
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main \
+engagement run acme run-001 --workspace ./workspace \
   --expert-model claude-opus-5 --second-model gpt-5.6-luna --triage
 ```
 
@@ -571,7 +574,7 @@ precisely why an unmaintained package slips through.
 ```bash
 snyk test --all-projects --json > snyk.json
 
-engagement run acme run-001 --workspace ../OpenHack-main --model claude-opus-5 \
+engagement run acme run-001 --workspace ./workspace --model claude-opus-5 \
   --triage --feeds ./feeds --snyk-export ./snyk.json
 ```
 
@@ -588,7 +591,7 @@ Every run writes an append-only trail beside itself. A SIEM is where it is
 actually read, so it ships in the shapes collectors expect:
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini \
   --siem ./out/engagement.ecs.json --siem-format ecs
 
 engagement export-siem runs/acme/run-001/audit.jsonl \
@@ -613,7 +616,7 @@ the runs that mattered without parsing prose.
 ## Picking work back up, and looking at it
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main --model gpt-5-mini \
+engagement run acme run-001 --workspace ./workspace --model gpt-5-mini \
   --resume-parked --report queue.html
 ```
 

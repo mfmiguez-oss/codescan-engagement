@@ -1,0 +1,13 @@
+# The vendored mirror is identified by hash, so it must survive a checkout
+# byte-for-byte. `scripts/vendor_openhack.py` records a sha256 of each file's
+# bytes and `tests/test_vendor.py` re-reads those bytes, so any end-of-line
+# translation between the two makes every hash wrong at once.
+#
+# Git's default is to translate, and `core.autocrlf=true` — the Windows
+# default — rewrites LF to CRLF on checkout. The result is not a stray test
+# failure: on the platform this is developed on, a *fresh clone* ships a
+# manifest whose hashes do not describe the files beside it, which is the one
+# claim vendoring exists to make. CI runs on Linux and would never see it.
+#
+# `-text` disables the translation for these paths while leaving them diffable.
+vendor/openhack/** -text

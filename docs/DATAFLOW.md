@@ -334,7 +334,7 @@ flowchart TB
 ```
 
 ```bash
-engagement run acme run-001 --workspace ../OpenHack-main \
+engagement run acme run-001 --workspace ./workspace \
   --expert-model claude-opus-5 --second-model gpt-5.6-luna --triage
 ```
 
