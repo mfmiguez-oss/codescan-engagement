@@ -36,8 +36,13 @@ review.
 ### Start it
 
 ```bash
-ENGAGEMENT_OPERATOR=ada .venv/Scripts/python -c "from engagement.cli import main; import sys; sys.exit(main())" console C:/Users/manue/AppData/Local/Temp/ohw/runs/benchmark-python/run-001 --dev-token local-dev --model claude-haiku-4-5
+ENGAGEMENT_OPERATOR=ada engagement console ./workspace/runs/acme/run-001 \
+  --dev-token local-dev --model claude-haiku-4-5
 ```
+
+The run directory is `<workspace>/runs/<client>/<run-id>` — the workspace being
+the one `engagement init-workspace ./workspace` seeded, not the read-only
+`vendor/openhack` mirror.
 
 Then open <http://127.0.0.1:8000/>, click **Sign in**, and paste `local-dev`.
 

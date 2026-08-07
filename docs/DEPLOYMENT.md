@@ -41,10 +41,12 @@ Three consequences worth knowing before you run it:
   the methodology. Mounting a volume over it shadows the expert manifests and
   leaves a container that starts and then has nothing to route to. The volumes
   are `/workspace/runs` (mutable per-run state) and `/artifacts` (exports).
-- **`--triage` is not available in the default image.** The triage backbone is
-  on no package index, so baking it in would mean a build that needs network
-  and repository access. Install it into a derived image if you want scoring in
-  the same container.
+- **`--triage` needs nothing extra.** The backbone was ported into the package
+  as `engagement.backbone` (stdlib and pydantic only), so scoring, lifecycle,
+  chains, PoC drafts and the worklist are all in the default image. This bullet
+  used to say the opposite, from when triage resolved to a private git
+  reference; there is no `triage` extra any more, and a derived image built to
+  get it is doing nothing.
 - **Bind-mounting a local repository needs `safe.directory`.** The container
   runs as uid 10001, so a host checkout mounted into it is owned by a different
   user and git refuses to clone from it (`detected dubious ownership`). Normal

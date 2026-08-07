@@ -8,15 +8,28 @@ cannot claim "mitigated" unless it names a test that exists.
 
 from __future__ import annotations
 
+import ast
 import re
+import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 THREATMODEL = ROOT / "docs" / "THREATMODEL.md"
 OUTPUTS = ROOT / "docs" / "OUTPUTS.md"
 FRAMEWORKS = ROOT / "docs" / "SECURITY_FRAMEWORKS.md"
+PYPROJECT = ROOT / "pyproject.toml"
 TESTS_DIR = Path(__file__).parent
 SRC_DIR = ROOT / "src" / "engagement"
+
+
+def _prose() -> list[Path]:
+    """Everything a reader might copy a command out of."""
+    return [
+        ROOT / "README.md",
+        *sorted((ROOT / "docs").glob("*.md")),
+        ROOT / "deploy" / "Dockerfile",
+    ]
 
 _ROW = re.compile(r"^\|\s*(R\d+)\s*\|(.+)\|\s*(mitigated|open)\s*\|\s*([^|]+)\|\s*$")
 
@@ -161,6 +174,61 @@ def test_the_frameworks_document_takes_no_unbacked_credit() -> None:
             if f"def {name}(" not in source:
                 missing.append(f"{name} does not exist")
     assert not missing, f"Enforced rows without a real test: {missing[:4]}"
+
+
+_INSTALL_EXTRAS = re.compile(r"\.\[([a-z0-9,_\- ]+)\]")
+
+
+def test_documented_install_commands_name_extras_that_exist() -> None:
+    """An install line is the first thing a reader runs, so a `.[thing]` that
+    pyproject does not define fails them before anything else can. Only lines
+    that actually install are considered — prose may discuss an extra that was
+    removed, and saying so is the opposite of the mistake this catches.
+    """
+    declared = set(
+        tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+            "optional-dependencies"
+        ]
+    )
+    wrong: list[str] = []
+    for path in _prose():
+        if not path.exists():
+            continue
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if "install" not in line:
+                continue
+            for match in _INSTALL_EXTRAS.finditer(line):
+                for name in (part.strip() for part in match.group(1).split(",")):
+                    if name and name not in declared:
+                        wrong.append(f"{path.name}:{number} installs '.[{name}]'")
+    assert not wrong, f"installs naming extras that do not exist: {wrong}"
+
+
+def test_the_triage_backbone_needs_nothing_the_base_install_lacks() -> None:
+    """`--triage` is documented as working in the default image, and that claim
+    is only true while the backbone stays on the base dependency set.
+
+    This is the invariant behind a doc line that was wrong for a while: the
+    backbone used to resolve from a private git reference, DEPLOYMENT.md said
+    `--triage` needed a derived image, and it kept saying so after the port
+    made it false. Adding an import here is what would make it true again, so
+    the assertion lives next to the thing that would break it.
+    """
+    tree = ast.parse((SRC_DIR / "backbone.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.add(node.module.split(".")[0])
+    # `pydantic` is the one non-stdlib name the base install guarantees.
+    outside = sorted(imported - set(sys.stdlib_module_names) - {"pydantic"})
+    assert not outside, (
+        f"backbone.py imports {outside}, which the base install does not carry — "
+        "either add the dependency and correct docs/DEPLOYMENT.md, or drop it"
+    )
 
 
 # -- invariants the register names ------------------------------------------

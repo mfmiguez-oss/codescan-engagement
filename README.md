@@ -745,10 +745,16 @@ taken for a control that is not run.
 
 ## Not yet
 
-The analyst view is still read-only — the control plane accepts state changes
-over HTTP, but the generated HTML does not call it. `PostgresClaimStore` is
-unproven against a live database, the JWKS network hop is stubbed in the suite,
-and there is no rate limiting (that belongs at the ingress — R25). The `triage` extra
-resolves to a git reference rather than an index, so `--triage` needs network
-and repository access and is deliberately not baked into the image. See the end
-of [docs/DESIGN.md](docs/DESIGN.md).
+`PostgresClaimStore` is unproven against a live database, and the JWKS network
+hop is stubbed in the suite — verification is proven against real RSA keys and
+real forgeries, but nothing here fetches an issuer's published keys, and the
+console's PKCE exchange has never run against a live one either.
+
+Rate limiting **exists** and bounds one process: per-principal token buckets in
+the control plane, with a smaller allowance on the routes that spend money. Four
+replicas of a per-process limit is four times the limit, so a fleet still needs
+one at the ingress (R25).
+
+Run progress is polled rather than streamed, no SBOM or VEX is published, and
+nothing alerts on the audit trail — it is append-only and exports cleanly to a
+SIEM, but no rule fires on it. See the end of [docs/DESIGN.md](docs/DESIGN.md).

@@ -23,8 +23,10 @@ keyvault = ["azure-identity>=1.17", "azure-keyvault-secrets>=4.8"]
 # package rather than resolved from a private git reference. There is no
 # `triage` extra any more: scoring, lifecycle, chains, PoC drafts and the
 # worklist are available to every install, and the image is self-sufficient.
-# `tests/test_backbone_conformance.py` holds the port to the original whenever
-# `triagekit` happens to be installed beside it.
+# `tests/test_backbone_conformance.py` holds the port to the original against
+# frozen vectors (`tests/data/backbone_vectors.json`), so it runs everywhere
+# rather than only where `triagekit` happens to be installed — which was
+# nowhere, since it is private and not a dependency.
 # The control plane: token verification and the HTTP surface.
 api = ["pyjwt[crypto]>=2.8", "starlette>=0.37", "uvicorn>=0.30"]
 dev = ["pytest", "ruff", "mypy"]

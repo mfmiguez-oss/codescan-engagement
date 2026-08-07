@@ -164,11 +164,12 @@ MUTATIONS: list[Mutation] = [
         "tests/test_caching.py::test_a_prefix_below_the_floor_is_still_sent_to_the_model",
     ),
     (
-        # the cached span escaping redaction: invariant text is not safe text
+        # the cached span escaping redaction: invariant text is not safe text.
+        # Anchored on the single line that decides what actually leaves, rather
+        # than on the whole block: the block was restructured (the counter moved
+        # under `with self._counters:`) and the old four-line anchor stopped
+        # matching, which failed setup until it was repointed here.
         "dispatch.py",
-        "                redacted_prefix = redact(cache_prefix)\n"
-        "                self.redactions += redacted_prefix.count\n"
-        "                redacted.restorations.update(redacted_prefix.restorations)\n"
         "                prefix = redacted_prefix.text",
         "                prefix = cache_prefix",
         "tests/test_caching.py::"

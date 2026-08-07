@@ -376,10 +376,14 @@ an estate with only one vendor available. It has to be a deliberate choice.
 
 ## 9. Honest limits
 
-**The analyst view is read-only.** The control plane accepts state changes over
-HTTP; the generated HTML does not call it. Deciding needs an authenticated
-principal, and a page that let an anonymous reader close a finding would undo the
-invariant the estate is built on.
+**Only one of the two surfaces writes.** `report.html` is read-only by design and
+stays that way — it is an artifact you attach to a ticket and open with no
+server. The console is its counterpart and the sole write path: deciding needs
+an authenticated principal, so it signs in over OIDC authorization code with
+PKCE and holds the token in a JavaScript variable, sent as a bearer and never as
+a cookie. A page that let an anonymous reader close a finding would undo the
+invariant the estate is built on, which is why these are two surfaces rather
+than one page with a login button.
 
 **Not verified live:** the Bedrock request shapes are asserted offline but never
 called; `PostgresClaimStore` is unproven against a real database; the JWKS
