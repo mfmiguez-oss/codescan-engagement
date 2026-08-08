@@ -39,12 +39,81 @@ ENDPOINT_TERMS = {
 }
 
 
+#: Suffixes whose routes are declared as configuration — a key/value pair with a
+#: path literal — and are read by `_extract_path_literal` + `_line_key`.
+CONFIG_SUFFIXES = {".php", ".yaml", ".yml", ".xml", ".json", ".ini", ".dist"}
+#: Python declares routes in code, as a decorator or a URLconf entry, so it gets
+#: its own extractor below rather than being fed to the config one.
+CODE_SUFFIXES = {".py"}
+
+
 def _runtime_file(path: Path) -> bool:
     parts = {part.lower() for part in path.parts}
     if parts & {"tests", "test", "__fixtures__", "fixtures"}:
         return False
     suffix = path.suffix.lower()
-    return suffix in {".php", ".yaml", ".yml", ".xml", ".json", ".ini", ".dist"}
+    return suffix in CONFIG_SUFFIXES or suffix in CODE_SUFFIXES
+
+
+#: `@app.route("/login")`, `@bp.get("/x")`, `@router.post("/x")` — Flask, its
+#: blueprints, FastAPI and APIRouter all share this shape.
+_PY_DECORATOR = re.compile(
+    r"@\s*[A-Za-z_][\w.]*\."
+    r"(?P<verb>route|get|post|put|patch|delete|head|options|websocket)\s*\(\s*"
+    r"(?P<quote>['\"])(?P<endpoint>[^'\"]*)(?P=quote)"
+)
+#: `path("login/", ...)`, `re_path(r"^login/$", ...)`, `url(...)` — Django.
+_PY_URLCONF = re.compile(
+    r"\b(?P<verb>path|re_path|url)\s*\(\s*r?"
+    r"(?P<quote>['\"])(?P<endpoint>[^'\"]*)(?P=quote)"
+)
+#: `methods=["POST"]` on the declaration line.
+_PY_METHODS = re.compile(r"methods\s*=\s*[\[(](?P<value>[^\])]*)[\])]")
+#: A decorator whose name *is* the method needs no `methods=`.
+_VERB_METHODS = {
+    "get": "GET",
+    "post": "POST",
+    "put": "PUT",
+    "patch": "PATCH",
+    "delete": "DELETE",
+    "head": "HEAD",
+    "options": "OPTIONS",
+}
+
+
+def _python_route(line: str) -> "tuple[str, str, list[str]] | None":
+    """A Python route declaration as (endpoint, key, methods), or None.
+
+    Methods are read from the declaration line rather than from the surrounding
+    context the config formats use. Python packs routes densely — a handler is
+    often three lines — so an eight-line context window would hand every route
+    in the block the union of its neighbours' verbs.
+    """
+    match = _PY_DECORATOR.search(line) or _PY_URLCONF.search(line)
+    if match is None:
+        return None
+    # Django writes `login/` and a regex route writes `^login/$`, while Flask
+    # writes `/login`. Downstream these are identity — the dedup key is the
+    # endpoint string — so the same route declared two ways must normalise to
+    # one value rather than becoming two boundaries.
+    endpoint = match.group("endpoint").strip().lstrip("^").rstrip("$")
+    endpoint = "/" + endpoint.lstrip("/")
+    verb = match.group("verb").lower()
+
+    methods: set[str] = set()
+    declared = _PY_METHODS.search(line)
+    if declared:
+        methods.update(
+            method.upper()
+            for method in re.findall(
+                r"\b(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b",
+                declared.group("value"),
+                re.I,
+            )
+        )
+    if verb in _VERB_METHODS:
+        methods.add(_VERB_METHODS[verb])
+    return endpoint, verb, sorted(methods)
 
 
 def _extract_path_literal(line: str) -> str | None:
@@ -267,9 +336,16 @@ def _row(
     key: str,
     endpoint: str,
     context: str,
+    declared_methods: "list[str] | None" = None,
 ) -> dict[str, Any]:
     boundary_type = _boundary_type(key, endpoint, context)
-    methods = _context_methods(context, boundary_type)
+    # A declaration that states its own methods is believed over the context
+    # scan; an empty list means it declared none, so fall back to the default
+    # for the boundary type exactly as a config route would.
+    if declared_methods:
+        methods = declared_methods
+    else:
+        methods = _context_methods(context, boundary_type)
     fields = _request_fields(boundary_type)
     return {
         "kind": "request_boundary",
@@ -309,15 +385,33 @@ def extract_request_boundaries(source_root: Path | str) -> list[dict[str, Any]]:
             continue
         lines = text.splitlines()
         rel = rel_path.as_posix()
+        is_code = rel_path.suffix.lower() in CODE_SUFFIXES
         for index, line in enumerate(lines):
-            endpoint = _extract_path_literal(line)
-            if not endpoint:
-                continue
-            key = _line_key(line)
-            context = _context(lines, index)
+            declared_methods: "list[str] | None" = None
+            if is_code:
+                route = _python_route(line)
+                if route is None:
+                    continue
+                endpoint, key, declared_methods = route
+            else:
+                endpoint = _extract_path_literal(line) or ""
+                if not endpoint:
+                    continue
+                key = _line_key(line)
+            # Classification reads the context, and `_boundary_type` matches on
+            # any keyword anywhere in it. For config that is fine — routes sit
+            # in separate blocks. Python packs a route and its handler into
+            # three lines, so an eight-line window hands every route in the
+            # block its neighbours' keywords: a `/login` two lines above an
+            # `/upload` classifies as `upload`, and one below a `/healthz`
+            # makes that an `oauth_callback`. The declaration is the evidence,
+            # so for code it is the whole context.
+            context = line if is_code else _context(lines, index)
             if not _should_emit(key, endpoint, context):
                 continue
-            rows.append(_row(rel, index + 1, line, key, endpoint, context))
+            rows.append(
+                _row(rel, index + 1, line, key, endpoint, context, declared_methods)
+            )
 
     by_boundary: dict[tuple[str, tuple[str, ...], str], dict[str, Any]] = {}
     for row in rows:

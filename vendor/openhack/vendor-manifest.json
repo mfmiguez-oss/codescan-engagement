@@ -25,7 +25,7 @@
     "config/scenario-result-schema.json": "f26b2f8a6c9af79a5b5ae2e20ff1ffc055531efabc02ffbf2019aaf4e2dcc7b7",
     "config/scenario-schema.json": "a4e136e9c87772e66760e1877b492ed7073bea4677513eb6e7a213e7f4c2a05a",
     "config/semgrep/openhack-recon.yml": "7d132d1f8f111307b9cfe0d5a40410a4d7a841878a3ff196b8ca1c37a9678f22",
-    "pyproject.toml": "44548ec838530fb066590edf0d25a9967efbe32f0e33f625bb208f3f76d64fef",
+    "pyproject.toml": "391ae7c4ed0a1014b399d1e6547c802b82e51883591cdf3a39842c1972367a1a",
     "src/openhack/__init__.py": "38ead66e6e9c9b2f35bb617c156421a992aa8ccd5702023574c4b4c13cbb6e93",
     "src/openhack/__main__.py": "3129adff95e0f38b87ab34cddfc27082c7892bcaec267ff5d40f160fdf55b44a",
     "src/openhack/backlog.py": "a0b22f74c98fbce41c690353b3d4ac5c058497e59800885c0dc5baef2ee08bee",
@@ -40,7 +40,7 @@
     "src/openhack/queue.py": "4d1cc2e54cc9fe1a01e9454ec4e296b68669acf441635aac88fd33cf6d83b7b6",
     "src/openhack/recon.py": "eef5948a12ae53ca2b2956592692df8106ef15407f91287006c81f1d9abaf1b9",
     "src/openhack/registry.py": "d7ee4ca05b639aecd6aa31199f4a6adea6c894654dcfcc03c15c9ddd0cdeab71",
-    "src/openhack/request_boundaries.py": "62dad2c3c42f18a99dca0f7c72b6a62309b63e1e1b1688c06e917f764f5a0163",
+    "src/openhack/request_boundaries.py": "1fa46a91db92d161342cece51c5434fe0654c160bd28ef3b883a40c1cfff8233",
     "src/openhack/results.py": "fd170b322c9057c2c367f4a5e98f30a7e2e963b17734285ff5751c8cc85a0032",
     "src/openhack/router_context.py": "7a18f1f54070fe5c14f5c82a6915cb7f10e61e01c4f8dbbf91d3e8e8af35fd23",
     "src/openhack/routing_units.py": "1a3c2f3b3955cd99c7521bd4c3008dd7ed0c25f3b219e8fefaa16e69bae253dd",
@@ -60,7 +60,7 @@
     "templates/scenario-result.json": "786cd4d1091a0ed096f200deadc9366298983dd8cc91725fe50f34ab7212dd53",
     "templates/scenario-router-prompt.md": "0877648625a68f61ee3b815529614ab7dce9626967b99583e482ec194c79c399"
   },
-  "source_commit": "4c90bc55dbe812a7c168d0268e1e0a141a76eec8",
+  "source_commit": "3562a70a5e508ad6a7aa3fb8a063565c6d821636",
   "source_dirty": [],
   "source_repo": "OpenHack",
   "source_url": "https://github.com/mfmiguez-oss/OpenHack-main.git",
@@ -71,5 +71,5 @@
     "config"
   ],
   "upstream_origin": "https://github.com/hadriansecurity/openhack",
-  "vendored_at": "2026-08-03T08:44:33.295132+00:00"
+  "vendored_at": "2026-08-08T05:07:22.937174+00:00"
 }

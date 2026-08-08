@@ -18,6 +18,7 @@ dependencies = [
 dev = [
   "ruff>=0.6",
   "mypy>=1.10",
+  "pytest>=8.0",
   "types-jsonschema",
 ]
 
@@ -42,6 +43,13 @@ target-version = "py39"
 # style migration wearing a bug fix's clothes.
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
+
+# Scoped, not discovered. A workspace root holds `runs/<client>/<run>/sourcecode`
+# — a checkout of the repository under review — and bare `pytest` collects any
+# `*_test.py` in it. That is someone else's test suite, arbitrary code, and it
+# already broke collection here on a vendored Go library's msgpack tests.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.mypy]
 files = ["src"]
