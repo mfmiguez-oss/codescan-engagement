@@ -12,6 +12,10 @@ Architecture and rationale: [docs/DESIGN.md](docs/DESIGN.md).
 Stages, contracts and dataflows: [docs/DATAFLOW.md](docs/DATAFLOW.md) — including
 the [degradation matrix](docs/DATAFLOW.md#degradation-what-happens-when-an-input-is-missing),
 which says what a run still means when a feed or a budget is missing.
+Which AI models are used and where: [docs/MODELS.md](docs/MODELS.md) — the
+register of every model call, the [default](docs/MODELS.md#3-dataflow--the-default-allocation)
+and [recommended](docs/MODELS.md#4-dataflow--the-recommended-allocation)
+allocations drawn as dataflows, and every stage that deliberately calls none.
 Topology and cloud setup: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 Running either web UI on your own machine: [docs/LOCAL_UI.md](docs/LOCAL_UI.md).
 Risk register: [docs/THREATMODEL.md](docs/THREATMODEL.md).
@@ -29,15 +33,23 @@ mirror is read-only by policy, and a run writes into the workspace it drives.
 pip install -e ".[dev]" ./vendor/openhack
 engagement init-workspace ./workspace
 
-# Azure Foundry (default)
+# Azure Foundry (default) — the per-task defaults apply, so no model is named
 export FOUNDRY_RESOURCE=... FOUNDRY_API_KEY=...
-engagement run acme run-001 --workspace ./workspace --model gpt-5-mini
+engagement run acme run-001 --workspace ./workspace
 
-# AWS Bedrock — same image, same command
+# AWS Bedrock — same image, same command, but name the deployments per task:
+# the defaults are Foundry-style ids and --model alone does not override them
 export BEDROCK_REGION=us-east-1 BEDROCK_INFERENCE_GEO=us
-engagement run acme run-001 --workspace ./workspace \
-  --model anthropic.claude-opus-5 --max-calls 400
+engagement run acme run-001 --workspace ./workspace --max-calls 400 \
+  --router-model anthropic.claude-opus-5 \
+  --expert-model anthropic.claude-opus-5 \
+  --triage-model anthropic.claude-sonnet-5 \
+  --chains-model anthropic.claude-sonnet-5 \
+  --analysis-model anthropic.claude-haiku-4-5
 ```
+
+Which model runs which stage, and what to change for a real engagement:
+[docs/MODELS.md](docs/MODELS.md).
 
 ## What it replaces
 
@@ -473,22 +485,34 @@ so a projection matches what a run does:
 |---|---|---|---|
 | `--router-model` | router | `claude-opus-4-8` | frontier (half the price of fable-5) |
 | `--expert-model` | scenarios | `claude-opus-4-8` | frontier |
-| `--triage-model` | triage | `claude-sonnet-4-6` | mid |
-| `--chains-model` | chains | `claude-sonnet-4-6` | mid |
+| `--triage-model` | triage | `claude-sonnet-4-6` | high |
+| `--chains-model` | chains | `claude-sonnet-4-6` | high |
 | `--analysis-model` | PoC (and chains fallback) | `claude-haiku-4-5` | economy |
 | `--effort` | phases that accept one | `low` | the cheapest lever on spend and time |
 
+The tier column is the *model's*, and triage's task profile asks for `mid` — of
+which nothing is catalogued — so `plan` warns that triage is a tier above what
+it needs. That is a warning about spending slightly more than the task requires,
+never less, and the run is unaffected.
+
 Chains is split from PoC on purpose: it is cross-finding reasoning — genuinely
-hard, but only one call per service — so a mid-tier model there costs almost
+hard, but only one call per service — so a higher tier there costs almost
 nothing, whereas PoC is the batch stage and stays on the economy tier. Set
 `--chains-model` to move just chains; `--analysis-model` still covers both when
 `--chains-model` is left unset.
 
-Override any of them with the matching flag, or set `--model` to force one
-deployment across every phase. Pass `--effort ''` to send no effort level at
+Override any of them with the matching flag. **`--model` does not override
+them** — a per-task flag with a default is still a per-task flag, and it wins.
+To force one deployment across every phase, name it in each flag, or clear them
+(`--router-model "" --expert-model "" …`) so `--model` becomes the fallback it
+was before the defaults existed. Pass `--effort ''` to send no effort level at
 all. These defaults are a CLI convenience only: the library `Policy` keeps its
 empty defaults and refuses to start without a model named, so a programmatic
 caller is still held to naming one.
+
+[docs/MODELS.md](docs/MODELS.md) is the full register: every dispatch site, the
+default and recommended allocations drawn as dataflows, the per-family request
+quirks, the priced catalogue, and every stage that deliberately calls no model.
 
 ## Two detection passes, from two vendors
 

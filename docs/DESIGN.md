@@ -4,7 +4,9 @@ Architecture and rationale for `codescan-engagement` — the unattended driver
 that turns scenario-first whitebox review into a scheduled, budgeted, portable
 service.
 
-For deployment topology see [DEPLOYMENT.md](DEPLOYMENT.md).
+For deployment topology see [DEPLOYMENT.md](DEPLOYMENT.md). For which model runs
+which stage — default and recommended, with the dataflows — see
+[MODELS.md](MODELS.md).
 
 ## What this is, and what it deliberately is not
 

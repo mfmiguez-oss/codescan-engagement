@@ -122,10 +122,21 @@ docker run --rm \
   -e ENGAGEMENT_PROVIDER=bedrock \
   -e BEDROCK_REGION=us-east-1 \
   -e BEDROCK_INFERENCE_GEO=us \
-  -e ENGAGEMENT_MODEL=anthropic.claude-opus-5 \
   -v "$PWD/workspace:/workspace" \
-  codescan-engagement:local run acme run-001 --workspace /workspace
+  codescan-engagement:local run acme run-001 --workspace /workspace \
+    --router-model anthropic.claude-opus-5 \
+    --expert-model anthropic.claude-opus-5 \
+    --triage-model anthropic.claude-sonnet-5 \
+    --chains-model anthropic.claude-sonnet-5 \
+    --analysis-model anthropic.claude-haiku-4-5
 ```
+
+**Name the deployments per task on Bedrock.** `ENGAGEMENT_MODEL` is a *fallback*
+for a per-task flag that is unset, and on `run` those flags always carry a CLI
+default — Foundry-style ids such as `claude-opus-4-8`, which a Bedrock account
+does not serve. Preflight refuses the run rather than failing at dispatch, but
+the cause reads as a missing deployment rather than as configuration that never
+applied. See [MODELS.md §5](MODELS.md#5-how-a-deployment-is-chosen-in-order).
 
 For a scheduled deployment: ECS Fargate task on an EventBridge schedule, an
 IAM task role granting `bedrock:InvokeModel` and `bedrock:Converse` plus S3
@@ -147,7 +158,7 @@ standalone stack.
 | Variable | Meaning |
 |---|---|
 | `ENGAGEMENT_PROVIDER` | `foundry` or `bedrock`. Required only when both are configured |
-| `ENGAGEMENT_MODEL` | Default deployment for every phase |
+| `ENGAGEMENT_MODEL` | Fallback deployment for any phase whose per-task flag is unset. On `run`/`plan`/`preflight` those flags carry CLI defaults, so this reaches only `draft-poc` and `console` unless the flags are cleared |
 | `FOUNDRY_RESOURCE` / `FOUNDRY_API_KEY` | Foundry resource and key (prefer managed identity) |
 | `FOUNDRY_BASE_URL` | Override the OpenAI-compatible base |
 | `BEDROCK_REGION` / `AWS_REGION` | Bedrock region; the marker that Bedrock is configured |

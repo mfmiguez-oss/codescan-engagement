@@ -253,6 +253,10 @@ backlog shape, dollars from the published per-token rates, and a warning when a
 deployment sits below (or wastefully above) its task's tier. A deployment with
 no published rate is reported **unpriced** rather than assigned a guessed rate.
 
+Which model each of those stages actually reaches — the default allocation, the
+recommended one, and the per-family quirks of the request itself — is
+[docs/MODELS.md](MODELS.md).
+
 ---
 
 ## 6. Artifacts

@@ -249,6 +249,42 @@ def test_a_run_checks_by_default() -> None:
     assert args.no_preflight is False
 
 
+def test_dash_dash_model_does_not_override_the_per_task_defaults() -> None:
+    """The consequence of shipping CLI defaults, pinned because it surprises
+    people and costs money when it does.
+
+    `deployments_for` resolves a per-task name ahead of the shared one, and on
+    `run`/`plan`/`preflight` every per-task flag carries a default — so the
+    shared flag is a fallback that nothing ever falls back to. Someone reading
+    `--model gpt-5-mini` reasonably expects the run to use it, and it does not.
+    Documented in docs/MODELS.md §5; if this assertion ever flips, that section
+    is what has to change with it.
+    """
+    args = cli._build_parser().parse_args(["preflight", "--model", "gpt-5-mini"])
+    wanted = deployments_for(
+        model=args.model,
+        router_model=args.router_model,
+        expert_model=args.expert_model,
+        triage_model=args.triage_model,
+        analysis_model=args.analysis_model,
+        chains_model=args.chains_model,
+    )
+
+    assert "gpt-5-mini" not in wanted.values()
+    assert wanted["router"] == cli.DEFAULT_ROUTER_MODEL
+
+
+def test_clearing_a_per_task_flag_is_what_lets_dash_dash_model_through() -> None:
+    """The documented escape hatch, so the instruction in MODELS.md §5 is a
+    tested one rather than a plausible one."""
+    args = cli._build_parser().parse_args(
+        ["preflight", "--model", "gpt-5-mini", "--router-model", ""]
+    )
+    wanted = deployments_for(model=args.model, router_model=args.router_model)
+
+    assert wanted["router"] == "gpt-5-mini"
+
+
 # -- the report model --------------------------------------------------------
 
 

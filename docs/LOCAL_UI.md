@@ -58,7 +58,7 @@ generic `local operator`, which makes the log much less useful later.
 | `--host` | `127.0.0.1` | Keep it on loopback locally — see the dev-token rule below. |
 | `--port` | `8000` | |
 | `--dev-token` | off | Accept this one string as a local analyst **and** approver. |
-| `--model` | off | Deployment for on-request PoC drafting. Omitted, drafting is off and the button does nothing. |
+| `--model` | off | Deployment for on-request PoC drafting. Omitted, drafting is off and the button does nothing. It is also passed to runs started with `--allow-runs`, where the per-task defaults override it — see [MODELS.md](MODELS.md#5-how-a-deployment-is-chosen-in-order). |
 | `--decisions` | `<run_dir>/decisions.jsonl` | Where decisions are appended. |
 | `--allow-runs` | off | Let a signed-in scanner start scans from the browser. |
 | `--run-max-calls` | `200` | Ceiling for a run started that way. |

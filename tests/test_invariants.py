@@ -14,10 +14,20 @@ import sys
 import tomllib
 from pathlib import Path
 
+from engagement.cli import (
+    DEFAULT_ANALYSIS_MODEL,
+    DEFAULT_CHAINS_MODEL,
+    DEFAULT_EXPERT_MODEL,
+    DEFAULT_ROUTER_MODEL,
+    DEFAULT_TRIAGE_MODEL,
+)
+from engagement.models import CATALOGUE, bare_model_id
+
 ROOT = Path(__file__).resolve().parent.parent
 THREATMODEL = ROOT / "docs" / "THREATMODEL.md"
 OUTPUTS = ROOT / "docs" / "OUTPUTS.md"
 FRAMEWORKS = ROOT / "docs" / "SECURITY_FRAMEWORKS.md"
+MODELS_DOC = ROOT / "docs" / "MODELS.md"
 PYPROJECT = ROOT / "pyproject.toml"
 TESTS_DIR = Path(__file__).parent
 SRC_DIR = ROOT / "src" / "engagement"
@@ -204,6 +214,97 @@ def test_documented_install_commands_name_extras_that_exist() -> None:
                     if name and name not in declared:
                         wrong.append(f"{path.name}:{number} installs '.[{name}]'")
     assert not wrong, f"installs naming extras that do not exist: {wrong}"
+
+
+#: The "short answer" table in MODELS.md — task, default deployment, tier.
+_MODEL_DEFAULT_ROW = re.compile(
+    r"^\|\s*`(router|scenarios|triage|chains|poc)`\s*\|\s*`([a-z0-9.\-]+)`\s*\|\s*(\w+)\s*\|"
+)
+
+#: The priced-catalogue table — deployment, tier, input rate, output rate.
+_MODEL_RATE_ROW = re.compile(
+    r"^\|\s*`([a-z0-9.\-]+)`\s*\|\s*(\w+)\s*\|\s*\$([\d.]+)\s*\|\s*\$([\d.]+)\s*\|"
+)
+
+
+def test_the_model_register_names_the_defaults_the_cli_actually_ships() -> None:
+    """MODELS.md tells a reader which model runs which stage, and that is the
+    one doc claim nobody can check by reading the output of a run — the model
+    name never appears in a finding. So it is checked here instead: a default
+    changed in `cli.py` without the register following is caught at the gate.
+    """
+    shipped = {
+        "router": DEFAULT_ROUTER_MODEL,
+        "scenarios": DEFAULT_EXPERT_MODEL,
+        "triage": DEFAULT_TRIAGE_MODEL,
+        "chains": DEFAULT_CHAINS_MODEL,
+        "poc": DEFAULT_ANALYSIS_MODEL,
+    }
+    documented: dict[str, tuple[str, str]] = {}
+    for line in MODELS_DOC.read_text(encoding="utf-8").splitlines():
+        match = _MODEL_DEFAULT_ROW.match(line.strip())
+        if match:
+            documented[match.group(1)] = (match.group(2), match.group(3))
+    assert set(documented) == set(shipped), (
+        f"MODELS.md documents defaults for {sorted(documented)}, but the CLI "
+        f"ships {sorted(shipped)}"
+    )
+    wrong: list[str] = []
+    for task, (deployment, tier) in documented.items():
+        if deployment != shipped[task]:
+            wrong.append(f"{task}: documented {deployment}, ships {shipped[task]}")
+        spec = CATALOGUE.get(deployment)
+        # A default that is not in the catalogue is a separate failure — the
+        # projection cannot price it — and the next test is the one that says so.
+        if spec is not None and spec.tier.value != tier:
+            wrong.append(f"{task}: documented tier {tier}, catalogue says {spec.tier.value}")
+    assert not wrong, f"MODELS.md disagrees with the code: {wrong}"
+
+
+def test_the_model_register_prices_match_the_catalogue() -> None:
+    """The rate table is the one part of the register a reader turns into a
+    budget. A rate that drifted from `CATALOGUE` would not make a run fail —
+    it would make a projection an operator already trusted quietly wrong.
+    """
+    text = MODELS_DOC.read_text(encoding="utf-8")
+    priced: dict[str, tuple[str, float, float]] = {}
+    for line in text.splitlines():
+        match = _MODEL_RATE_ROW.match(line.strip())
+        if match:
+            priced[match.group(1)] = (
+                match.group(2),
+                float(match.group(3)),
+                float(match.group(4)),
+            )
+    assert set(priced) == set(CATALOGUE), (
+        f"the rate table lists {sorted(priced)}; the catalogue holds {sorted(CATALOGUE)}"
+    )
+    wrong = [
+        f"{name}: documented {tier}/${inp}/${out}, catalogue says "
+        f"{CATALOGUE[name].tier.value}/${CATALOGUE[name].input_per_mtok}/"
+        f"${CATALOGUE[name].output_per_mtok}"
+        for name, (tier, inp, out) in priced.items()
+        if (tier, inp, out)
+        != (
+            CATALOGUE[name].tier.value,
+            CATALOGUE[name].input_per_mtok,
+            CATALOGUE[name].output_per_mtok,
+        )
+    ]
+    assert not wrong, f"MODELS.md rates have drifted: {wrong}"
+
+
+def test_every_model_the_register_recommends_can_be_priced() -> None:
+    """A recommendation the projection cannot cost is a recommendation whose
+    bill an operator finds out about afterwards. Every Claude deployment named
+    in the register has to be one `engagement plan` can put a number against.
+    """
+    named = set(re.findall(r"`((?:[a-z]+\.)*claude-[a-z0-9\-]+)`", MODELS_DOC.read_text("utf-8")))
+    unpriced = sorted(name for name in named if bare_model_id(name) not in CATALOGUE)
+    assert not unpriced, (
+        f"MODELS.md names {unpriced}, which the catalogue cannot price — add a "
+        "ModelSpec or stop recommending it"
+    )
 
 
 def test_the_triage_backbone_needs_nothing_the_base_install_lacks() -> None:

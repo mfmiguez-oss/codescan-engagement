@@ -61,10 +61,10 @@ EXIT_ERROR = 1
 EXIT_CONFIG = 2
 EXIT_INCOMPLETE = 3
 
-#: CLI-layer default model allocation: a deliberately cheap frontier/mid/economy
+#: CLI-layer default model allocation: a deliberately cheap frontier/high/economy
 #: split so a plain ``engagement scan`` runs at a sensible cost without the
 #: operator naming a deployment per phase. Router and scenarios get a frontier
-#: model (opus-4-8, half the price of fable-5), triage and chains a mid one, and
+#: model (opus-4-8, half the price of fable-5), triage and chains a high one, and
 #: the batched PoC drafting stage the economy tier. Chains is separated from PoC
 #: because it is cross-finding reasoning — hard, but rare (one call per service)
 #: — so a higher tier there costs almost nothing, whereas PoC is the batch
@@ -104,7 +104,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--workspace", type=Path, required=True, help="OpenHack workspace root."
     )
-    run.add_argument("--model", default="", help="Deployment for every phase.")
+    run.add_argument(
+        "--model",
+        default="",
+        help="Fallback deployment for any phase whose per-task flag is empty. "
+        "The per-task flags below carry defaults, so this does NOT override "
+        "them — clear one with '' to make this apply to that phase.",
+    )
     run.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
     run.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
     run.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
@@ -289,7 +295,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "preflight",
         help="Check that every configured deployment exists, before spending.",
     )
-    pre.add_argument("--model", default="", help="Deployment for every phase.")
+    pre.add_argument(
+        "--model",
+        default="",
+        help="Fallback for a per-task flag left empty; the defaults below win.",
+    )
     pre.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
     pre.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
     pre.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
@@ -394,7 +404,12 @@ def _build_parser() -> argparse.ArgumentParser:
     poc.set_defaults(func=_cmd_draft_poc)
 
     plan = sub.add_parser("plan", help="Show the model allocation and projected spend.")
-    plan.add_argument("--model", default="", help="Deployment for every task.")
+    plan.add_argument(
+        "--model",
+        default="",
+        help="Fallback for a per-task flag left empty; the defaults below win. "
+        "Mirrors `run` exactly, so a projection matches what a run does.",
+    )
     plan.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
     plan.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
     plan.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
