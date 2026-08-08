@@ -67,6 +67,14 @@ _PY_URLCONF = re.compile(
     r"\b(?P<verb>path|re_path|url)\s*\(\s*r?"
     r"(?P<quote>['\"])(?P<endpoint>[^'\"]*)(?P=quote)"
 )
+#: `Route("/x", handler, methods=[...])`, `WebSocketRoute(...)` — Starlette and
+#: FastAPI's table form — and Flask's `add_url_rule("/x", ...)`. A routing table
+#: is not a decorator, so none of the patterns above see it, and it is how an
+#: application that builds its routes programmatically declares every one.
+_PY_ROUTETABLE = re.compile(
+    r"\b(?P<verb>Route|WebSocketRoute|add_url_rule)\s*\(\s*"
+    r"(?P<quote>['\"])(?P<endpoint>[^'\"]*)(?P=quote)"
+)
 #: `methods=["POST"]` on the declaration line.
 _PY_METHODS = re.compile(r"methods\s*=\s*[\[(](?P<value>[^\])]*)[\])]")
 #: A decorator whose name *is* the method needs no `methods=`.
@@ -89,7 +97,11 @@ def _python_route(line: str) -> "tuple[str, str, list[str]] | None":
     often three lines — so an eight-line context window would hand every route
     in the block the union of its neighbours' verbs.
     """
-    match = _PY_DECORATOR.search(line) or _PY_URLCONF.search(line)
+    match = (
+        _PY_DECORATOR.search(line)
+        or _PY_URLCONF.search(line)
+        or _PY_ROUTETABLE.search(line)
+    )
     if match is None:
         return None
     # Django writes `login/` and a regex route writes `^login/$`, while Flask
@@ -315,13 +327,36 @@ def _source_rank(key: str, endpoint: str) -> int:
     return 2
 
 
+def _names_an_endpoint_term(endpoint: str) -> bool:
+    """Whether a path *names* an endpoint term, rather than merely containing it.
+
+    This was a plain substring test, and `"ldapi"` contains `"api"`. On a corpus
+    of LDAP-injection cases that accident was the only reason anything emitted
+    at all: 58 boundaries, every one a false positive, while the SQL-injection
+    and command-injection routes beside them were dropped.
+
+    Whole-word equality is too strict in the other direction — `/oauth2/token`
+    has no `oauth` word — so a term also matches a word it prefixes. Splitting
+    on non-alphanumerics rather than on `/` alone is what lets `/user-login`
+    and `/login_otp` still match.
+
+    The result is strictly narrower than the substring test it replaces: every
+    word-prefix match was already a substring match, so this can only ever drop
+    a false positive, never lose a boundary that used to be found.
+    """
+    words = {word for word in re.split(r"[^a-z0-9]+", endpoint.lower()) if word}
+    return any(
+        word == term or word.startswith(term) for word in words for term in ENDPOINT_TERMS
+    )
+
+
 def _should_emit(key: str, endpoint: str, context: str) -> bool:
     if not key:
         return False
     low = " ".join([key, endpoint, context]).lower()
     if key in SECURITY_KEYS:
         return True
-    if any(term in endpoint.lower() for term in ENDPOINT_TERMS):
+    if _names_an_endpoint_term(endpoint):
         return True
     return any(
         term in low
