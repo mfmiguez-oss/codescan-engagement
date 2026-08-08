@@ -73,6 +73,7 @@ def test_every_run_flag_is_read_somewhere_in_the_command() -> None:
         "chains",
         "pocs",
         "analysis_model",
+        "chains_model",
         "lifecycle_feed",
         "inventory",
         "siem",
@@ -204,6 +205,7 @@ def test_every_detail_the_lifecycle_event_emits_is_allowed_out() -> None:
 
 def test_analysis_without_a_deployment_reports_rather_than_guessing() -> None:
     args = _run_args("--chains")
+    args.chains_model = ""  # type: ignore[attr-defined]
     args.analysis_model = ""  # type: ignore[attr-defined]
     args.model = ""  # type: ignore[attr-defined]
 

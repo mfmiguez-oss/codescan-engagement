@@ -562,6 +562,7 @@ def analyse(
     want_chains: bool = True,
     want_pocs: bool = True,
     signals: SignalReport | None = None,
+    chains_deployment: str = "",
 ) -> AnalysisSummary:
     """Run the advisory stages over a scored queue.
 
@@ -576,6 +577,10 @@ def analyse(
     drafted for, and it cannot be if selection runs against a pre-enrichment
     score. ``signals`` is where those chaining counts are recorded when the
     caller is keeping a tally.
+
+    ``chains_deployment`` routes the chain stage to its own model; empty falls
+    back to ``deployment``, so a caller that wants one model for both passes only
+    ``deployment``. PoC drafting always uses ``deployment``.
     """
     summary = AnalysisSummary()
     if not findings:
@@ -584,7 +589,9 @@ def analyse(
 
     before = dispatcher.ledger.calls
     if want_chains:
-        summary.chains = ChainEngine(dispatcher, deployment).find(findings, summary)
+        summary.chains = ChainEngine(
+            dispatcher, chains_deployment or deployment
+        ).find(findings, summary)
         # applied here rather than by the caller afterwards, because "afterwards"
         # is too late to change what the next stage selects — and applying it
         # twice would double-count, so this is the one place that may

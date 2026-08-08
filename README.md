@@ -465,6 +465,31 @@ configured deployment sits below (or wastefully above) its task's tier. A
 deployment with no published rate is reported as **unpriced** rather than
 assigned a guessed one.
 
+**The per-phase flags default to a cheap allocation**, so a plain run needs no
+deployment named at all — and `run`, `preflight`, and `plan` share the defaults,
+so a projection matches what a run does:
+
+| Flag | Phases | Default | Tier |
+|---|---|---|---|
+| `--router-model` | router | `claude-opus-4-8` | frontier (half the price of fable-5) |
+| `--expert-model` | scenarios | `claude-opus-4-8` | frontier |
+| `--triage-model` | triage | `claude-sonnet-4-6` | mid |
+| `--chains-model` | chains | `claude-sonnet-4-6` | mid |
+| `--analysis-model` | PoC (and chains fallback) | `claude-haiku-4-5` | economy |
+| `--effort` | phases that accept one | `low` | the cheapest lever on spend and time |
+
+Chains is split from PoC on purpose: it is cross-finding reasoning — genuinely
+hard, but only one call per service — so a mid-tier model there costs almost
+nothing, whereas PoC is the batch stage and stays on the economy tier. Set
+`--chains-model` to move just chains; `--analysis-model` still covers both when
+`--chains-model` is left unset.
+
+Override any of them with the matching flag, or set `--model` to force one
+deployment across every phase. Pass `--effort ''` to send no effort level at
+all. These defaults are a CLI convenience only: the library `Policy` keeps its
+empty defaults and refuses to start without a model named, so a programmatic
+caller is still held to naming one.
+
 ## Two detection passes, from two vendors
 
 ```bash

@@ -220,6 +220,7 @@ def deployments_for(
     expert_model: str = "",
     triage_model: str = "",
     analysis_model: str = "",
+    chains_model: str = "",
     second_model: str = "",
 ) -> dict[str, str]:
     """Every deployment a run could reach, keyed by the task that reaches it.
@@ -228,12 +229,16 @@ def deployments_for(
     second detection pass that fails at dispatch has already cost the first
     pass, and finding out at the end is the failure preflight exists to move to
     the beginning.
+
+    Chains resolves to ``chains_model`` first, then ``analysis_model``, then the
+    shared model — so a run may spend a higher tier on the cross-finding
+    reasoning while PoC drafting stays on the cheap ``analysis_model``.
     """
     resolved = {
         Task.router.value: router_model or model,
         Task.scenarios.value: expert_model or model,
         Task.triage.value: triage_model or model,
-        Task.chains.value: analysis_model or model,
+        Task.chains.value: chains_model or analysis_model or model,
         Task.poc.value: analysis_model or model,
     }
     if second_model.strip():

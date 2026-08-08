@@ -61,6 +61,27 @@ EXIT_ERROR = 1
 EXIT_CONFIG = 2
 EXIT_INCOMPLETE = 3
 
+#: CLI-layer default model allocation: a deliberately cheap frontier/mid/economy
+#: split so a plain ``engagement scan`` runs at a sensible cost without the
+#: operator naming a deployment per phase. Router and scenarios get a frontier
+#: model (opus-4-8, half the price of fable-5), triage and chains a mid one, and
+#: the batched PoC drafting stage the economy tier. Chains is separated from PoC
+#: because it is cross-finding reasoning — hard, but rare (one call per service)
+#: — so a higher tier there costs almost nothing, whereas PoC is the batch
+#: stage. These live here, not on :class:`~engagement.driver.Policy`: the Policy
+#: object stays "loud on omission" for library and test callers, while the CLI
+#: ships an opinionated default. Override any of them with the matching flag, or
+#: with --model for all phases. Shared across run/preflight/plan so a projection
+#: matches what a run does.
+DEFAULT_ROUTER_MODEL = "claude-opus-4-8"
+DEFAULT_EXPERT_MODEL = "claude-opus-4-8"
+DEFAULT_TRIAGE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CHAINS_MODEL = "claude-sonnet-4-6"
+DEFAULT_ANALYSIS_MODEL = "claude-haiku-4-5"
+#: Effort level, the cheapest lever on both spend and wall clock. Silently
+#: omitted for families that reject it (Haiku 4.5, Sonnet 4.5).
+DEFAULT_EFFORT = "low"
+
 #: Provider group or app-role values mapped to this system's roles. Duplicated
 #: from `asgi` rather than shared because the two entrypoints serve different
 #: deployments and one changing its directory should not silently change the
@@ -84,9 +105,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workspace", type=Path, required=True, help="OpenHack workspace root."
     )
     run.add_argument("--model", default="", help="Deployment for every phase.")
-    run.add_argument("--router-model", default="")
-    run.add_argument("--expert-model", default="")
-    run.add_argument("--triage-model", default="")
+    run.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
+    run.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
+    run.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
     run.add_argument(
         "--expert", action="append", default=[], help="Scope recon to this expert; repeatable."
     )
@@ -142,12 +163,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--effort",
-        default="",
+        default=DEFAULT_EFFORT,
         choices=["", *sorted(EFFORT_LEVELS)],
         help=(
             "Effort level, the cheapest lever on both spend and wall clock. "
             "Silently omitted for families that reject it (Haiku 4.5, "
-            "Sonnet 4.5), where sending it would fail the call."
+            "Sonnet 4.5), where sending it would fail the call. Pass "
+            "--effort '' to send nothing."
         ),
     )
     run.add_argument("--no-sarif", action="store_true")
@@ -176,9 +198,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "Never executed. Anything below critical: see the draft-poc command.",
     )
     run.add_argument(
+        "--chains-model",
+        default=DEFAULT_CHAINS_MODEL,
+        help="Deployment for --chains. Falls back to --analysis-model, then "
+        "--model. Separated because chains is hard but rare; PoC is the batch "
+        "stage.",
+    )
+    run.add_argument(
         "--analysis-model",
-        default="",
-        help="Deployment for --chains and --pocs (default: --model).",
+        default=DEFAULT_ANALYSIS_MODEL,
+        help="Deployment for --pocs (and the --chains fallback if "
+        "--chains-model is unset).",
     )
     run.add_argument(
         "--lifecycle-feed",
@@ -260,10 +290,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Check that every configured deployment exists, before spending.",
     )
     pre.add_argument("--model", default="", help="Deployment for every phase.")
-    pre.add_argument("--router-model", default="")
-    pre.add_argument("--expert-model", default="")
-    pre.add_argument("--triage-model", default="")
-    pre.add_argument("--analysis-model", default="")
+    pre.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
+    pre.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
+    pre.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
+    pre.add_argument("--chains-model", default=DEFAULT_CHAINS_MODEL)
+    pre.add_argument("--analysis-model", default=DEFAULT_ANALYSIS_MODEL)
     pre.add_argument("--second-model", default="")
     pre.set_defaults(func=_cmd_preflight)
 
@@ -364,10 +395,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="Show the model allocation and projected spend.")
     plan.add_argument("--model", default="", help="Deployment for every task.")
-    plan.add_argument("--router-model", default="")
-    plan.add_argument("--expert-model", default="")
-    plan.add_argument("--triage-model", default="")
-    plan.add_argument("--analysis-model", default="")
+    plan.add_argument("--router-model", default=DEFAULT_ROUTER_MODEL)
+    plan.add_argument("--expert-model", default=DEFAULT_EXPERT_MODEL)
+    plan.add_argument("--triage-model", default=DEFAULT_TRIAGE_MODEL)
+    plan.add_argument("--chains-model", default=DEFAULT_CHAINS_MODEL)
+    plan.add_argument("--analysis-model", default=DEFAULT_ANALYSIS_MODEL)
     plan.add_argument("--scenarios", type=int, default=0)
     plan.add_argument("--candidates", type=int, default=0)
     plan.add_argument("--services", type=int, default=1)
@@ -444,6 +476,7 @@ def _cmd_preflight(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         expert_model=args.expert_model,
         triage_model=args.triage_model,
         analysis_model=args.analysis_model,
+        chains_model=args.chains_model,
         second_model=args.second_model,
     )
     if not deployments:
@@ -737,7 +770,7 @@ def _cmd_plan(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         Task.router.value: args.router_model or shared,
         Task.scenarios.value: args.expert_model or shared,
         Task.triage.value: args.triage_model or shared,
-        Task.chains.value: args.analysis_model or shared,
+        Task.chains.value: args.chains_model or args.analysis_model or shared,
         Task.poc.value: args.analysis_model or shared,
     }
     plan = build_plan(
@@ -870,6 +903,7 @@ def _cmd_run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
                 expert_model=policy.expert_model,
                 triage_model=policy.triage_model,
                 analysis_model=args.analysis_model,
+                chains_model=args.chains_model,
                 second_model=policy.second_expert_model,
             ),
             quiet=True,
@@ -1188,23 +1222,31 @@ def _run_analysis(
     """Run the advisory stages, spending from the run's own ledger."""
     if not (args.chains or args.pocs):
         return None
-    deployment = args.analysis_model or args.model or ""
-    if not deployment:
+    poc_deployment = args.analysis_model or args.model or ""
+    chains_deployment = args.chains_model or poc_deployment
+    missing: list[str] = []
+    if args.chains and not chains_deployment:
+        missing.append("--chains")
+    if args.pocs and not poc_deployment:
+        missing.append("--pocs")
+    if missing:
         return AnalysisSummary(
             warnings=[
-                "analysis: no deployment for --chains/--pocs — pass --analysis-model "
+                "analysis: no deployment for "
+                f"{'/'.join(missing)} — pass --chains-model, --analysis-model, "
                 "or --model. Nothing was analysed"
             ]
         )
     result = analyse(
         summary.queue,
         dispatcher=driver.dispatcher,
-        deployment=deployment,
+        deployment=poc_deployment,
         out_dir=run_dir,
         repo=repo,
         want_chains=args.chains,
         want_pocs=args.pocs,
         signals=signals,
+        chains_deployment=chains_deployment,
     )
     audit_log.record(
         "analysis_finished",
