@@ -53,6 +53,110 @@ def test_an_unchecked_result_says_so_rather_than_claiming_a_pass() -> None:
     assert "not known to be misconfigured" in lines
 
 
+# -- a listing is not evidence -----------------------------------------------
+
+
+def test_a_listed_model_the_resource_will_not_serve_is_still_missing() -> None:
+    """The failure this exists for. Foundry's listing is the region *catalog*,
+    not an inventory of what is deployed, and the records are identical either
+    way — so `claude-sonnet-5` was reported available among 382 and then 404'd
+    at the router call with recon already paid for. Without the confirmation
+    step this check could not fail on a real name at all."""
+    listed = [*SERVED, "claude-sonnet-5"]
+
+    optimistic = check({"scenarios": "claude-sonnet-5"}, listed)
+    assert optimistic.ok, "precondition: the listing accepts it"
+
+    report = check(
+        {"scenarios": "claude-sonnet-5"},
+        listed,
+        confirm=lambda name: name != "claude-sonnet-5",
+    )
+    assert not report.ok
+    assert report.missing == ["claude-sonnet-5"]
+    assert report.wanted_by == {"claude-sonnet-5": ["scenarios"]}
+    assert any("catalog" in w for w in report.warnings)
+
+
+def test_a_probe_that_cannot_answer_leaves_the_listing_standing() -> None:
+    """A 401, a 429 or a timeout says nothing about whether a deployment
+    exists. Reading unknown as absent would refuse runs whose inference works —
+    the same collapse this module refuses everywhere else."""
+    report = check({"scenarios": "claude-opus-5"}, SERVED, confirm=lambda _: None)
+
+    assert report.ok
+    assert report.missing == []
+
+
+def test_a_name_the_listing_already_refused_is_not_probed() -> None:
+    """It is already known-missing, so a probe spends a call to learn nothing."""
+    asked: list[str] = []
+
+    def confirm(name: str) -> bool | None:
+        asked.append(name)
+        return True
+
+    check({"scenarios": "claude-opus-9", "triage": "gpt-5-mini"}, SERVED, confirm)
+    assert asked == ["gpt-5-mini"]
+
+
+def test_one_model_wanted_by_several_tasks_is_probed_once() -> None:
+    """The answer is a property of the deployment, not of the task asking, and
+    one probe per task would scale the check with the routing table."""
+    asked: list[str] = []
+
+    def confirm(name: str) -> bool | None:
+        asked.append(name)
+        return True
+
+    check(
+        {"router": "claude-opus-5", "scenarios": "claude-opus-5", "triage": "gpt-5-mini"},
+        SERVED,
+        confirm,
+    )
+    assert sorted(asked) == ["claude-opus-5", "gpt-5-mini"]
+    assert len(asked) == 2
+
+
+def test_every_task_wanting_a_refuted_model_is_named() -> None:
+    """The report has to say which tasks are affected, or the operator fixes one
+    flag and hits the same wall on the next phase."""
+    report = check(
+        {"router": "claude-opus-5", "scenarios": "claude-opus-5"},
+        SERVED,
+        confirm=lambda _: False,
+    )
+    assert report.wanted_by == {"claude-opus-5": ["router", "scenarios"]}
+
+
+def test_a_refused_model_is_not_offered_as_its_own_alternative() -> None:
+    """"`claude-sonnet-5` is not served — try claude-sonnet-5" is what this
+    printed live, because `available` is the listing and a probe-refused name is
+    still in it."""
+    report = check(
+        {"scenarios": "claude-sonnet-5"},
+        [*SERVED, "claude-sonnet-4-6", "claude-sonnet-5"],
+        confirm=lambda name: name != "claude-sonnet-5",
+    )
+    near = report.near_misses()
+    assert "claude-sonnet-5" not in near, "refused model offered as its own fix"
+    assert "claude-sonnet-4-6" in near, "the real alternative went missing too"
+
+
+def test_the_cli_second_guesses_the_listing_through_the_provider() -> None:
+    """Wiring, not logic: the confirmation is worth nothing if the CLI never
+    passes it. `FakeProvider.probes` stages a name the listing accepts and the
+    resource refuses."""
+    provider = FakeProvider(
+        deployments=[*SERVED, "claude-sonnet-5"],
+        probes={"claude-sonnet-5": False},
+    )
+    report = cli._run_preflight(provider, {"scenarios": "claude-sonnet-5"}, quiet=True)
+
+    assert not report.ok
+    assert report.missing == ["claude-sonnet-5"]
+
+
 def test_everything_present_is_a_clean_pass() -> None:
     report = check({"scenarios": "claude-opus-5", "triage": "gpt-5-mini"}, SERVED)
 

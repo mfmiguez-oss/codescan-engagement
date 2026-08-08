@@ -250,7 +250,7 @@ flowchart TB
   PROV -->|"both configured, none named"| STOP3["refused: never guess a bill"]:::stop
   PROV -->|"foundry"| PRE
   PROV -->|"bedrock"| PRE
-  PRE{"preflight: does the<br/>resource serve it?<br/><i>one listing call</i>"} -->|"absent"| STOP2["refused before anything is spent"]:::stop
+  PRE{"preflight: does the<br/>resource serve it?<br/><i>listing, then a one-token<br/>probe per name it accepts</i>"} -->|"absent"| STOP2["refused before anything is spent"]:::stop
   PRE -->|"present, or could not tell"| SURF{"surface"}
   SURF -->|"foundry"| F["claude-* → /anthropic/v1/messages<br/>codex → /openai/v1/responses<br/>else → /openai/v1/chat/completions"]:::ok
   SURF -->|"bedrock"| BR["Converse<br/><i>us./eu./apac. profile prefix applied once</i>"]:::ok
@@ -401,7 +401,8 @@ Three checks, in the order they are worth running:
 engagement plan --scenarios 24 --candidates 9 --services 3 --critical 6
 
 # 2. Does the resource actually serve every deployment the run would reach?
-#    One listing call, and it refuses before anything is spent.
+#    A listing call, plus one token-sized probe per name the listing accepts,
+#    and it refuses before anything else is spent.
 engagement preflight
 
 # 3. After the fact: every call, its phase, its deployment, its token counts
@@ -412,6 +413,15 @@ engagement export-siem runs/run-001/audit.jsonl --out model-calls.ecs.json
 run would otherwise reach only after the first pass had already been paid for.
 An empty deployment listing means *"could not tell"*, never *"serves nothing"*:
 the run proceeds and the report says the check was not made.
+
+**The listing alone cannot answer the question on Foundry.** `/openai/v1/models`
+returns the region catalog rather than this resource's deployments, and a served
+model and an unserved one carry identical records — same `status: "succeeded"`,
+same `capabilities.inference: true`. So preflight also asks for each accepted
+name directly, one token on the surface the run will use. Before that, the check
+could not fail: `claude-sonnet-5` was reported available among 382 and then 404'd
+at the router call. A 404 is absence; a 401, 429 or timeout is unknown, and
+unknown still proceeds.
 
 `audit.jsonl` is the record of record. Every dispatch writes the phase, the
 deployment, a prompt digest, token counts and the redactions applied — which is

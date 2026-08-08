@@ -285,6 +285,18 @@ engagement preflight --model claude-opus-5 --analysis-model claude-haiku-4-5
 
 It runs automatically before `engagement run`; `--no-preflight` skips it.
 
+**A listing is not evidence, so each name is also asked for directly.** On
+Foundry `/openai/v1/models` is the *catalog* of what the region offers, not an
+inventory of what this resource has deployed, and nothing in the payload
+separates them — a model that answers and one that 404s carry identical
+records, down to `status: "succeeded"` and `capabilities.inference: true`. For a
+while this check therefore could not fail: it reported *"every configured
+deployment is available (382 on the resource)"* for a model that then 404'd at
+the router call, with recon already paid for. Each name the listing accepts now
+gets a one-token call on the surface the run will use, which is the only
+question that distinguishes the two. A 404 is absence; a 401, a 429 or a
+timeout is **unknown**, and unknown still proceeds.
+
 **It reports availability and never acts on it.** The obvious next step —
 "the configured model is missing, so use one that is present" — is precisely
 what it does not do. A silent substitution changes both the bill and the queue

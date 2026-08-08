@@ -9,6 +9,21 @@ spent the calls it took to get there.
 This asks the provider what it serves and compares that against what the run
 intends to use, before anything is dispatched.
 
+## A listing is not always evidence
+
+On Foundry it is not. ``/openai/v1/models`` returns the *catalog* of what the
+region offers, not an inventory of what this resource has deployed, and the two
+cannot be told apart from the payload — a model that answers and one that 404s
+carry identical records, down to ``status: "succeeded"`` and
+``capabilities.inference: true``. So this check silently could not fail: it
+reported "every configured deployment is available (382 on the resource)" for a
+model that then 404'd at the router call, with recon already paid for.
+
+Hence ``confirm``: for each name the listing accepts, the provider is asked
+about that one deployment on the surface the run will use. A check that cannot
+fail is not a check, and here only the question the run itself asks can answer
+it. The cost is one token-sized call per distinct configured model.
+
 ## The one rule: report availability, never act on it
 
 The obvious next step — "the configured model is missing, so use one that is
@@ -35,7 +50,7 @@ must not collapse into each other.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from .contracts import StrictModel
 from .models import Task, bare_model_id, spec_for
@@ -134,16 +149,24 @@ class PreflightReport(StrictModel):
 
         Never a suggestion, and deliberately not sorted by similarity: this is
         a filtered view of what exists, not a ranked recommendation.
+
+        A missing name is excluded from its own alternatives. That reads as a
+        contradiction otherwise — "this is not served, try these" with the
+        refused name in the list — and it became reachable once a listed model
+        could be refused by probe: `available` is the listing, so a name the
+        resource does not serve is still in it.
         """
         stems = {_stem(name) for name in self.missing}
         stems.discard("")
         if not stems:
             return []
+        refused = set(self.missing)
         return [
             name
             for name in self.available
-            if any(_stem(name).startswith(stem) or stem.startswith(_stem(name))
-                   for stem in stems)
+            if name not in refused
+            and any(_stem(name).startswith(stem) or stem.startswith(_stem(name))
+                    for stem in stems)
         ][:MAX_LISTED]
 
 
@@ -164,11 +187,18 @@ def _matches(wanted: str, available: set[str], bare: set[str]) -> bool:
 def check(
     deployments: Mapping[str, str],
     available: list[str],
+    confirm: Callable[[str], bool | None] | None = None,
 ) -> PreflightReport:
     """Compare configured deployments against what a provider reported.
 
-    Pure: the network call belongs to the provider, so this half is testable
+    Pure: the network calls belong to the provider, so this half is testable
     offline and the same function serves Foundry, Bedrock and the fake.
+
+    ``confirm`` asks the provider about one deployment directly, and is what
+    makes this check able to fail at all on a provider whose listing is a
+    catalog rather than an inventory. Only names the listing *accepted* are
+    confirmed — a name already known-missing needs no second opinion, and
+    probing it would spend a call to re-learn what is already known.
     """
     named = {task: name.strip() for task, name in deployments.items() if name.strip()}
     if not available:
@@ -187,6 +217,18 @@ def check(
     for task, name in named.items():
         if not _matches(name, served, bare):
             wanted_by.setdefault(name, []).append(task)
+
+    refuted: list[str] = []
+    if confirm is not None:
+        # Each distinct name once, however many tasks want it: the answer is a
+        # property of the deployment, and one probe per task would multiply the
+        # cost of the check by the size of the routing table.
+        for name in sorted({n for n in named.values() if n not in wanted_by}):
+            if confirm(name) is False:
+                refuted.append(name)
+                for task, wanted in named.items():
+                    if wanted == name:
+                        wanted_by.setdefault(name, []).append(task)
 
     report = PreflightReport(
         available=sorted(served),
@@ -210,6 +252,12 @@ def check(
         report.warnings.append(
             f"preflight: no published rate for {', '.join(unpriced)} — the run "
             "will proceed and `engagement plan` cannot project its cost"
+        )
+    if refuted:
+        report.warnings.append(
+            f"preflight: {', '.join(refuted)} appears in the provider's listing "
+            "but the resource does not serve it. The listing is a catalog of "
+            "what the region offers, not an inventory of what is deployed here"
         )
     return report
 

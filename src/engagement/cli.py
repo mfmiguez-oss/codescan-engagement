@@ -474,7 +474,12 @@ def _run_preflight(
     quiet: bool = False,
 ) -> PreflightReport:
     """Ask the provider what it serves and report against what is configured."""
-    report = preflight_check(deployments, provider.list_deployments())
+    # `serves` is duck-typed rather than required: a provider written against
+    # the older protocol still preflights, it just cannot have its listing
+    # second-guessed. Missing means unknown, which is the same reading an
+    # unreachable listing already gets.
+    confirm = getattr(provider, "serves", None)
+    report = preflight_check(deployments, provider.list_deployments(), confirm)
     if not quiet:
         for line in report.describe():
             print(line, file=sys.stderr if not report.ok else sys.stdout)

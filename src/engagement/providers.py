@@ -37,6 +37,12 @@ PROVIDERS = ("foundry", "bedrock")
 #: working normally, the second one discarding 39 paid-for chunk answers.
 READ_TIMEOUT_SECONDS = 600.0
 
+#: Deadline for a preflight probe. Short on purpose, and unrelated to the
+#: dispatch deadline above: a probe asks for one token, so a resource that has
+#: not answered in this long is not generating — and a preflight that can hang
+#: for ten minutes is one an operator turns off.
+PROBE_TIMEOUT_SECONDS = 30.0
+
 
 class ProviderTimeout(RuntimeError):
     """The stream went silent for :data:`READ_TIMEOUT_SECONDS`.
@@ -256,6 +262,19 @@ class ModelProvider(Protocol):
         """
         ...
 
+    def serves(self, deployment: str) -> bool | None:
+        """Whether this provider will actually answer for one deployment.
+
+        ``True`` served, ``False`` known-absent, ``None`` could not tell — the
+        same three-way distinction :meth:`list_deployments` carries, per name.
+
+        This exists because on some providers a listing is not evidence. It is
+        the only thing that separates "the catalog offers this model in this
+        region" from "this resource will answer for it", and a preflight built
+        on the first cannot fail.
+        """
+        ...
+
 
 class ProviderError(RuntimeError):
     """Configuration that would produce a silently degraded run."""
@@ -430,8 +449,62 @@ class FoundryProvider:
         against the egress allowlist without a network call."""
         return f"{self._openai_base}/models"
 
+    def serves(self, deployment: str) -> bool | None:
+        """Ask the resource, on the surface the run will use, for one model.
+
+        **On Foundry a listing cannot answer this.** ``/openai/v1/models``
+        returns the region *catalog*, not what this resource has deployed, and
+        the two are not distinguishable from the payload: measured against a
+        live resource, the record for a model that serves and one that 404s on
+        call were identical — same ``object``, same ``status: "succeeded"``,
+        same ``lifecycle_status``, same ``capabilities.inference: true``. There
+        is no field to filter on, and the deployment endpoints that would answer
+        properly are control-plane and unreachable with an api-key.
+
+        So the catalog said ``claude-sonnet-5`` was among its 394 entries,
+        preflight reported "every configured deployment is available", and the
+        run died on a 404 at the router call with recon already paid for —
+        exactly the failure preflight exists to move to the beginning.
+
+        The only question that separates the two is the one the run itself
+        asks, so this asks it: a one-token completion, billed at effectively
+        nothing, on the same surface with the same auth. 404 is the resource
+        saying it has no such deployment. Any other error is *unknown* — a 401,
+        a 429 or a timeout says nothing about whether the model exists, and
+        reporting it as absent would refuse runs whose inference works.
+        """
+        import httpx  # lazy: optional extra
+
+        shape = self.build_request(
+            ModelRequest(
+                deployment=deployment,
+                system="",
+                user="ping",
+                max_output_tokens=1,
+            )
+        )
+        if self._egress is not None:
+            self._egress.check(str(shape["url"]), purpose="deployment probe")
+        try:
+            with httpx.stream(
+                "POST",
+                shape["url"],
+                headers=shape["headers"],
+                json=shape["body"],
+                timeout=PROBE_TIMEOUT_SECONDS,
+            ) as response:
+                if response.status_code == 404:
+                    return False
+                return True if response.status_code < 400 else None
+        except Exception:  # noqa: BLE001 - an advisory probe never raises
+            return None
+
     def list_deployments(self) -> list[str]:
-        """Ask the resource which deployments exist.
+        """Ask the resource which models it lists.
+
+        **Not proof that any of them serve** — see :meth:`serves`. This is the
+        catalog, and it is kept because a name absent even from the catalog is
+        definitively wrong and worth catching without spending a probe.
 
         The OpenAI-compatible listing is used for both surfaces because it is
         resource-wide: a Claude deployment on Foundry appears here alongside
@@ -657,6 +730,17 @@ class BedrockProvider:
             )
         return self._client
 
+    def serves(self, deployment: str) -> bool | None:
+        """Always *unknown* — deliberately, because listing is enough here.
+
+        Bedrock's listing is an account-scoped answer to "what can I invoke",
+        not a region catalog, so :meth:`list_deployments` already distinguishes
+        served from absent and a probe would spend a call to learn nothing. The
+        Foundry override exists because that provider's listing cannot make the
+        distinction at all; this is not a gap to be filled by symmetry.
+        """
+        return None
+
     def list_deployments(self) -> list[str]:
         """Foundation models and inference profiles this account can invoke.
 
@@ -744,9 +828,18 @@ class FakeProvider(StrictModel):
     #: *unknown*, and a fake that claimed to serve everything would make every
     #: preflight test pass for the wrong reason.
     deployments: list[str] = Field(default_factory=list)
+    #: Probe answers by deployment name. Absent means *unknown*, for the same
+    #: reason `deployments` starts empty: a fake that confirmed everything would
+    #: make the confirmation step pass without exercising it. Set `False` here
+    #: to stage the case this whole mechanism exists for — a name the listing
+    #: accepts and the resource does not serve.
+    probes: dict[str, bool] = Field(default_factory=dict)
 
     def list_deployments(self) -> list[str]:
         return list(self.deployments)
+
+    def serves(self, deployment: str) -> bool | None:
+        return self.probes.get(deployment)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
