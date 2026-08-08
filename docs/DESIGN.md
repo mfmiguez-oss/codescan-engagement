@@ -171,6 +171,23 @@ smaller:
   way — so it halves the chunk instead, which changes the one thing that caused
   it. Chunk size is therefore a tuning knob, not a correctness one: too large
   costs one wasted call before the split and the run still completes.
+- **A path can be cut, and is told when it has been.** Paths used to be atomic,
+  on the reasoning that the coverage gate judges them and a path split across
+  two assignments leaves neither able to speak for it. What that protects is
+  *disjointness*, and disjointness survives cutting — so a path heavier than one
+  assignment is sliced into disjoint shares of its obligations, each slice
+  marked `partial` and told in the prompt to cover exactly what it lists and
+  nothing else for that path.
+
+  Keeping paths whole turned a soft failure into a hard one. Halving only ever
+  split *between* paths, so a single module owing more obligations than one
+  answer could hold was unroutable at **every** chunk size and **every** output
+  ceiling. A live pygoat run hit exactly that: `introduction/urls.py` owed 70 of
+  the run's 166 obligations in one lump and truncated at a 16K ceiling and again
+  at 32K. Django and FastAPI both concentrate every route into one module, so
+  that is the ordinary shape of a Python web application rather than an outlier
+  — and the request-boundary detector learning to read Python is what
+  concentrated the obligations there in the first place.
 
 **Dispatch streams, so a long answer is not mistaken for a hang.** A
 document-sized answer generates for minutes before it is complete, and on a

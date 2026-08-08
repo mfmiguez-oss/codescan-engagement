@@ -14,6 +14,7 @@ from engagement.contracts import (
     Disposition,
     Phase,
     Priority,
+    RoutingPath,
     RunRef,
     RunReport,
     ScenarioRef,
@@ -739,9 +740,104 @@ def test_assignments_are_sized_by_obligations_not_by_unit_count() -> None:
     assert _obligations(bare) == 1
     assert _obligations(heavy) == 5
 
-    # Same unit count, very different weight: the heavy path travels alone.
+    # Same unit count, very different weight. `b.py` is heavier than a whole
+    # assignment, so it is cut rather than sent oversized, and no assignment
+    # exceeds the size it was given.
     chunks = _chunks([bare, heavy, bare.model_copy(update={"path": "c.py"})], 4)
-    assert [[e.path for e in chunk] for chunk in chunks] == [["a.py"], ["b.py"], ["c.py"]]
+    assert [[e.path for e in chunk] for chunk in chunks] == [
+        ["a.py"],
+        ["b.py"],
+        ["b.py", "c.py"],
+    ]
+    assert all(sum(_obligations(e) for e in chunk) <= 4 for chunk in chunks)
+
+
+def _pairs(entry: "RoutingPath") -> list[tuple[str, str]]:
+    """Every obligation an entry carries, as comparable pairs."""
+    out = [("", expert) for expert in entry.required_experts]
+    for unit in entry.units:
+        if unit.mandatory:
+            out.extend((unit.unit_id, expert) for expert in unit.required_experts)
+    return out
+
+
+def test_a_path_heavier_than_an_assignment_is_cut_not_sent_oversized() -> None:
+    """The failure this fixes: paths were atomic, so a path owing more than one
+    answer could hold was unroutable at any chunk size and any output ceiling.
+    A live pygoat run had `introduction/urls.py` owe 70 of 166 obligations in
+    one lump, and it truncated at a 16K ceiling and again at 32K.
+
+    Cutting is only safe if it is exact, so that is what is asserted: every
+    obligation lands in exactly one slice, none invented, none lost.
+    """
+    from engagement.contracts import RoutingPath, RoutingUnit
+    from engagement.driver import _obligations, _split_path
+
+    monster = RoutingPath(
+        path="introduction/urls.py",
+        units=[
+            RoutingUnit(
+                unit_id=f"U{i:03d}", required_experts=["auth", "access"], mandatory=True
+            )
+            for i in range(1, 21)
+        ],
+        required_experts=["auth"],
+    )
+    assert _obligations(monster) == 42
+
+    slices = _split_path(monster, 6)
+    assert len(slices) > 1
+    assert all(_obligations(s) <= 6 for s in slices)
+    assert all(s.path == monster.path for s in slices)
+    assert sorted(_pairs(monster)) == sorted(p for s in slices for p in _pairs(s))
+
+
+def test_every_slice_is_told_it_owns_only_part_of_the_path() -> None:
+    """A slice that believed it owned the whole path would duplicate the other
+    slices, or assume they had covered what it was itself asked for — which is
+    the failure that kept paths atomic. Disjointness is what that invariant
+    protected, and saying so out loud is what preserves it."""
+    from engagement.contracts import RoutingPath, RoutingUnit
+    from engagement.driver import _assignment_paths, _split_path
+
+    entry = RoutingPath(
+        path="urls.py",
+        units=[
+            RoutingUnit(unit_id="U001", required_experts=["a", "b"], mandatory=True),
+            RoutingUnit(unit_id="U002", required_experts=["c", "d"], mandatory=True),
+        ],
+        required_experts=["a"],
+    )
+    slices = _split_path(entry, 3)
+    assert all(s.partial for s in slices)
+    rendered = _assignment_paths(slices[:1])
+    assert "PARTIAL ASSIGNMENT" in rendered
+    assert "nothing else for it" in rendered
+
+    # A path that fits is never marked partial and never gains the warning.
+    whole = RoutingPath(path="small.py", units=[RoutingUnit(unit_id="U009")])
+    assert whole.partial is False
+    assert "PARTIAL" not in _assignment_paths([whole])
+
+
+def test_two_slices_of_one_path_never_share_an_assignment() -> None:
+    """They would print as two blocks naming the same path, which reads as a
+    contradiction exactly where the assignment has to be unambiguous."""
+    from engagement.contracts import RoutingPath, RoutingUnit
+    from engagement.driver import _chunks
+
+    entry = RoutingPath(
+        path="urls.py",
+        units=[
+            RoutingUnit(unit_id=f"U{i}", required_experts=["a", "b"], mandatory=True)
+            for i in range(6)
+        ],
+        required_experts=["a"],
+    )
+    chunks = _chunks([entry], 4)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len({e.path for e in chunk}) == len(chunk)
 
 
 def test_a_chunk_that_leaves_an_obligation_uncovered_is_re_asked() -> None:

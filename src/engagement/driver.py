@@ -43,6 +43,7 @@ from .contracts import (
     Phase,
     RenderedPrompt,
     RoutingPath,
+    RoutingUnit,
     RunRef,
     RunReport,
     ScenarioOutcome,
@@ -401,27 +402,100 @@ def _obligations(entry: RoutingPath) -> int:
     )
 
 
-def _chunks(paths: list[RoutingPath], size: int) -> list[list[RoutingPath]]:
-    """Pack whole paths into assignments of roughly ``size`` obligations.
+def _split_path(entry: RoutingPath, size: int) -> list[RoutingPath]:
+    """Cut one path's obligations into slices that each fit an assignment.
 
-    Paths are atomic because the coverage gate judges them: a path split across
-    two assignments leaves neither able to speak for it, and the merge is
-    refused for a path each chunk thought the other owned.
+    Paths used to be atomic, on the reasoning that the coverage gate judges
+    them and a path split across two assignments leaves neither able to speak
+    for it. What that argument actually protects is *disjointness* — the
+    failure it describes is two chunks each assuming the other covered an
+    obligation — and disjointness survives cutting, as long as every slice is
+    told exactly which experts it owns and that it owns only those.
+
+    Keeping paths whole had a hard failure mode instead of a soft one: a path
+    whose obligations exceed any single answer could not be routed at all, at
+    any chunk size and any output ceiling, because halving only ever split
+    *between* paths. A live pygoat run hit this — `introduction/urls.py` owed
+    **70 of the run's 166 obligations** in one indivisible lump, and truncated
+    at a 16K ceiling and again at 32K. Django and FastAPI both concentrate
+    every route into one module, so this is the normal shape of a Python web
+    application, not an outlier.
+
+    Each slice costs one obligation for naming the path, so it carries at most
+    ``size - 1`` of the real ones. Non-mandatory units are context rather than
+    obligations and ride along with the first slice only — repeating them in
+    every slice would re-inflate exactly what this is cutting down.
+    """
+    budget = max(1, size - 1)
+    #: (unit_id or None, expert). ``None`` is a path-level obligation.
+    items: list[tuple[str | None, str]] = [
+        (None, expert) for expert in entry.required_experts
+    ]
+    for unit in entry.units:
+        if unit.mandatory:
+            items.extend((unit.unit_id, expert) for expert in unit.required_experts)
+    if not items:
+        return [entry]
+
+    spare = [unit for unit in entry.units if not unit.mandatory]
+    by_id = {unit.unit_id: unit for unit in entry.units}
+    slices: list[RoutingPath] = []
+    for start in range(0, len(items), budget):
+        window = items[start : start + budget]
+        experts = [expert for unit_id, expert in window if unit_id is None]
+        assigned: dict[str, list[str]] = {}
+        for unit_id, expert in window:
+            if unit_id is not None:
+                assigned.setdefault(unit_id, []).append(expert)
+        units = [
+            RoutingUnit(
+                unit_id=unit_id,
+                required_experts=experts_for,
+                mandatory=by_id[unit_id].mandatory,
+            )
+            for unit_id, experts_for in assigned.items()
+        ]
+        if not slices:
+            units.extend(spare)
+        slices.append(
+            RoutingPath(
+                path=entry.path,
+                units=units,
+                required_experts=experts,
+                partial=True,
+            )
+        )
+    return slices
+
+
+def _chunks(paths: list[RoutingPath], size: int) -> list[list[RoutingPath]]:
+    """Pack paths into assignments of roughly ``size`` obligations.
 
     Sized by *obligations* rather than units, because obligations are the work.
     A live run packed 12 units per call, which came to 23 obligations, and the
     router kept dropping a few of them however explicitly they were listed —
-    the failure was bookkeeping load, and unit count is a poor proxy for it. A
-    single path whose own obligations exceed ``size`` becomes its own oversized
-    chunk rather than being cut; if its answer overruns, halving splits by path.
+    the failure was bookkeeping load, and unit count is a poor proxy for it.
+
+    A path heavier than a whole assignment is cut by :func:`_split_path` rather
+    than emitted as an oversized chunk. Two slices of one path are never packed
+    together: they would print as two blocks naming the same path, which reads
+    as a contradiction precisely where the assignment has to be unambiguous.
     """
     step = max(1, size)
+    expanded: list[RoutingPath] = []
+    for entry in paths:
+        if _obligations(entry) > step:
+            expanded.extend(_split_path(entry, step))
+        else:
+            expanded.append(entry)
+
     chunks: list[list[RoutingPath]] = []
     current: list[RoutingPath] = []
     count = 0
-    for entry in paths:
+    for entry in expanded:
         weight = _obligations(entry)
-        if current and count + weight > step:
+        clashes = any(other.path == entry.path for other in current)
+        if current and (count + weight > step or clashes):
             chunks.append(current)
             current, count = [], 0
         current.append(entry)
@@ -446,6 +520,14 @@ def _assignment_paths(chunk: list[RoutingPath]) -> str:
     blocks: list[str] = []
     for entry in chunk:
         lines = [f"- {entry.path}"]
+        if entry.partial:
+            lines.append(
+                "    PARTIAL ASSIGNMENT: this path is too large for one answer "
+                "and has been split. Cover exactly the obligations listed "
+                "below and nothing else for it — the rest are assigned to "
+                "other calls, so work you add here is duplicated and work you "
+                "assume elsewhere is lost."
+            )
         if entry.required_experts:
             joined = ", ".join(entry.required_experts)
             lines.append(f"    REQUIRED experts for this path: {joined}")
@@ -807,14 +889,25 @@ class Driver:
             try:
                 answer = self._route_chunk(ref, prompt, chunk, index, max(total, index))
             except TruncatedAnswer:
-                if len(chunk) == 1:
-                    # One path already, and its answer still does not fit. No
-                    # split is left that keeps paths whole, so the ceiling is
-                    # genuinely too low rather than the assignment too large.
+                if len(chunk) > 1:
+                    half = len(chunk) // 2
+                    pending[:0] = [chunk[:half], chunk[half:]]
+                    total += 1
+                    index -= 1
+                    continue
+                # One path, and its answer still does not fit. Cut the path
+                # itself rather than giving up: splitting between paths is not
+                # the only split available, and stopping here is what made a
+                # single heavy module — one Django `urls.py` — unroutable at
+                # every chunk size and every ceiling.
+                weight = _obligations(chunk[0])
+                pieces = _split_path(chunk[0], max(2, weight // 2))
+                if len(pieces) < 2:
+                    # A single obligation that will not fit in an answer. No
+                    # split is left, so the ceiling is genuinely too low.
                     raise
-                half = len(chunk) // 2
-                pending[:0] = [chunk[:half], chunk[half:]]
-                total += 1
+                pending[:0] = [[piece] for piece in pieces]
+                total += len(pieces) - 1
                 index -= 1
                 continue
             # Merged by shape rather than by a known key list: the router also

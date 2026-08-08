@@ -129,6 +129,13 @@ class RoutingPath(StrictModel):
     units: list[RoutingUnit] = Field(default_factory=list)
     #: Experts recon says this path owes a scenario or an explicit decision.
     required_experts: list[str] = Field(default_factory=list)
+    #: True when this is one slice of a path too large for a single assignment,
+    #: carrying a disjoint share of its obligations. The router is told so
+    #: explicitly, because a slice that believed it owned the whole path would
+    #: either duplicate the other slices or assume they had covered what it was
+    #: itself asked for. Recon never sets this — only the driver's chunker does,
+    #: and only when it has to cut.
+    partial: bool = False
 
 
 class RenderedPrompt(StrictModel):
