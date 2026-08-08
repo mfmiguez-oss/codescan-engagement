@@ -22,9 +22,31 @@ from .schemas import (
 
 ACCEPTING_DECISIONS = {"accepted", "downgraded"}
 
+#: Ceiling on the scenario-result JSON inlined into a triage prompt. The result
+#: carries the finding's quoted evidence, so it is the one block in this prompt
+#: that scales with the model's own scenario output rather than with a bounded
+#: structure — every other block is a fixed template or a small candidate record.
+#: Sized high enough that a normal result never reaches it (a ceiling that is
+#: never hit costs nothing), so only a pathological result is trimmed, and the
+#: trim is announced so a reader is never misled into thinking the evidence was
+#: shown whole. Mirrors ``scenarios.MAX_SOURCE_CHARS``.
+MAX_SCENARIO_RESULT_CHARS = 60_000
+
 
 def _format_json(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
+
+
+def _format_scenario_result(result: ScenarioResult) -> str:
+    text = _format_json(result)
+    if len(text) <= MAX_SCENARIO_RESULT_CHARS:
+        return text
+    return (
+        text[:MAX_SCENARIO_RESULT_CHARS]
+        + f"\n\n**This scenario result was truncated at {MAX_SCENARIO_RESULT_CHARS} "
+        "characters.** Adjudicate on the evidence shown; every citation is "
+        "re-validated against the checkout regardless."
+    )
 
 
 def _load_json(path: Path) -> Any:
@@ -97,7 +119,7 @@ def render_triage_prompt(target: str, run_id: str, candidate_id: str) -> Path:
             root() / "agents" / "orchestration" / "finding-triage.md"
         ).read_text(),
         "candidate_json": _format_json(candidate),
-        "scenario_result_json": _format_json(scenario_result),
+        "scenario_result_json": _format_scenario_result(scenario_result),
         "existing_findings_json": _format_json(
             _existing_finding_summaries(path, candidate_id)
         ),
