@@ -8,8 +8,8 @@ jobs:
   gate:
     runs-on: ubuntu-latest  # POSIX, non-root: a Windows-only gate hides POSIX bugs
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       # the vendored workspace is installed so the in-process end-to-end test
@@ -26,8 +26,8 @@ jobs:
     # control-plane container whose command was never installed.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]"
