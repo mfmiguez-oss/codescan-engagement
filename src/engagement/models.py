@@ -80,6 +80,23 @@ class TaskProfile(StrictModel):
     #: economy ones.
     volume: str
     rationale: str
+    #: What one call of this task actually costs in tokens.
+    #:
+    #: Per task, not one average across the pipeline. The projection used a
+    #: single 6000-in/1200-out pair for every stage, which is close enough for
+    #: a scenario (measured 6129/2105) and wrong by 7x for a router chunk
+    #: (measured 980 fresh input, 65146 read from cache, 8807 out) — the router
+    #: re-reads the whole recon on every chunk and answers with a document.
+    #: A run projected at $3.90 billed about $18.
+    #:
+    #: Cache tokens are carried separately because they are billed separately:
+    #: a read is a tenth of fresh input and a write is a quarter more. Folding
+    #: 65k cached tokens in at the fresh rate would replace one wrong number
+    #: with another.
+    avg_input_tokens: int = 6000
+    avg_output_tokens: int = 1200
+    avg_cache_read_tokens: int = 0
+    avg_cache_write_tokens: int = 0
 
 
 #: The allocation. Ordered by the pipeline's own sequence.
@@ -87,13 +104,22 @@ PROFILES: dict[Task, TaskProfile] = {
     Task.router: TaskProfile(
         task=Task.router,
         tier=Tier.frontier,
-        volume="1 per run",
+        volume="1 per chunk of the backlog",
         rationale=(
             "Decides the whole backlog. A missed routing unit loses every finding "
-            "it would have produced, and no later stage can recover it — but it "
-            "costs exactly one call, so the strongest model is also the cheapest "
-            "insurance in the pipeline."
+            "it would have produced, and no later stage can recover it, so the "
+            "strongest model is the cheapest insurance in the pipeline. It is no "
+            "longer one call: the backlog is split into chunks of a dozen "
+            "obligations, and a live pygoat run took 25."
         ),
+        # measured, pygoat run-001 2026-08-09: 25 calls, 980 fresh input and
+        # 65146 cache-read per call, 8807 out. The fresh input is small and the
+        # cached recon is enormous, which is the opposite shape to every other
+        # stage — projecting this one from a pipeline-wide average cannot work.
+        avg_input_tokens=1000,
+        avg_output_tokens=8800,
+        avg_cache_read_tokens=65000,
+        avg_cache_write_tokens=8900,
     ),
     Task.scenarios: TaskProfile(
         task=Task.scenarios,
@@ -104,6 +130,11 @@ PROFILES: dict[Task, TaskProfile] = {
             "not produce a cheaper run — it produces a run that finds less and "
             "costs the same to review."
         ),
+        # measured, same run: 250 calls, 6129 in / 2105 out per call
+        avg_input_tokens=6100,
+        avg_output_tokens=2100,
+        avg_cache_read_tokens=1600,
+        avg_cache_write_tokens=530,
     ),
     Task.triage: TaskProfile(
         task=Task.triage,
@@ -114,6 +145,12 @@ PROFILES: dict[Task, TaskProfile] = {
             "workspace re-validates every citation against the checkout whatever "
             "the model says. Bounded and checkable, so a mid tier holds."
         ),
+        # not yet measured: the one live run that reached candidates spent its
+        # budget before triage dispatched. Sized as a scenario answer without
+        # the source window, and marked here so the guess is not mistaken for a
+        # measurement when someone reconciles a bill against this table.
+        avg_input_tokens=4000,
+        avg_output_tokens=1500,
     ),
     Task.chains: TaskProfile(
         task=Task.chains,
@@ -157,6 +194,22 @@ class ModelSpec(StrictModel):
     #: False when the API rejects temperature/top_p/top_k outright.
     accepts_sampling: bool = True
     note: str = ""
+
+    @property
+    def cache_read_per_mtok(self) -> float:
+        """A cache read is a tenth of fresh input, across the whole family.
+
+        Derived rather than tabulated: it is a published *ratio*, so writing it
+        out per model invites eight numbers to drift apart when one of them is
+        updated. The router reads 65k cached tokens per chunk, so a projection
+        that ignored this was quietly ten percent light on every run.
+        """
+        return self.input_per_mtok * 0.1
+
+    @property
+    def cache_write_per_mtok(self) -> float:
+        """Writing a cache entry costs a quarter more than fresh input."""
+        return self.input_per_mtok * 1.25
 
 
 #: Published rates, current as of 2026-08-01. A deployment absent from this
@@ -438,14 +491,31 @@ class Allocation(StrictModel):
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     priced: bool = False
+    #: What one call of this task costs in tokens, carried from its profile so
+    #: the renderer does not have to reach back for it.
+    per_call_input: int = 0
+    per_call_output: int = 0
+    per_call_cache_read: int = 0
+    per_call_cache_write: int = 0
 
-    def projected_cost(self, input_tokens: int, output_tokens: int) -> float | None:
-        """Dollars for a projected token spend, or ``None`` when unpriced."""
+    def projected_cost(self) -> float | None:
+        """Dollars for this task's whole projected spend, or ``None`` unpriced.
+
+        Takes no token arguments any more. It used to, and every caller passed
+        the same flat pipeline-wide average — which meant the one place that
+        knew a router chunk is nothing like a scenario answer had no way to say
+        so. The per-call shape now travels on the allocation itself.
+        """
         if not self.priced or self.input_per_mtok is None or self.output_per_mtok is None:
             return None
+        calls = self.projected_calls
+        read_rate = self.input_per_mtok * 0.1
+        write_rate = self.input_per_mtok * 1.25
         return (
-            input_tokens / 1_000_000 * self.input_per_mtok
-            + output_tokens / 1_000_000 * self.output_per_mtok
+            calls * self.per_call_input / 1_000_000 * self.input_per_mtok
+            + calls * self.per_call_output / 1_000_000 * self.output_per_mtok
+            + calls * self.per_call_cache_read / 1_000_000 * read_rate
+            + calls * self.per_call_cache_write / 1_000_000 * write_rate
         )
 
 
@@ -468,14 +538,27 @@ def build_plan(
     poc_batch: int = 10,
     max_poc: int = 40,
     critical_findings: int | None = None,
+    obligations: int = 0,
+    router_chunk_obligations: int = 12,
 ) -> Plan:
     """Project each task's model and call count before anything is dispatched.
 
-    The call-count model mirrors the stages exactly: one router call, one per
-    scenario, one per candidate, one per service for chains, and one per batch
-    of PoC drafts up to the cap. Getting this wrong in the optimistic direction
-    would be the worst kind of error — a budget that looks affordable until the
-    run is already halfway through it.
+    The call-count model mirrors the stages exactly: one router call *per chunk
+    of the backlog*, one per scenario, one per candidate, one per service for
+    chains, and one per batch of PoC drafts up to the cap. Getting this wrong in
+    the optimistic direction would be the worst kind of error — a budget that
+    looks affordable until the run is already halfway through it.
+
+    The router used to be projected at one call flat. That was true when it made
+    one, and stopped being true when the backlog started being chunked: a live
+    pygoat run took 25, each answering with about 8800 tokens. Pass
+    ``obligations`` — the count recon produced — and the projection is
+    ``ceil(obligations / chunk size)``. It is a *floor*, because a chunk whose
+    answer truncates is split and re-asked, which adds calls.
+
+    ``obligations`` is unknown before recon, and the honest answer then is not
+    "1". It is a warning that this line is the one number in the table that
+    cannot be projected yet.
 
     Drafting is critical-only, so ``critical_findings`` is what drives the PoC
     count. Left unset it falls back to the whole queue, which over-projects: a
@@ -484,13 +567,38 @@ def build_plan(
     """
     plan = Plan()
     drafted = findings if critical_findings is None else max(0, critical_findings)
+    running = bool(scenarios or candidates)
+    chunk_size = max(1, router_chunk_obligations)
+    if obligations > 0:
+        router_calls = -(-obligations // chunk_size)
+    else:
+        router_calls = 1 if running else 0
     counts = {
-        Task.router: 1 if scenarios or candidates else 0,
+        Task.router: router_calls,
         Task.scenarios: max(0, scenarios),
         Task.triage: max(0, candidates),
         Task.chains: max(0, services),
         Task.poc: -(-min(max(0, drafted), max_poc) // poc_batch) if drafted else 0,
     }
+    if running and obligations <= 0:
+        plan.warnings.append(
+            "router: shown at 1 call because the obligation count is not known "
+            "until recon has run. The router takes one call per "
+            f"{chunk_size} obligations — a live pygoat run took 25 — so the "
+            "router line and the total below are floors, not estimates. Re-run "
+            "plan with --obligations after recon for a real number"
+        )
+    elif obligations > 0:
+        plan.warnings.append(
+            f"router: {router_calls} call(s) is a floor for {obligations} "
+            f"obligation(s) at {chunk_size} per chunk. Even division is the best "
+            "case: a path too heavy for one chunk is cut into disjoint slices "
+            "that cannot be packed with each other, and a chunk whose answer "
+            "truncates is split and re-asked. A live pygoat run turned 166 "
+            f"obligations into 23 chunks against this formula's 14, so size for "
+            f"roughly {int(router_calls * 1.6)}. How far it runs over depends on "
+            "how unevenly the obligations sit, which recon knows and this does not"
+        )
 
     for task, profile in PROFILES.items():
         deployment = (deployments.get(task.value) or "").strip()
@@ -508,6 +616,10 @@ def build_plan(
             priced=spec is not None,
             input_per_mtok=spec.input_per_mtok if spec else None,
             output_per_mtok=spec.output_per_mtok if spec else None,
+            per_call_input=profile.avg_input_tokens,
+            per_call_output=profile.avg_output_tokens,
+            per_call_cache_read=profile.avg_cache_read_tokens,
+            per_call_cache_write=profile.avg_cache_write_tokens,
         )
         plan.allocations.append(allocation)
         if spec is not None and spec.tier is not profile.tier:
@@ -525,8 +637,14 @@ def build_plan(
     return plan
 
 
-def render_plan(plan: Plan, avg_input_tokens: int = 6000, avg_output_tokens: int = 1200) -> str:
-    """The plan as a table an operator reads before authorising the run."""
+def render_plan(plan: Plan) -> str:
+    """The plan as a table an operator reads before authorising the run.
+
+    No token arguments. They were two pipeline-wide averages applied to every
+    stage, so the caller could not have supplied a right answer even knowing
+    one: a router chunk and a scenario answer differ by 7x in output and 65x in
+    cached input. Each allocation now carries its own measured shape.
+    """
     lines = [
         f"{'task':<11}{'tier':<10}{'deployment':<24}{'calls':>7}{'est. $':>10}",
         "-" * 62,
@@ -534,10 +652,7 @@ def render_plan(plan: Plan, avg_input_tokens: int = 6000, avg_output_tokens: int
     total = 0.0
     any_priced = False
     for allocation in plan.allocations:
-        cost = allocation.projected_cost(
-            avg_input_tokens * allocation.projected_calls,
-            avg_output_tokens * allocation.projected_calls,
-        )
+        cost = allocation.projected_cost()
         if cost is not None:
             total += cost
             any_priced = True

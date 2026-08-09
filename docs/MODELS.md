@@ -330,36 +330,61 @@ what Foundry bills at through the Marketplace).
 worse than none. Bedrock is partner-operated and priced separately, so a Bedrock
 run projects with these rates only as an approximation.
 
-A real projection, for a 24-scenario backlog with 9 candidates, 3 services and 6
-critical findings:
+A real projection, for a 24-scenario backlog with 48 obligations, 9 candidates,
+3 services and 6 critical findings:
 
 ```
 task       tier      deployment                calls    est. $
 --------------------------------------------------------------
-router     frontier  claude-opus-4-8               1      0.06
-scenarios  frontier  claude-opus-4-8              24      1.44
-triage     mid       claude-sonnet-4-6             9      0.32
+router     frontier  claude-opus-4-8               4      1.25
+scenarios  frontier  claude-opus-4-8              24      2.09
+triage     mid       claude-sonnet-4-6             9      0.31
 chains     high      claude-sonnet-4-6             3      0.11
 poc        economy   claude-haiku-4-5              1      0.01
 --------------------------------------------------------------
-projected                                                 1.94
+projected                                                 3.77
 ```
 
 The same backlog on the recommended allocation (`claude-opus-5` /
-`claude-sonnet-5`) projects the same **$1.94** — Opus 5 and Opus 4.8 are priced
+`claude-sonnet-5`) projects the same **$3.77** — Opus 5 and Opus 4.8 are priced
 identically, so the upgrade is free at these rates. Moving scenarios to
-`claude-fable-5` projects **$3.44**.
+`claude-fable-5` projects **$5.86**.
 
-Two things the projection does *not* claim to be exact:
+### What the numbers come from, and what they still cannot know
 
-- It assumes a flat **6,000 input / 1,200 output tokens per call**. A real
-  scenario prompt with an embedded source file is larger, and prompt caching
-  pulls the effective input rate down by roughly a factor of ten on the repeated
-  prefix.
-- It projects the router as **one call**. The router is chunked by coverage
-  obligations (12 per call by default), so a large target dispatches many —
-  a 606-unit target is dozens. This is the one line that under-projects, and it
-  is the line to watch on a first run against an unfamiliar repository.
+Each task is priced on **its own measured token shape**, not a pipeline-wide
+average. The averages used to be flat — 6,000 in / 1,200 out for every stage —
+which is close enough for a scenario and wrong by 7x for a router chunk. The
+router re-reads the whole recon on every chunk and answers with a document:
+
+| Task | Input | Output | Cache read | Cache write | Source |
+|---|---|---|---|---|---|
+| router | 1,000 | 8,800 | 65,000 | 8,900 | measured, pygoat run-001 |
+| scenarios | 6,100 | 2,100 | 1,600 | 530 | measured, pygoat run-001 |
+| triage | 4,000 | 1,500 | — | — | **estimated**, never measured |
+
+Cache tokens are priced at their published ratios to fresh input — a read is a
+tenth, a write is a quarter more. Ignoring them was a silent ~10% understatement,
+because the router reads 65k cached tokens on every chunk.
+
+Triage has never run to completion on a live target: the one run that reached
+candidates spent its budget first. Its row is a guess, and is labelled as one in
+`PROFILES` so nobody reconciling a bill mistakes it for a measurement.
+
+**The router line is a floor, not an estimate.** Pass `--obligations` (the count
+recon produced) and the projection is `ceil(obligations / 12)`. Even division is
+the best case: a path too heavy for one chunk is cut into disjoint slices that
+cannot be packed with each other, and a chunk whose answer truncates is split and
+re-asked. A live pygoat run turned **166 obligations into 23 chunks against the
+formula's 14**, so size for roughly 1.6x this line. How far it runs over depends
+on how unevenly the obligations sit across paths — which recon knows and the
+projection does not.
+
+Without `--obligations` the router shows as 1 call and `plan` warns that the
+line and the total are floors. That silent 1 is what let a run projected at
+**$3.90** bill about **$18**; the same run now projects $15.44 against $17.81
+actually billed, and `test_the_projection_lands_near_a_run_that_actually_happened`
+holds it there.
 
 ---
 

@@ -426,6 +426,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Findings expected to come out critical — only those are drafted "
         "for. Omitted, the projection assumes every finding is, and over-projects.",
     )
+    plan.add_argument(
+        "--obligations",
+        type=int,
+        default=0,
+        help="Coverage obligations recon produced. The router takes one call "
+        "per chunk of these, not one per run — without this the router line is "
+        "shown as 1 call and the total is a floor.",
+    )
+    plan.add_argument(
+        "--router-chunk-obligations",
+        type=int,
+        default=Policy().router_chunk_obligations,
+        help="Obligations per router call; must match what the run will use.",
+    )
     plan.set_defaults(func=_cmd_plan)
 
     return parser
@@ -800,6 +814,8 @@ def _cmd_plan(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         services=args.services,
         findings=args.findings,
         critical_findings=args.critical,
+        obligations=args.obligations,
+        router_chunk_obligations=args.router_chunk_obligations,
     )
     print(render_plan(plan))
     for warning in plan.warnings:

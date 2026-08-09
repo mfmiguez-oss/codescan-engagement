@@ -9,6 +9,8 @@ an operator routes the hardest work to.
 
 from __future__ import annotations
 
+import pytest
+
 from engagement.models import (
     CATALOGUE,
     PROFILES,
@@ -195,7 +197,7 @@ def test_an_unpriced_deployment_is_reported_rather_than_guessed() -> None:
 
     assert plan.unpriced() == ["some-private-alias"]
     assert any("no published rate" in w for w in plan.warnings)
-    assert all(a.projected_cost(1000, 100) is None for a in plan.allocations)
+    assert all(a.projected_cost() is None for a in plan.allocations)
 
 
 def test_a_deployment_below_its_task_tier_is_flagged() -> None:
@@ -205,11 +207,103 @@ def test_a_deployment_below_its_task_tier_is_flagged() -> None:
 
 
 def test_cost_is_computed_from_the_published_rate() -> None:
-    plan = build_plan({task.value: "claude-opus-5" for task in Task}, scenarios=1)
+    plan = build_plan({task.value: "claude-opus-5" for task in Task}, scenarios=1_000_000)
     allocation = next(a for a in plan.allocations if a.task is Task.scenarios)
 
-    # 1M input at $5 + 1M output at $25
-    assert allocation.projected_cost(1_000_000, 1_000_000) == 30.0
+    # a million scenario calls, so the per-call shape reads straight off as
+    # millions of tokens: 6100 in at $5, 2100 out at $25, plus the cache tiers
+    # at their published ratios to input — a tenth for a read, a quarter more
+    # for a write
+    assert allocation.projected_cost() == pytest.approx(
+        6100 * 5.0 + 2100 * 25.0 + 1600 * 0.5 + 530 * 6.25
+    )
+
+
+def test_a_task_is_priced_on_its_own_token_shape_not_a_pipeline_average() -> None:
+    """One flat average put the router 7x light. A router chunk re-reads the
+    whole recon and answers with a document; a scenario answer does neither."""
+    plan = build_plan(
+        {task.value: "claude-opus-5" for task in Task}, scenarios=1, obligations=12
+    )
+    router = next(a for a in plan.allocations if a.task is Task.router)
+    scenarios = next(a for a in plan.allocations if a.task is Task.scenarios)
+
+    assert router.per_call_output > 4 * scenarios.per_call_output
+    assert router.per_call_cache_read > 10 * scenarios.per_call_cache_read
+    # both are one call here, so the costs compare directly
+    assert router.projected_calls == scenarios.projected_calls == 1
+    assert router.projected_cost() > scenarios.projected_cost()  # type: ignore[operator]
+
+
+def test_the_router_is_projected_per_chunk_not_per_run() -> None:
+    """It was one call, and stopped being one when the backlog started being
+    chunked. A live pygoat run took 25 while the table said 1."""
+    plan = build_plan(
+        {task.value: "claude-opus-5" for task in Task},
+        scenarios=200,
+        obligations=166,
+        router_chunk_obligations=12,
+    )
+    router = next(a for a in plan.allocations if a.task is Task.router)
+
+    assert router.projected_calls == 14  # ceil(166 / 12)
+    assert any("is a floor" in w for w in plan.warnings)
+
+
+def test_an_unknown_obligation_count_says_so_rather_than_projecting_one() -> None:
+    """Before recon the count is genuinely unknown, and the honest answer is not
+    '1 call'. A silent 1 is what made a $18 run read as $3.90."""
+    plan = build_plan({task.value: "claude-opus-5" for task in Task}, scenarios=200)
+    router = next(a for a in plan.allocations if a.task is Task.router)
+
+    assert router.projected_calls == 1
+    assert any(
+        "not known until recon" in w and "floors, not estimates" in w
+        for w in plan.warnings
+    )
+
+
+#: pygoat run-001, 2026-08-09, every call on claude-sonnet-4-6. Frozen from
+#: that run's audit.jsonl, which is a runtime artifact and gitignored, so the
+#: totals are copied here rather than read — the alternative is a test that
+#: silently stops checking anything the day the temp directory is cleared.
+_PYGOAT = {
+    "obligations": 166,
+    "scenarios": 245,
+    "router_calls": 25,
+    "scenario_calls": 250,
+    "billed_usd": 17.81,
+}
+
+
+def test_the_projection_lands_near_a_run_that_actually_happened() -> None:
+    """The reconciliation. A projection nobody has ever checked against a bill
+    is a number with a dollar sign in front of it.
+
+    This one said $3.90 for a run that billed about $18 — optimistic by 4.5x,
+    which is the worst direction to be wrong in. The residual gap is the router
+    line, and it is a *floor* by construction: the formula divides obligations
+    evenly, and the real chunker cut pygoat's 166 into 23 rather than 14 because
+    a path too heavy for one chunk becomes disjoint slices that cannot be packed
+    together. So the projection is asserted to sit inside a band that is tight
+    on the optimistic side and open on the other.
+    """
+    plan = build_plan(
+        {task.value: "claude-sonnet-4-6" for task in Task},
+        scenarios=_PYGOAT["scenarios"],
+        services=0,
+        obligations=_PYGOAT["obligations"],
+    )
+    projected = sum(
+        cost
+        for a in plan.allocations
+        if a.task in {Task.router, Task.scenarios} and (cost := a.projected_cost())
+    )
+
+    billed = _PYGOAT["billed_usd"]
+    assert 0.8 * billed <= projected <= 1.3 * billed, (
+        f"projected ${projected:.2f} against ${billed:.2f} actually billed"
+    )
 
 
 def test_the_rendered_plan_names_every_task_and_totals_the_spend() -> None:
