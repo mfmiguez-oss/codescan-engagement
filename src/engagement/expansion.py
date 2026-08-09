@@ -70,6 +70,11 @@ class Expansion(StrictModel):
     supplied_paths: list[str] = Field(default_factory=list)
     unresolved_paths: list[str] = Field(default_factory=list)
     truncated_paths: list[str] = Field(default_factory=list)
+    #: Named, present in the checkout, and still not carried — the file budget
+    #: ran out first. A separate list from `unresolved_paths` because telling
+    #: the model a file is absent when it is merely unaffordable invites it to
+    #: conclude from that falsehood.
+    crowded_out_paths: list[str] = Field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -132,6 +137,7 @@ def build_expansion(
     supplied: dict[str, str],
     unresolved: list[str],
     truncated: list[str] | None = None,
+    crowded_out: list[str] | None = None,
 ) -> Expansion:
     """Render the expansion block appended to a re-attempted prompt.
 
@@ -174,9 +180,16 @@ def build_expansion(
         # inconclusive answer for the same reason as the first
         parts += [
             "",
-            "These paths could not be supplied (absent from the checkout, or "
-            "outside it): " + ", ".join(sorted(unresolved)),
+            "These paths are not in the checkout (absent, or outside it): "
+            + ", ".join(sorted(unresolved)),
         ]
+    if crowded_out:
+        # named apart from the unresolved list on purpose: these exist, and a
+        # reviewer told they were missing may reason from their absence
+        parts.append(
+            "These paths are in the checkout but did not fit this expansion: "
+            + ", ".join(sorted(crowded_out))
+        )
     if truncated:
         parts.append(
             "These files were truncated to fit: " + ", ".join(sorted(truncated))
@@ -192,4 +205,5 @@ def build_expansion(
         supplied_paths=sorted(supplied),
         unresolved_paths=sorted(set(unresolved)),
         truncated_paths=sorted(set(truncated or [])),
+        crowded_out_paths=sorted(set(crowded_out or [])),
     )

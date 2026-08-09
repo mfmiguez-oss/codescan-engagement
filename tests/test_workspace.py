@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -161,6 +163,110 @@ def test_a_caller_search_refuses_a_symlink_out_of_the_checkout(tmp_path: Path) -
     ref = RunRef(target="acme", run_id="run-001")
 
     assert CliWorkspace(root=tmp_path).search_source(ref, ["token"]) == []
+
+
+def _checkout(tmp_path: Path, *paths: str) -> RunRef:
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    for path in paths:
+        target = src / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x = 1\n", encoding="utf-8")
+    src.mkdir(parents=True, exist_ok=True)
+    return RunRef(target="acme", run_id="run-001")
+
+
+def test_a_named_file_resolves_from_the_name_the_source_uses(tmp_path: Path) -> None:
+    """A reviewer names ``views.py``, not its path from a checkout root it has
+    never been shown. Resolving that literally reported the file absent while it
+    sat two directories down, and parked the scenario for a gap that was not
+    real: a live pygoat run lost 34 that way."""
+    ref = _checkout(tmp_path, "introduction/views.py", "challenge/views.py")
+
+    assert CliWorkspace(root=tmp_path).resolve_source(ref, ["views.py"]) == {
+        "views.py": ["challenge/views.py", "introduction/views.py"]
+    }
+
+
+def test_a_partial_path_resolves_the_same_way_as_a_bare_name(tmp_path: Path) -> None:
+    """``A9/api.py`` is the same request as ``api.py`` with more of the path
+    given, so it is one suffix rule rather than a basename special case."""
+    ref = _checkout(tmp_path, "introduction/playground/A9/api.py")
+
+    assert CliWorkspace(root=tmp_path).resolve_source(ref, ["A9/api.py"]) == {
+        "A9/api.py": ["introduction/playground/A9/api.py"]
+    }
+
+
+def test_resolution_matches_only_whole_path_components(tmp_path: Path) -> None:
+    """A bare suffix comparison would answer ``api.py`` with ``legacy_api.py``
+    and hand the reviewer a file it never asked about, which it would then cite
+    as though it had."""
+    ref = _checkout(tmp_path, "app/legacy_api.py", "app/api.py")
+
+    assert CliWorkspace(root=tmp_path).resolve_source(ref, ["api.py"]) == {
+        "api.py": ["app/api.py"]
+    }
+
+
+def test_resolution_answers_ambiguity_with_every_match_not_a_guess(
+    tmp_path: Path,
+) -> None:
+    """Three files named ``views.py`` are three candidates the reviewer can cite
+    from. Picking one for it would invent the answer to its own question — and
+    the bound on how many is real, so it truncates shallowest-first."""
+    ref = _checkout(
+        tmp_path, "a/views.py", "b/views.py", "deep/nested/views.py", "views.py"
+    )
+
+    resolved = CliWorkspace(root=tmp_path).resolve_source(ref, ["views.py"], limit=3)
+
+    assert resolved == {"views.py": ["views.py", "a/views.py", "b/views.py"]}
+
+
+def test_what_is_not_a_path_resolves_to_nothing(tmp_path: Path) -> None:
+    """The path extractor also offers up ``request.POST`` and
+    ``django.contrib.auth.logout``. A fallback that guessed at those would
+    supply files nobody asked for; these stay honestly unresolved."""
+    ref = _checkout(tmp_path, "app/views.py")
+    workspace = CliWorkspace(root=tmp_path)
+
+    assert workspace.resolve_source(ref, ["request.POST", "requests.get"]) == {}
+    # and the jail still holds: no traversal resolves, however it is spelled
+    assert workspace.resolve_source(ref, ["../../host/views.py"]) == {}
+
+
+def test_resolution_refuses_a_symlink_out_of_the_checkout(tmp_path: Path) -> None:
+    """Same jail as `read_source` and `search_source`, for the same reason: a
+    link committed into the checkout points wherever its author chose."""
+    ref = _checkout(tmp_path, "app/keep.py")
+    src = tmp_path / "runs" / "acme" / "run-001" / "sourcecode"
+    outside = tmp_path / "host-secret.py"
+    outside.write_text("aws_secret_access_key = 'token'\n", encoding="utf-8")
+    try:
+        (src / "settings.py").symlink_to(outside)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform-gated
+        pytest.skip("creating symlinks needs a privilege this platform withholds")
+
+    assert CliWorkspace(root=tmp_path).resolve_source(ref, ["settings.py"]) == {}
+
+
+def test_every_path_is_resolved_in_one_walk(tmp_path: Path) -> None:
+    """The caller holds a lock across this call, so a walk per path is a full
+    re-read of the checkout no other worker can interleave with."""
+    ref = _checkout(tmp_path, "a/views.py", "b/urls.py", "c/models.py")
+    walks: list[str] = []
+    workspace = CliWorkspace(root=tmp_path)
+    real = Path.rglob
+
+    def counting(self: Path, pattern: str) -> Iterator[Path]:
+        walks.append(pattern)
+        return real(self, pattern)
+
+    with patch.object(Path, "rglob", counting):
+        resolved = workspace.resolve_source(ref, ["views.py", "urls.py", "models.py"])
+
+    assert set(resolved) == {"views.py", "urls.py", "models.py"}
+    assert len(walks) == 1
 
 
 def test_every_term_is_matched_in_one_walk(tmp_path: Path) -> None:

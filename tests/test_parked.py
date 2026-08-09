@@ -5,7 +5,7 @@ from __future__ import annotations
 from engagement.budget import Budget, Ledger
 from engagement.contracts import Disposition, Priority, RunRef, ScenarioRef
 from engagement.driver import Driver, Policy
-from engagement.expansion import build_expansion, requested_paths
+from engagement.expansion import ExpansionBounds, build_expansion, requested_paths
 from engagement.providers import FakeProvider
 from fakes import FakeWorkspace, scenarios
 
@@ -86,6 +86,88 @@ def test_a_path_outside_the_checkout_is_refused_and_reported() -> None:
     assert parked.supplied_paths == []
     assert "../../other-repo/secrets.py" in parked.unresolved_paths
     assert "app/missing.py" in parked.unresolved_paths
+
+
+def test_a_file_named_the_way_the_source_names_it_is_still_supplied() -> None:
+    """The whole point of the fallback: `read_source` takes ``views.py``
+    literally, finds nothing at the checkout root, and the scenario parks for a
+    gap that was never real."""
+    workspace = _needs_context()
+    workspace.missing_for["S001"] = ["the handler source in views.py is absent"]
+    workspace.sources["introduction/views.py"] = "def home(request): ..."
+    workspace.expanded_status["S001"] = "verified"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.scenarios_completed == 1
+    assert workspace.resolutions == ["views.py"]
+
+
+def test_the_literal_path_is_tried_before_any_resolution() -> None:
+    """A path the model got exactly right must not go through a suffix search
+    that could answer it with a different file at the same name."""
+    workspace = _needs_context()
+    workspace.missing_for["S001"] = ["need app/auth/session.py"]
+    workspace.sources["app/auth/session.py"] = "def guard(): ..."
+    workspace.sources["vendor/auth/session.py"] = "SHOULD NOT BE SUPPLIED"
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.parked[0].supplied_paths == ["app/auth/session.py"]
+    assert workspace.resolutions == []
+
+
+def test_an_ambiguous_name_is_answered_with_every_candidate() -> None:
+    """Choosing one of three files named ``views.py`` would invent the answer to
+    the question the reviewer asked."""
+    workspace = _needs_context()
+    workspace.missing_for["S001"] = ["the handler in views.py"]
+    workspace.sources["a/views.py"] = "def a(): ..."
+    workspace.sources["b/views.py"] = "def b(): ..."
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.parked[0].supplied_paths == ["a/views.py", "b/views.py"]
+    assert report.parked[0].unresolved_paths == []
+
+
+def test_a_name_the_checkout_does_not_have_stays_unresolved() -> None:
+    """The fallback must not become a way to answer every request with
+    something. What is not in the checkout is still reported as not in it."""
+    workspace = _needs_context()
+    workspace.missing_for["S001"] = ["need request.POST and missing_helper.py"]
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    parked = report.parked[0]
+    assert parked.supplied_paths == []
+    assert "missing_helper.py" in parked.unresolved_paths
+    assert parked.crowded_out_paths == []
+
+
+def test_a_present_file_that_did_not_fit_is_not_called_absent() -> None:
+    """Two different facts, and an operator acts on them differently: one sends
+    them looking for a missing file, the other says raise the file budget and
+    re-run. Telling the model a file is absent when it is merely unaffordable
+    invites it to conclude from a falsehood."""
+    workspace = _needs_context()
+    workspace.missing_for["S001"] = [
+        "need a/one.py and a/two.py and a/three.py and helper.py"
+    ]
+    for name in ("one", "two", "three"):
+        workspace.sources[f"a/{name}.py"] = f"# {name}"
+    workspace.sources["deep/helper.py"] = "# helper"
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace, expansion_bounds=ExpansionBounds(max_files=3)).run(REF)
+
+    parked = report.parked[0]
+    assert parked.supplied_paths == ["a/one.py", "a/three.py", "a/two.py"]
+    assert parked.crowded_out_paths == ["helper.py"]
+    assert parked.unresolved_paths == []
 
 
 def test_expansion_is_skipped_when_the_budget_cannot_cover_it() -> None:

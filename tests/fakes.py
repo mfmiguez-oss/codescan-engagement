@@ -64,6 +64,9 @@ class FakeWorkspace:
         #: Terms a context expansion searched for, so a test can assert that a
         #: "who calls this?" request became a search rather than a re-read.
         self.searches: list[str] = []
+        #: Paths a context expansion had to resolve by suffix, so a test can
+        #: assert the fallback ran only after the literal read missed.
+        self.resolutions: list[str] = []
         self.attempts: dict[str, int] = {}
         self.expanded_prompts: list[str] = []
         self.parked_written: list[ParkedScenario] = []
@@ -262,6 +265,31 @@ class FakeWorkspace:
         if ".." in path or path.startswith(("/", "\\")):
             return None
         return self.sources.get(path)
+
+    def resolve_source(
+        self, ref: RunRef, paths: Sequence[str], limit: int = 3
+    ) -> dict[str, list[str]]:
+        """Suffix match over the declared sources, shallowest first.
+
+        Mirrors `CliWorkspace.resolve_source`, including its component-boundary
+        rule and case folding — a fake that matched bare substrings would let
+        ``api.py`` resolve to ``legacy_api.py`` and no driver test would notice
+        the real workspace refusing to.
+        """
+        self.resolutions.extend(paths)
+        out: dict[str, list[str]] = {}
+        for request in paths:
+            tail = request.strip().replace("\\", "/").strip("/").lower()
+            if not tail:
+                continue
+            hits = [
+                path
+                for path in self.sources
+                if path.lower() == tail or path.lower().endswith("/" + tail)
+            ]
+            if hits:
+                out[request] = sorted(hits, key=lambda p: (p.count("/"), p))[:limit]
+        return out
 
     def search_source(
         self, ref: RunRef, terms: Sequence[str], limit: int = 5

@@ -237,6 +237,10 @@ class Workspace(Protocol):
 
     def read_source(self, ref: RunRef, path: str) -> str | None: ...
 
+    def resolve_source(
+        self, ref: RunRef, paths: Sequence[str], limit: int = 3
+    ) -> dict[str, list[str]]: ...
+
     def search_source(
         self, ref: RunRef, terms: Sequence[str], limit: int = 5
     ) -> list[str]: ...
@@ -636,6 +640,77 @@ class CliWorkspace:
             return resolved.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
+
+    def resolve_source(
+        self, ref: RunRef, paths: Sequence[str], limit: int = 3
+    ) -> dict[str, list[str]]:
+        """Checkout paths ending in each requested path, shallowest first.
+
+        A reviewer names a file the way the source names it — ``views.py``,
+        ``A9/api.py`` — not by its path from the checkout root, which it has
+        never been shown. `read_source` takes that literally, finds nothing at
+        the root, and the file is reported absent while it sits two directories
+        down. A live pygoat run parked 34 scenarios that way; twelve of them
+        asked for a ``views.py`` the checkout had three of.
+
+        Matched on **component boundaries**, so ``api.py`` never answers with
+        ``legacy_api.py``, and as a plain string comparison rather than a
+        pattern: the request arrives from model output, and compiling it would
+        hand untrusted text control over the walk. Case is folded because the
+        request is prose about code, not a filesystem call.
+
+        Ambiguity is answered with every match, bounded, rather than a guess.
+        Three files named ``views.py`` are three candidates the reviewer can
+        cite from; choosing one for it would be inventing the answer to the
+        question it asked.
+
+        Anything that is not a path in this checkout resolves to nothing, which
+        is how the non-paths the extractor also offers up — ``request.POST``,
+        ``django.contrib.auth.logout`` — stay honestly unresolved.
+
+        One walk for every request, for the reason `search_source` gives: the
+        caller holds a lock across this call, so a walk per path is a full
+        re-read of the checkout that no other worker can interleave with.
+        """
+        root = (self._run_dir(ref) / "sourcecode").resolve()
+        wanted: dict[str, str] = {}
+        for path in paths:
+            cleaned = path.strip().replace("\\", "/").strip("/")
+            if cleaned:
+                wanted.setdefault(path, cleaned.lower())
+        if not wanted or not root.is_dir():
+            return {}
+
+        def by_depth(path: Path) -> tuple[int, str]:
+            relative = path.relative_to(root)
+            return len(relative.parts), relative.as_posix()
+
+        found: dict[str, list[str]] = {key: [] for key in wanted}
+        for candidate in sorted(root.rglob("*"), key=by_depth):
+            if all(len(hits) >= limit for hits in found.values()):
+                break
+            relative = candidate.relative_to(root).as_posix()
+            lowered = relative.lower()
+            due = [
+                key
+                for key, tail in wanted.items()
+                if len(found[key]) < limit
+                and (lowered == tail or lowered.endswith("/" + tail))
+            ]
+            if not due:
+                continue
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+                if not resolved.is_file():
+                    continue
+            except (OSError, ValueError):
+                continue
+            for key in due:
+                # the lexical path, as `search_source` returns: it is what the
+                # caller hands back to `read_source`, which contains it again
+                found[key].append(relative)
+        return {key: hits for key, hits in found.items() if hits}
 
     def search_source(
         self, ref: RunRef, terms: Sequence[str], limit: int = 5

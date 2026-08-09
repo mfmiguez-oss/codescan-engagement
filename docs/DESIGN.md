@@ -320,8 +320,10 @@ flowchart TD
   B -->|yes| C{"budget?"}
   C -->|no| P2["parked<br/><i>budget exhausted</i>"]:::bad
   C -->|yes| D["extract paths<br/>from the statement"]:::step
-  D --> E["<b>path jail</b><br/>resolve inside checkout"]:::step
-  E --> F["re-dispatch:<br/>prompt + gap + files"]:::step
+  D --> E["<b>path jail</b><br/>read as written"]:::step
+  E --> E2{"found?"}
+  E2 -->|no| E3["match by path suffix<br/><i>views.py → app/views.py</i>"]:::step
+  E2 & E3 --> F["re-dispatch:<br/>prompt + gap + files"]:::step
   F --> G{"concluded?"}
   G -->|yes| H["completed<br/><i>after expansion</i>"]:::ok
   G -->|no| P3["parked<br/><i>still unresolved</i>"]:::bad
@@ -336,10 +338,27 @@ and refuses anything that escapes it, so hostile text inside a scenario prompt
 cannot steer an expansion into `/etc/passwd` or a sibling repository. A refusal
 returns nothing and is *reported*, never raised.
 
-**Every refusal is a bound, so every refusal is named.** Paths that did not
-resolve, files truncated to fit, and the per-expansion file cap all land in the
-parked record — and in the prompt itself, so a second inconclusive answer is not
-caused by an omission the model was never told about.
+**A reviewer names a file the way the source names it.** It asks for
+`views.py`, not for its path from a checkout root it has never been shown. Read
+literally that finds nothing, and the file is reported absent while it sits two
+directories down — a live pygoat run parked 34 scenarios exactly that way, and
+twelve of them wanted a `views.py` the checkout had three of. So a path that
+misses is retried as a **path suffix** on component boundaries, which answers
+`A9/api.py` with `introduction/playground/A9/api.py` and never answers `api.py`
+with `legacy_api.py`. Ambiguity is answered with every match rather than a
+guess: three files named `views.py` are three candidates the reviewer can cite
+from, and picking one for it would invent the answer to its own question.
+Anything that was never a path — `request.POST`, `django.contrib.auth.logout`,
+both of which the extractor really does offer up — resolves to nothing and stays
+honestly unresolved.
+
+**Every refusal is a bound, so every refusal is named — and the *kind* of
+refusal is named too.** Paths absent from the checkout, paths the checkout has
+that the file cap could not carry, and files truncated to fit are three separate
+lists in the parked record and in the prompt itself. Merging the first two would
+be the cheapest possible lie: it sends an operator hunting for a file that is
+right there, and it tells the model a file is missing when it is merely
+unaffordable, inviting it to conclude from that absence.
 
 **The queue is written to disk.** `parked-scenarios.json` sits beside the run,
 carrying the reason, the model's stated gap, what was supplied, and what could

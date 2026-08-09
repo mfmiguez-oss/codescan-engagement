@@ -69,16 +69,27 @@ def test_the_register_parses_and_is_not_empty() -> None:
 
 def test_every_mitigated_risk_names_an_invariant_test_that_exists() -> None:
     """The meta-test: a 'mitigated' row with nothing behind it fails here, so
-    the register cannot take credit the code does not back."""
+    the register cannot take credit the code does not back.
+
+    A row may name several tests, comma-separated, and **every** one of them has
+    to exist — a mitigation held up by three checks should not have to under-
+    claim to two, and a list is not a place to hide one name that resolves to
+    nothing.
+    """
     source = _all_test_source()
     missing: list[str] = []
     for risk_id, status, test_name in _rows():
         if status != "mitigated":
             continue
-        if test_name in {"", "—", "-"}:
+        named = [part.strip() for part in test_name.split(",") if part.strip()]
+        if not named or test_name in {"", "—", "-"}:
             missing.append(f"{risk_id}: no invariant test named")
-        elif f"def {test_name}(" not in source:
-            missing.append(f"{risk_id}: names '{test_name}', which does not exist")
+            continue
+        missing.extend(
+            f"{risk_id}: names '{name}', which does not exist"
+            for name in named
+            if f"def {name}(" not in source
+        )
     assert not missing, "; ".join(missing)
 
 

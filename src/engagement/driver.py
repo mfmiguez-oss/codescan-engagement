@@ -736,6 +736,11 @@ class _Gathered(NamedTuple):
     #: whether an empty expansion means "the checkout gave nothing" or "you
     #: already have it".
     already_had: list[str]
+    #: Files the model asked for that the checkout has and the expansion could
+    #: not afford. A fourth outcome, kept apart from `unresolved` because only
+    #: one of the two is a statement about the repository. Required rather than
+    #: defaulted: a NamedTuple default is one shared list.
+    crowded_out: list[str]
 
 
 class Driver:
@@ -1183,11 +1188,13 @@ class Driver:
             gathered.supplied,
             gathered.unresolved,
             gathered.truncated,
+            gathered.crowded_out,
         )
         parked.expanded = True
         parked.attempts = 2
         parked.supplied_paths = expansion.supplied_paths
         parked.unresolved_paths = expansion.unresolved_paths
+        parked.crowded_out_paths = expansion.crowded_out_paths
         if expansion.is_empty:
             # Two different situations end here, and an operator triaging the
             # parked queue acts on them differently: one sends them looking for
@@ -1276,16 +1283,17 @@ class Driver:
         unresolved: list[str] = []
         truncated: list[str] = []
         already_had: list[str] = []
+        crowded_out: list[str] = []
         seen: set[str] = set()
 
-        def _add(path: str, requested: bool) -> bool:
+        def _add(path: str, missed: list[str] | None) -> bool:
             """True when the file was supplied. Bounds are reported, not silent.
 
-            ``requested`` separates a path the model named from a file a search
-            turned up. Only the first belongs in ``unresolved``: that list is
-            quoted back to the model as paths it asked for and did not get, and
-            reported to the operator under the same contract, so putting a
-            search hit in it is a false account of the model's own request.
+            ``missed`` receives the path when it could not be supplied, and is
+            ``None`` for a file that no statement named — a search hit, or a
+            candidate this method itself resolved. Only what the *model* asked
+            for may be reported back to it as unmet, so passing a hit here
+            would be a false account of the model's own request.
             """
             key = _normalised(path)
             if not key or key in seen:
@@ -1295,16 +1303,14 @@ class Driver:
                 already_had.append(key)
                 return False
             if len(supplied) >= bounds.max_files:
-                # the cap is itself a bound on the re-attempt, so the paths it
-                # excluded are reported rather than forgotten
-                if requested:
-                    unresolved.append(key)
+                if missed is not None:
+                    missed.append(key)
                 return False
             with self._workspace_lock:
                 content = self._workspace.read_source(ref, key)
             if content is None:
-                if requested:
-                    unresolved.append(key)
+                if missed is not None:
+                    missed.append(key)
                 return False
             if len(content) > bounds.max_chars_per_file:
                 content = content[: bounds.max_chars_per_file]
@@ -1312,8 +1318,28 @@ class Driver:
             supplied[key] = content
             return True
 
+        # First pass: the path exactly as written. A miss here is not yet a
+        # verdict on the checkout — a reviewer names a file the way the source
+        # names it, not by its path from a root it has never seen.
+        missed: list[str] = []
         for path in requested_paths(statements):
-            _add(path, requested=True)
+            _add(path, missed=missed)
+
+        if missed:
+            with self._workspace_lock:
+                matches = self._workspace.resolve_source(ref, missed)
+            for named in missed:
+                candidates = matches.get(named) or []
+                if not candidates:
+                    unresolved.append(named)
+                    continue
+                keys = {_normalised(candidate) for candidate in candidates}
+                for candidate in candidates:
+                    _add(candidate, missed=None)
+                # a candidate already in hand satisfies the request as fully as
+                # one just read, so both count before calling this a shortfall
+                if not keys & (set(supplied) | set(already_had)):
+                    crowded_out.append(named)
 
         symbols = requested_symbols(statements)
         if symbols and len(supplied) < bounds.max_files:
@@ -1322,8 +1348,8 @@ class Driver:
                     ref, symbols, bounds.max_files - len(supplied)
                 )
             for hit in hits:
-                _add(hit, requested=False)
-        return _Gathered(supplied, unresolved, truncated, already_had)
+                _add(hit, missed=None)
+        return _Gathered(supplied, unresolved, truncated, already_had, crowded_out)
 
     def _park(
         self, ref: RunRef, scenario: ScenarioRef, parked: ParkedScenario

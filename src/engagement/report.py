@@ -76,8 +76,17 @@ def _rows(report: RunReport) -> str:
     for item in report.parked:
         supplied = ", ".join(item.supplied_paths) or "—"
         unresolved = (
-            f"<br><span class='bad'>not supplied: {escape(', '.join(item.unresolved_paths))}</span>"
+            f"<br><span class='bad'>not in checkout: "
+            f"{escape(', '.join(item.unresolved_paths))}</span>"
             if item.unresolved_paths
+            else ""
+        )
+        # a different action for the operator: raise the expansion's file budget
+        # and re-run, rather than go looking for a file that was never there
+        unresolved += (
+            f"<br><span class='bad'>in checkout, did not fit: "
+            f"{escape(', '.join(item.crowded_out_paths))}</span>"
+            if item.crowded_out_paths
             else ""
         )
         gap = "<br>".join(escape(statement) for statement in item.missing_context) or "—"

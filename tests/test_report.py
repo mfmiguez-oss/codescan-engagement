@@ -34,6 +34,7 @@ def _partial() -> RunReport:
                 missing_context=["cannot resolve app/auth.py"],
                 expanded=True,
                 unresolved_paths=["app/auth.py"],
+                crowded_out_paths=["app/models.py"],
             )
         ],
         warnings=["coverage: 1 scenario(s) parked"],
@@ -87,7 +88,10 @@ def test_a_complete_run_says_so_without_a_caveat() -> None:
 def test_parked_scenarios_show_the_gap_and_what_was_refused() -> None:
     html = render(_partial())
     assert "cannot resolve app/auth.py" in html
-    assert "not supplied" in html
+    assert "not in checkout: app/auth.py" in html
+    # a file the checkout has and the expansion could not afford is a different
+    # fact, and sends the operator somewhere else: raise the budget, re-run
+    assert "in checkout, did not fit: app/models.py" in html
 
 
 def test_the_page_is_self_contained() -> None:

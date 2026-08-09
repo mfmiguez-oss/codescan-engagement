@@ -194,9 +194,16 @@ class ParkedScenario(StrictModel):
     #: Whether a context expansion was dispatched, and what it carried.
     expanded: bool = False
     supplied_paths: list[str] = Field(default_factory=list)
-    #: Paths the model asked for that could not be supplied — a bound, so it is
-    #: reported rather than dropped. Includes anything refused by the path jail.
+    #: Paths the model asked for that the checkout does not contain — a bound,
+    #: so it is reported rather than dropped. Includes anything refused by the
+    #: path jail, and anything named that was never a path to begin with.
     unresolved_paths: list[str] = Field(default_factory=list)
+    #: Paths the model asked for that the checkout *does* contain and the
+    #: expansion still could not carry, because its file budget was already
+    #: spent. Kept apart from `unresolved_paths` because the two send an
+    #: operator to different places: one to look for a missing file, the other
+    #: to raise `expansion_bounds.max_files` and re-run.
+    crowded_out_paths: list[str] = Field(default_factory=list)
 
 
 class WorkOutcome(StrictModel):
