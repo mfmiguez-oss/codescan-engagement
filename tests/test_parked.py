@@ -170,6 +170,48 @@ def test_a_present_file_that_did_not_fit_is_not_called_absent() -> None:
     assert parked.unresolved_paths == []
 
 
+def test_a_parked_scenario_does_not_strand_the_findings_the_run_did_reach() -> None:
+    """Parking is the driver's concept, not the workspace's.
+
+    A parked scenario is never written to `scenarios/finished`, so the
+    workspace answers `scenarios` for as long as one exists and `Phase.triage`
+    is never reached. The run then ends with candidates on disk, none triaged
+    and an empty queue — which reads as "found nothing" rather than "never
+    looked". A live pygoat run ended exactly there: 14 findings recorded, 0
+    triaged, 78 of its 110 calls unspent. A gap in coverage is reported; it is
+    not a reason to discard the rest of the run.
+    """
+    workspace = FakeWorkspace(
+        scenarios=scenarios(("S001", Priority.normal), ("S002", Priority.normal)),
+        candidates_per_scenario=1,
+    )
+    workspace.status_for["S001"] = "needs_context"  # parks: never finished
+    workspace.missing_for["S001"] = ["cannot resolve app/missing.py"]
+    workspace.expanded_status["S001"] = "needs_context"
+    workspace.status_for["S002"] = "verified"  # yields a candidate
+
+    report = _driver(workspace).run(REF)
+
+    assert report.scenarios_parked == 1
+    assert [c.item_id for c in report.candidates] == ["S002-F001"]
+    assert report.candidates[0].disposition is Disposition.completed
+
+
+def test_a_run_with_nothing_to_triage_still_terminates() -> None:
+    """The other half of the same change: falling through to triage must not
+    become a loop when the workspace keeps answering `scenarios` and there is
+    no candidate to make progress on."""
+    workspace = FakeWorkspace(scenarios=ONE)
+    workspace.status_for["S001"] = "needs_context"
+    workspace.missing_for["S001"] = ["cannot resolve app/missing.py"]
+    workspace.expanded_status["S001"] = "needs_context"
+
+    report = _driver(workspace).run(REF)
+
+    assert report.scenarios_parked == 1
+    assert report.candidates == []
+
+
 def test_expansion_is_skipped_when_the_budget_cannot_cover_it() -> None:
     workspace = _needs_context()
     workspace.sources["app/auth/session.py"] = "x = 1"

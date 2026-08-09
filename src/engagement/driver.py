@@ -1446,7 +1446,21 @@ class Driver:
                 continue
 
             if state.phase is Phase.scenarios:
-                if not self._drain_scenarios(ref, report, seen):
+                if self._drain_scenarios(ref, report, seen):
+                    continue
+                # Parking is this driver's concept, not the workspace's: a
+                # parked scenario is never written to `scenarios/finished`, so
+                # `state()` answers `scenarios` for as long as one exists and
+                # `Phase.triage` is unreachable. Breaking here abandoned every
+                # candidate the run had already produced — a live pygoat run
+                # ended with 14 findings on disk, none triaged, an empty queue
+                # and 78 of its 110 calls unspent. A parked scenario is a gap
+                # in coverage, which the report states; it is not a reason to
+                # discard the findings the run did reach.
+                if not self._workspace.pending_candidates(ref):
+                    break
+                report.phase = Phase.triage
+                if not self._drain_candidates(ref, report, seen):
                     break
                 continue
 
