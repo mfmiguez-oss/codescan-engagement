@@ -9,14 +9,17 @@ The allocation follows one rule — **spend on judgement, economise on volume** 
 because the two are anti-correlated across this pipeline:
 
 ``router``
-    One call per run, and it decides the entire backlog. A router that misses a
-    routing unit loses every finding that unit would have produced, and no later
-    stage can recover it. Highest tier; the cost is one call.
+    One call per *chunk* of the backlog, and it decides that entire backlog. A
+    router that misses a routing unit loses every finding that unit would have
+    produced, and no later stage can recover it. Highest tier. It was one call
+    per run until the backlog started being chunked; a live pygoat run took 25,
+    so the count now comes from the obligation count recon produces.
 ``scenarios``
-    One call per scenario — the bulk of the spend *and* the stage that actually
-    finds vulnerabilities. Highest tier, because a cheaper model here does not
-    produce a cheaper run, it produces a run that finds less and costs the same
-    to review.
+    Roughly two calls per scenario — the bulk of the spend *and* the stage that
+    actually finds vulnerabilities. Highest tier, because a cheaper model here
+    does not produce a cheaper run, it produces a run that finds less and costs
+    the same to review. Two rather than one because a scenario that ends
+    ``needs_context`` earns an expanded re-attempt, and most of them do.
 ``triage``
     One call per candidate, adjudicating a claim against evidence already
     gathered. Bounded, mechanical, and checkable — the workspace validates every
@@ -540,6 +543,7 @@ def build_plan(
     critical_findings: int | None = None,
     obligations: int = 0,
     router_chunk_obligations: int = 12,
+    expand_context: bool = True,
 ) -> Plan:
     """Project each task's model and call count before anything is dispatched.
 
@@ -573,13 +577,28 @@ def build_plan(
         router_calls = -(-obligations // chunk_size)
     else:
         router_calls = 1 if running else 0
+    # A scenario that ends `needs_context` earns one expanded re-attempt, so the
+    # scenario line is not one call per scenario whenever expansion is on. The
+    # pygoat run made 250 calls for 120 dispatched scenarios -- 2.1 each, and
+    # that stage is the bulk of every run, so projecting it at 1.0 halves the
+    # only number an operator actually reads.
+    scenario_calls = max(0, scenarios)
+    if expand_context and scenario_calls:
+        scenario_calls = -(-scenario_calls * 21 // 10)
     counts = {
         Task.router: router_calls,
-        Task.scenarios: max(0, scenarios),
+        Task.scenarios: scenario_calls,
         Task.triage: max(0, candidates),
         Task.chains: max(0, services),
         Task.poc: -(-min(max(0, drafted), max_poc) // poc_batch) if drafted else 0,
     }
+    if expand_context and scenarios > 0:
+        plan.warnings.append(
+            f"scenarios: {scenario_calls} call(s) for {scenarios} scenario(s) — a "
+            "scenario that ends needs_context earns one expanded re-attempt, and "
+            "a live pygoat run averaged 2.1 calls per dispatched scenario. Runs "
+            "with expansion off project 1:1"
+        )
     if running and obligations <= 0:
         plan.warnings.append(
             "router: shown at 1 call because the obligation count is not known "

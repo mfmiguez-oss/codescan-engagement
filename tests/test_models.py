@@ -142,7 +142,9 @@ def test_judgement_heavy_low_volume_tasks_get_the_top_tier() -> None:
 
 
 def test_the_plan_projects_one_call_per_scenario_and_candidate() -> None:
-    plan = build_plan(_ALL, scenarios=12, candidates=5, services=2, findings=25)
+    plan = build_plan(
+        _ALL, scenarios=12, candidates=5, services=2, findings=25, expand_context=False
+    )
     calls = {a.task: a.projected_calls for a in plan.allocations}
 
     assert calls[Task.router] == 1
@@ -150,6 +152,19 @@ def test_the_plan_projects_one_call_per_scenario_and_candidate() -> None:
     assert calls[Task.triage] == 5
     assert calls[Task.chains] == 2
     assert calls[Task.poc] == 3  # 25 findings, batches of 10
+
+
+def test_expansion_is_projected_because_it_is_a_second_call() -> None:
+    """A scenario that ends needs_context earns one expanded re-attempt. That
+    stage is the bulk of every run, so projecting it 1:1 halves the total: a
+    live pygoat run averaged 2.1 calls per dispatched scenario."""
+    off = build_plan(_ALL, scenarios=100, expand_context=False)
+    on = build_plan(_ALL, scenarios=100, expand_context=True)
+
+    assert next(a for a in off.allocations if a.task is Task.scenarios).projected_calls == 100
+    assert next(a for a in on.allocations if a.task is Task.scenarios).projected_calls == 210
+    assert any("earns one expanded re-attempt" in w for w in on.warnings)
+    assert not any("expanded re-attempt" in w for w in off.warnings)
 
 
 def test_the_poc_projection_respects_the_cap() -> None:
@@ -207,7 +222,11 @@ def test_a_deployment_below_its_task_tier_is_flagged() -> None:
 
 
 def test_cost_is_computed_from_the_published_rate() -> None:
-    plan = build_plan({task.value: "claude-opus-5" for task in Task}, scenarios=1_000_000)
+    plan = build_plan(
+        {task.value: "claude-opus-5" for task in Task},
+        scenarios=1_000_000,
+        expand_context=False,
+    )
     allocation = next(a for a in plan.allocations if a.task is Task.scenarios)
 
     # a million scenario calls, so the per-call shape reads straight off as
@@ -223,7 +242,10 @@ def test_a_task_is_priced_on_its_own_token_shape_not_a_pipeline_average() -> Non
     """One flat average put the router 7x light. A router chunk re-reads the
     whole recon and answers with a document; a scenario answer does neither."""
     plan = build_plan(
-        {task.value: "claude-opus-5" for task in Task}, scenarios=1, obligations=12
+        {task.value: "claude-opus-5" for task in Task},
+        scenarios=1,
+        obligations=12,
+        expand_context=False,
     )
     router = next(a for a in plan.allocations if a.task is Task.router)
     scenarios = next(a for a in plan.allocations if a.task is Task.scenarios)
@@ -269,7 +291,11 @@ def test_an_unknown_obligation_count_says_so_rather_than_projecting_one() -> Non
 #: silently stops checking anything the day the temp directory is cleared.
 _PYGOAT = {
     "obligations": 166,
-    "scenarios": 245,
+    # 245 were in the backlog; the budget dispatched 120 of them (32 completed,
+    # 88 parked) and left 100 unfunded. The projection is compared against the
+    # work that was actually *done*, not the backlog that was planned, because
+    # the unfunded remainder never cost anything.
+    "dispatched_scenarios": 120,
     "router_calls": 25,
     "scenario_calls": 250,
     "billed_usd": 17.81,
@@ -290,10 +316,14 @@ def test_the_projection_lands_near_a_run_that_actually_happened() -> None:
     """
     plan = build_plan(
         {task.value: "claude-sonnet-4-6" for task in Task},
-        scenarios=_PYGOAT["scenarios"],
+        scenarios=_PYGOAT["dispatched_scenarios"],
         services=0,
         obligations=_PYGOAT["obligations"],
     )
+    scenarios = next(a for a in plan.allocations if a.task is Task.scenarios)
+    # the expansion multiplier has to land near the calls the run really made,
+    # or the dollar band below passes on two errors cancelling
+    assert abs(scenarios.projected_calls - _PYGOAT["scenario_calls"]) <= 25
     projected = sum(
         cost
         for a in plan.allocations

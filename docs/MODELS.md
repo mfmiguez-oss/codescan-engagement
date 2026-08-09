@@ -381,10 +381,24 @@ on how unevenly the obligations sit across paths — which recon knows and the
 projection does not.
 
 Without `--obligations` the router shows as 1 call and `plan` warns that the
-line and the total are floors. That silent 1 is what let a run projected at
-**$3.90** bill about **$18**; the same run now projects $15.44 against $17.81
-actually billed, and `test_the_projection_lands_near_a_run_that_actually_happened`
-holds it there.
+line and the total are floors.
+
+**The scenario line is not one call per scenario.** A scenario that ends
+`needs_context` earns one expanded re-attempt, and that stage is the bulk of
+every run — the pygoat run made 250 calls for 120 dispatched scenarios, 2.1
+each. The projection applies that multiplier whenever expansion is on; pass
+`--no-expand-context` only if the run will also have it off.
+
+Reconciled against that run: **252 scenario calls projected against 250 made**,
+and $15.80 against $17.81 actually billed — the remaining 11% is the router
+floor. `test_the_projection_lands_near_a_run_that_actually_happened` holds it
+there, and checks the call count separately so the dollar band cannot pass on
+two errors cancelling out.
+
+Note that the projection prices the *backlog you give it*. pygoat's 245-scenario
+backlog fully funded projects about $30; that run billed $18 because its budget
+stopped it at 120. A projection and a bill only compare when they cover the same
+work.
 
 ---
 

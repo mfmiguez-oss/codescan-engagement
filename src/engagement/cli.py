@@ -440,6 +440,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Policy().router_chunk_obligations,
         help="Obligations per router call; must match what the run will use.",
     )
+    plan.add_argument(
+        "--no-expand-context",
+        action="store_true",
+        help="Project without the expanded re-attempt a needs_context scenario "
+        "earns. Only pass this if the run will also have expansion off — it "
+        "roughly halves the scenario line.",
+    )
     plan.set_defaults(func=_cmd_plan)
 
     return parser
@@ -816,6 +823,7 @@ def _cmd_plan(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         critical_findings=args.critical,
         obligations=args.obligations,
         router_chunk_obligations=args.router_chunk_obligations,
+        expand_context=not args.no_expand_context,
     )
     print(render_plan(plan))
     for warning in plan.warnings:
