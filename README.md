@@ -79,8 +79,14 @@ remainder is reported as `unfunded` — never silently dropped.
   by good intentions.
 - **`needs_context` earns one expanded re-attempt, then parks.** The model's own
   statement of what it lacked drives the expansion; files it names are resolved
-  **inside the checkout only**, and anything refused is reported. Parked
-  scenarios are written to `parked-scenarios.json`, not merely counted.
+  **inside the checkout only**, and anything refused is reported. When the name
+  is ambiguous — a Django checkout has ten `views.py` — the symbol named in the
+  same sentence decides which one is read, rather than depth. Parked scenarios
+  are written to `parked-scenarios.json`, not merely counted.
+- **A refused citation is corrected, not discarded.** An expanded answer that
+  fails the recorder's integrity checks had the context and mis-quoted it, and
+  the complaint names the item — so it is quoted back and the scenario
+  re-dispatched once, under its own agent id. A second refusal parks.
 - **Credentials never reach the provider.** Credential shapes are redacted
   before every dispatch and restored in the answer — reversible, because a
   model that could only see a redacted line could never cite one, and the

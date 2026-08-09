@@ -319,18 +319,25 @@ flowchart TD
   B -->|no| P1["parked<br/><i>no gap to act on</i>"]:::bad
   B -->|yes| C{"budget?"}
   C -->|no| P2["parked<br/><i>budget exhausted</i>"]:::bad
-  C -->|yes| D["extract paths<br/>from the statement"]:::step
+  C -->|yes| D["extract <b>paths and symbols</b><br/>from the statement"]:::step
+  D --> S["search the checkout<br/>for each symbol"]:::step
   D --> E["<b>path jail</b><br/>read as written"]:::step
   E --> E2{"found?"}
-  E2 -->|no| E3["match by path suffix<br/><i>views.py → app/views.py</i>"]:::step
-  E2 & E3 --> F["re-dispatch:<br/>prompt + gap + files"]:::step
+  E2 -->|no| E3["match by path suffix<br/><i>views.py → 10 candidates</i>"]:::step
+  S --> E4
+  E3 --> E4["<b>rank by symbol</b><br/><i>the file defining it, first</i>"]:::step
+  E2 & E4 --> F["re-dispatch:<br/>prompt + gap + files"]:::step
   F --> G{"concluded?"}
   G -->|yes| H["completed<br/><i>after expansion</i>"]:::ok
   G -->|no| P3["parked<br/><i>still unresolved</i>"]:::bad
-  P1 & P2 & P3 --> Q["parked-scenarios.json"]:::bad
+  F --> R{"citations<br/>refused?"}
+  R -->|"first time"| F2["re-dispatch with<br/>the checker's complaint"]:::step
+  F2 --> G
+  R -->|"again"| P4["parked<br/><i>answer rejected</i>"]:::bad
+  P1 & P2 & P3 & P4 --> Q["parked-scenarios.json"]:::bad
 ```
 
-Three things about this are load-bearing:
+Five things about this are load-bearing:
 
 **The paths come from model output, so reading them is a jail, not a
 convenience.** `read_source` resolves each requested path against the checkout
@@ -351,6 +358,30 @@ from, and picking one for it would invent the answer to its own question.
 Anything that was never a path — `request.POST`, `django.contrib.auth.logout`,
 both of which the extractor really does offer up — resolves to nothing and stays
 honestly unresolved.
+
+**Which of ten `views.py` it meant is decided by the symbol it named, not by
+depth.** Answering an ambiguous name with the shallowest candidates answers a
+question the reviewer did not ask, and answers it with another app's source —
+which comes back as a reviewed file. So the symbol search runs *first*, and its
+hits rank the path candidates: a checkout's ten `views.py` are ordered by which
+one defines the `all_users_data_view` the same sentence asked for. The symbol
+has to be extracted to be used, and prose names a handler flatly rather than as
+a call, so a bare `login_view` counts as well as a `get_connection()`. The
+internal underscore is the whole discriminator between an identifier and an
+English word — narrow on purpose, and cheap when wrong, because a spurious
+needle costs one literal comparison in a walk that was happening anyway while a
+spurious *path* would spend a file read. In the same live run, 23 of 88 parked
+scenarios asked for `views.py` and 20 named their symbol in prose.
+
+**A refused answer is corrected once, because the refusal says what to fix.**
+The recorder does not reject an expanded answer for lacking context; it rejects
+it for mis-citing context the model was given, and it names the item and the
+reason. Parking on that discards a finished review over a quotation error and
+files it as unreviewed — 38 of those 88 died exactly there, each holding real
+findings. So the complaint is quoted back and the scenario re-dispatched once,
+under its own agent id so an audit can tell a corrected answer from the one that
+was refused. Once, not until it passes: a reviewer that cannot cite correctly
+twice is not converging, and the third call buys the same answer.
 
 **Every refusal is a bound, so every refusal is named — and the *kind* of
 refusal is named too.** Paths absent from the checkout, paths the checkout has

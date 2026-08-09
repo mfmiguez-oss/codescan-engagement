@@ -155,14 +155,16 @@ def test_the_plan_projects_one_call_per_scenario_and_candidate() -> None:
 
 
 def test_expansion_is_projected_because_it_is_a_second_call() -> None:
-    """A scenario that ends needs_context earns one expanded re-attempt. That
-    stage is the bulk of every run, so projecting it 1:1 halves the total: a
-    live pygoat run averaged 2.1 calls per dispatched scenario."""
+    """A scenario that ends needs_context earns one expanded re-attempt, and an
+    expanded answer refused on its citations earns one correction. That stage is
+    the bulk of every run, so projecting it 1:1 halves the total: a live pygoat
+    run measured 2.1 calls per dispatched scenario before the correction
+    existed, and 2.4 projects it with."""
     off = build_plan(_ALL, scenarios=100, expand_context=False)
     on = build_plan(_ALL, scenarios=100, expand_context=True)
 
     assert next(a for a in off.allocations if a.task is Task.scenarios).projected_calls == 100
-    assert next(a for a in on.allocations if a.task is Task.scenarios).projected_calls == 210
+    assert next(a for a in on.allocations if a.task is Task.scenarios).projected_calls == 240
     assert any("earns one expanded re-attempt" in w for w in on.warnings)
     assert not any("expanded re-attempt" in w for w in off.warnings)
 
@@ -298,6 +300,13 @@ _PYGOAT = {
     "dispatched_scenarios": 120,
     "router_calls": 25,
     "scenario_calls": 250,
+    # 38 of that run's 88 parked scenarios were refused on integrity checks and
+    # discarded where the driver now answers the refusal once, so the same
+    # backlog under today's code makes 38 calls this run never made. Held apart
+    # from the measured 250 rather than folded into it: one number came off a
+    # bill and the other is arithmetic, and a vector that blurs the two stops
+    # being a reconciliation against reality.
+    "citation_retries": 38,
     "billed_usd": 17.81,
 }
 
@@ -321,9 +330,13 @@ def test_the_projection_lands_near_a_run_that_actually_happened() -> None:
         obligations=_PYGOAT["obligations"],
     )
     scenarios = next(a for a in plan.allocations if a.task is Task.scenarios)
-    # the expansion multiplier has to land near the calls the run really made,
-    # or the dollar band below passes on two errors cancelling
-    assert abs(scenarios.projected_calls - _PYGOAT["scenario_calls"]) <= 25
+    # The expansion multiplier has to land near the calls this backlog really
+    # costs, or the dollar band below passes on two errors cancelling. The
+    # target is the 250 that were billed plus the 38 corrections the code now
+    # makes for refusals it used to discard — the projection is checked against
+    # what today's driver would spend, not against a driver that no longer runs.
+    would_cost = _PYGOAT["scenario_calls"] + _PYGOAT["citation_retries"]
+    assert abs(scenarios.projected_calls - would_cost) <= 25
     projected = sum(
         cost
         for a in plan.allocations

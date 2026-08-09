@@ -55,6 +55,7 @@ from .dispatch import Dispatcher
 from .expansion import (
     ExpansionBounds,
     build_expansion,
+    integrity_feedback,
     requested_paths,
     requested_symbols,
 )
@@ -84,6 +85,32 @@ TRIAGE_SYSTEM = (
 #: else means it could not, and is parked rather than retried: re-dispatching an
 #: unchanged prompt spends budget without supplying the missing context.
 CONCLUDED_STATUSES = frozenset({"verified", "rejected", "candidate"})
+
+#: Candidates one ambiguous path may offer up for ranking. Larger than the
+#: number actually read, because the walk costs the same either way and a
+#: candidate outside this pool cannot be chosen however well it matches — which
+#: is precisely how depth ordering used to win by default: the checkout's ten
+#: `views.py` were cut to the shallowest three before anything knew which one
+#: defined the handler under review.
+_PATH_CANDIDATES = 12
+
+#: How many of those are read. Unchanged, and the reason is unchanged: three
+#: files named `views.py` are three citations a reviewer can work from, and ten
+#: are a context window. The fix was never to read more, it was to rank first.
+_PATH_READS = 3
+
+#: Symbol hits gathered per expansion. Above `max_files` on purpose — most are
+#: spent ranking paths rather than being read, so cutting this to the file
+#: budget would starve the ranking to save reads it was not going to make.
+_SYMBOL_SEARCH_LIMIT = 12
+
+#: Dispatches one expanded scenario may make: the expansion itself, plus one
+#: correction if the recorder refuses its citations. Two rather than one
+#: because an integrity rejection names exactly what to fix and is therefore
+#: answerable; two rather than more because a reviewer that cannot cite
+#: correctly twice is not converging, and the third call buys the same answer
+#: with the scenario still unreviewed at the end of it.
+_EXPANSION_ATTEMPTS = 2
 
 #: The per-call scope note appended to the invariant router prompt. Everything
 #: the router needs to *decide* is in that prompt and is byte-identical across
@@ -1208,50 +1235,90 @@ class Driver:
             )
             return self._park(ref, scenario, parked)
 
-        try:
-            # Same hoist as the first attempt, so the expansion reads the cache
-            # entry that attempt already wrote rather than paying for the
-            # manifest a second time on the same scenario.
-            body, manifest = split_manifest(prompt.text)
-            answer = self._ask(
-                Phase.scenarios,
-                EXPERT_SYSTEM,
-                f"{body}\n\n{expansion.text}",
-                cache_prefix=manifest,
-                max_output_tokens=self._policy.scenario_max_output_tokens,
-            )
-            stamped = _stamp(
-                answer,
-                {
-                    "scenario_id": scenario.scenario_id,
-                    "expert": scenario.expert,
-                    "review_mode": "per-scenario-subagent",
-                    "subagent_id": _agent_id("expert-expanded", scenario.scenario_id),
-                    "scenario_prompt_sha256": prompt.digest,
-                    # the model saw more than the rendered prompt, so what it
-                    # additionally saw is recorded too: provenance that names
-                    # only part of the input is not provenance
-                    "context_expansion_sha256": sha256(
-                        expansion.text.encode("utf-8")
-                    ).hexdigest(),
-                },
-            )
-            with self._workspace_lock:
-                second = self._workspace.record_scenario_result(
-                    ref, scenario.scenario_id, stamped
+        # Same hoist as the first attempt, so the expansion reads the cache
+        # entry that attempt already wrote rather than paying for the manifest
+        # a second time on the same scenario.
+        body, manifest = split_manifest(prompt.text)
+
+        # A rejection on integrity checks is answerable, so it is answered —
+        # once. The recorder does not refuse an expanded answer for lacking
+        # context; it refuses it for mis-citing context the model was given,
+        # and it names the item and the reason. Parking on the first refusal
+        # discarded a finished review over a citation error and reported it as
+        # unreviewed, which is the more expensive of the two mistakes.
+        #
+        # Bounded by `_EXPANSION_ATTEMPTS`, and only while the budget allows.
+        # The bound lives in one place: a loop range and a separate stop
+        # condition saying the same thing lets one of them drift into a bound
+        # that never decides anything, which is a bound no test can fail on.
+        second = None
+        rejection = ""
+        for attempt in range(_EXPANSION_ATTEMPTS):
+            addendum = expansion.text
+            if rejection:
+                addendum = f"{addendum}\n\n{integrity_feedback(rejection)}"
+            try:
+                answer = self._ask(
+                    Phase.scenarios,
+                    EXPERT_SYSTEM,
+                    f"{body}\n\n{addendum}",
+                    cache_prefix=manifest,
+                    max_output_tokens=self._policy.scenario_max_output_tokens,
                 )
-        except BudgetExceeded:
-            parked.reason = "needs_context (budget exhausted during expansion)"
-            return self._park(ref, scenario, parked)
-        except WorkspaceError as exc:
-            parked.reason = f"needs_context (expanded answer rejected: {str(exc)[:200]})"
+                stamped = _stamp(
+                    answer,
+                    {
+                        "scenario_id": scenario.scenario_id,
+                        "expert": scenario.expert,
+                        "review_mode": "per-scenario-subagent",
+                        # the retry is a separate dispatch and is labelled as
+                        # one: an audit that cannot tell a corrected answer
+                        # from a first answer cannot review the correction
+                        "subagent_id": _agent_id(
+                            "expert-expanded-retry" if rejection else "expert-expanded",
+                            scenario.scenario_id,
+                        ),
+                        "scenario_prompt_sha256": prompt.digest,
+                        # the model saw more than the rendered prompt, so what
+                        # it additionally saw is recorded too: provenance that
+                        # names only part of the input is not provenance. The
+                        # correction block is inside this digest, so a retried
+                        # answer is not attributed to the input that failed.
+                        "context_expansion_sha256": sha256(
+                            addendum.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                )
+                with self._workspace_lock:
+                    second = self._workspace.record_scenario_result(
+                        ref, scenario.scenario_id, stamped
+                    )
+                break
+            except BudgetExceeded:
+                parked.reason = "needs_context (budget exhausted during expansion)"
+                return self._park(ref, scenario, parked)
+            except WorkspaceError as exc:
+                rejection = str(exc)
+                if attempt + 1 < _EXPANSION_ATTEMPTS and self._ledger.can_afford():
+                    parked.attempts = 3
+                    continue
+                parked.reason = (
+                    f"needs_context (expanded answer rejected: {rejection[:200]})"
+                )
+                return self._park(ref, scenario, parked)
+
+        if second is None:  # pragma: no cover - the loop above always exits one way
+            parked.reason = "needs_context (expanded answer rejected)"
             return self._park(ref, scenario, parked)
 
         if second.status in CONCLUDED_STATUSES:
+            detail = f"{second.status} (after context expansion)"
+            if rejection:
+                detail = f"{second.status} (after context expansion and a citation retry)"
             return WorkOutcome(
                 item_id=scenario.scenario_id,
                 disposition=Disposition.completed,
-                detail=f"{second.status} (after context expansion)",
+                detail=detail,
             )
         parked.missing_context = second.missing_context or outcome.missing_context
         parked.reason = "needs_context (still unresolved after expansion)"
@@ -1325,30 +1392,49 @@ class Driver:
         for path in requested_paths(statements):
             _add(path, missed=missed)
 
+        # The symbol search runs *before* the missed paths are resolved, because
+        # its hits are what disambiguate them. A reviewer naming `views.py` in a
+        # Django checkout has named ten files, and the one it wants is the one
+        # defining the handler it named in the same breath; answering with the
+        # shallowest three answers a question it did not ask. 23 of 88 parked
+        # scenarios in a live pygoat run asked for `views.py` this way.
+        #
+        # Ranking only, at this point — the hits are not read until after the
+        # requested paths below, so an explicit request still outranks a search.
+        symbols = requested_symbols(statements)
+        symbol_hits: list[str] = []
+        if symbols:
+            with self._workspace_lock:
+                symbol_hits = self._workspace.search_source(
+                    ref, symbols, _SYMBOL_SEARCH_LIMIT
+                )
+        defines = {_normalised(hit) for hit in symbol_hits}
+
         if missed:
             with self._workspace_lock:
-                matches = self._workspace.resolve_source(ref, missed)
+                matches = self._workspace.resolve_source(
+                    ref, missed, _PATH_CANDIDATES
+                )
             for named in missed:
                 candidates = matches.get(named) or []
                 if not candidates:
                     unresolved.append(named)
                     continue
+                # stable sort, so the workspace's depth ordering still decides
+                # within each group and only the grouping is new
+                candidates.sort(key=lambda c: _normalised(c) not in defines)
                 keys = {_normalised(candidate) for candidate in candidates}
-                for candidate in candidates:
+                for candidate in candidates[:_PATH_READS]:
                     _add(candidate, missed=None)
                 # a candidate already in hand satisfies the request as fully as
                 # one just read, so both count before calling this a shortfall
                 if not keys & (set(supplied) | set(already_had)):
                     crowded_out.append(named)
 
-        symbols = requested_symbols(statements)
-        if symbols and len(supplied) < bounds.max_files:
-            with self._workspace_lock:
-                hits = self._workspace.search_source(
-                    ref, symbols, bounds.max_files - len(supplied)
-                )
-            for hit in hits:
-                _add(hit, missed=None)
+        for hit in symbol_hits:
+            if len(supplied) >= bounds.max_files:
+                break
+            _add(hit, missed=None)
         return _Gathered(supplied, unresolved, truncated, already_had, crowded_out)
 
     def _park(

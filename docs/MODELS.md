@@ -50,6 +50,7 @@ therefore through one `Ledger`, one redaction pass and one audit record.
 | router | [`driver.py`](../src/engagement/driver.py) | Turn the recon inventory into a backlog of scenarios and coverage decisions | Proposes work. The workspace validates coverage obligations; ids are renumbered on merge |
 | scenarios | [`driver.py`](../src/engagement/driver.py) | Review a routing unit against one scenario and state a result with quoted evidence | Proposes a finding. Every citation is re-validated against the checkout |
 | context expansion | [`expansion.py`](../src/engagement/expansion.py) | Re-attempt one scenario that ended `needs_context`, given the context it said it lacked | Same as a scenario. Fires once, only when the model named a gap |
+| citation correction | [`expansion.py`](../src/engagement/expansion.py) | Re-answer an expanded scenario whose evidence the recorder refused, given the checker's complaint | Same as a scenario. Fires once, only after a refusal, and the complaint is quoted as diagnostic text the answer must not obey |
 | triage | [`driver.py`](../src/engagement/driver.py) | Adjudicate a candidate finding against evidence already gathered | Proposes a verdict. The workspace re-validates the citations regardless |
 | chains | [`analysis.py`](../src/engagement/analysis.py) | Combine findings across a service into an attack chain | **Advisory only.** Annotates a queue that already exists |
 | PoC drafts | [`analysis.py`](../src/engagement/analysis.py) | Draft a reproduction procedure for a finding already established | **Advisory only.** Never executed; a human reads it first |
@@ -105,6 +106,7 @@ flowchart TB
   GATE -->|"affordable"| SCEN["scenarios<br/><b>claude-opus-4-8</b><br/><i>frontier · 1 each</i>"]:::ai
   GATE -->|"over ceiling"| UNFUND["unfunded<br/><i>reported, not dropped</i>"]:::art
   SCEN -->|"needs_context"| EXP["expand once<br/><i>same deployment</i>"]:::ai
+  EXP -->|"citations refused"| FIX["correct once<br/><i>same deployment</i>"]:::ai
   SCEN --> TRIAGE["candidate triage<br/><b>claude-sonnet-4-6</b><br/><i>high · 1 each</i>"]:::ai
   TRIAGE --> SARIF["findings.sarif"]:::art
 
@@ -384,16 +386,23 @@ Without `--obligations` the router shows as 1 call and `plan` warns that the
 line and the total are floors.
 
 **The scenario line is not one call per scenario.** A scenario that ends
-`needs_context` earns one expanded re-attempt, and that stage is the bulk of
-every run — the pygoat run made 250 calls for 120 dispatched scenarios, 2.1
-each. The projection applies that multiplier whenever expansion is on; pass
+`needs_context` earns one expanded re-attempt, and an expanded answer refused on
+its citations earns one correction. That stage is the bulk of every run, and the
+projection applies a **2.4×** multiplier whenever expansion is on; pass
 `--no-expand-context` only if the run will also have it off.
 
-Reconciled against that run: **252 scenario calls projected against 250 made**,
-and $15.80 against $17.81 actually billed — the remaining 11% is the router
-floor. `test_the_projection_lands_near_a_run_that_actually_happened` holds it
-there, and checks the call count separately so the dollar band cannot pass on
-two errors cancelling out.
+Where 2.4 comes from, and which half of it is measured: the pygoat run made 250
+calls for 120 dispatched scenarios — **2.08, measured off the bill**. 38 of its
+88 parked scenarios were refused on integrity checks and discarded, where the
+driver now answers the refusal once; that is **+0.32, arithmetic**, applied to a
+run that never made those calls. Re-derive it from a run that actually retries
+before treating it as calibrated.
+
+Reconciled against that run: **288 scenario calls projected against the 288 the
+same backlog would cost today** (250 billed + 38 corrections), and $17.68
+against $17.81 actually billed. `test_the_projection_lands_near_a_run_that_
+actually_happened` holds it there, and checks the call count separately so the
+dollar band cannot pass on two errors cancelling out.
 
 Note that the projection prices the *backlog you give it*. pygoat's 245-scenario
 backlog fully funded projects about $30; that run billed $18 because its budget

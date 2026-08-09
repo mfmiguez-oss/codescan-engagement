@@ -577,14 +577,21 @@ def build_plan(
         router_calls = -(-obligations // chunk_size)
     else:
         router_calls = 1 if running else 0
-    # A scenario that ends `needs_context` earns one expanded re-attempt, so the
-    # scenario line is not one call per scenario whenever expansion is on. The
-    # pygoat run made 250 calls for 120 dispatched scenarios -- 2.1 each, and
-    # that stage is the bulk of every run, so projecting it at 1.0 halves the
-    # only number an operator actually reads.
+    # A scenario that ends `needs_context` earns one expanded re-attempt, and an
+    # expanded answer refused on its citations earns one correction, so the
+    # scenario line is not one call per scenario whenever expansion is on. That
+    # stage is the bulk of every run, so projecting it at 1.0 halves the only
+    # number an operator actually reads.
+    #
+    # 2.4, from the pygoat run: 250 calls for 120 dispatched scenarios is 2.08,
+    # and 38 of its 88 parked scenarios were refused on integrity checks, each of
+    # which now buys one further call. The 2.08 is measured; the 0.32 on top is
+    # that count applied to a run that never made those calls, so it is
+    # arithmetic over measured inputs rather than a second measurement.
+    # Re-derive it from a run that actually retries before calling it calibrated.
     scenario_calls = max(0, scenarios)
     if expand_context and scenario_calls:
-        scenario_calls = -(-scenario_calls * 21 // 10)
+        scenario_calls = -(-scenario_calls * 24 // 10)
     counts = {
         Task.router: router_calls,
         Task.scenarios: scenario_calls,
@@ -596,8 +603,10 @@ def build_plan(
         plan.warnings.append(
             f"scenarios: {scenario_calls} call(s) for {scenarios} scenario(s) — a "
             "scenario that ends needs_context earns one expanded re-attempt, and "
-            "a live pygoat run averaged 2.1 calls per dispatched scenario. Runs "
-            "with expansion off project 1:1"
+            "an expanded answer refused on its citations earns one correction. A "
+            "live pygoat run measured 2.1 calls per dispatched scenario before "
+            "the correction existed; 2.4 projects it. Runs with expansion off "
+            "project 1:1"
         )
     if running and obligations <= 0:
         plan.warnings.append(

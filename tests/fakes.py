@@ -55,6 +55,15 @@ class FakeWorkspace:
         self.status_for: dict[str, str] = {}
         self.decision_for: dict[str, str] = {}
         self.reject: set[str] = set()
+        #: How many *expanded* answers to refuse before accepting one — the
+        #: shape of a real integrity rejection, which is a correctable citation
+        #: error rather than a malformed answer. A count rather than a flag
+        #: because the behaviour under test is precisely how many corrections
+        #: are worth buying: 1 exercises the retry, 2 exercises its bound.
+        self.reject_expanded = 0
+        #: how many times `reject_once` fired, so a test can prove the retry
+        #: happened rather than inferring it from the answer that followed
+        self.rejections = 0
         #: what the model says it lacks, per scenario
         self.missing_for: dict[str, list[str]] = {}
         #: status on the second (expanded) attempt, if different
@@ -247,6 +256,23 @@ class FakeWorkspace:
             raise WorkspaceError("result carries no subagent_id")
         if agent in self.agent_ids:
             raise WorkspaceError(f"subagent_id {agent} already recorded")
+        if self.reject_expanded > 0 and agent.startswith("expert-expanded"):
+            # Only the *expanded* dispatch, because that is the one this models:
+            # a mis-cited snippet is an error about source the model was shown,
+            # and the expansion is where it is shown any. Gated on the id rather
+            # than a call counter so a fake that fired on the first attempt —
+            # which reaches a different branch entirely — cannot pass for this.
+            #
+            # Refused before the id is registered below, which is where the real
+            # recorder refuses too: an answer that fails its integrity checks is
+            # never persisted, so nothing about it is spent.
+            self.reject_expanded -= 1
+            self.rejections += 1
+            raise WorkspaceError(
+                "Scenario result failed integrity checks:\n"
+                "- evidence item 4 invalid: evidence snippet does not match "
+                "the cited source line"
+            )
         self.agent_ids.add(agent)
         attempt = self.attempts.get(scenario_id, 0) + 1
         self.attempts[scenario_id] = attempt

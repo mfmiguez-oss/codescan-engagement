@@ -93,7 +93,8 @@ flowchart TB
   GATE -->|"affordable"| SCEN["scenarios<br/><i>1 call each</i>"]:::ai
   GATE -->|"over ceiling"| UNFUND["unfunded<br/><i>reported, not dropped</i>"]:::art
   SCEN -->|"needs_context"| EXPAND["expand once"]:::ai
-  EXPAND -->|"still unresolved"| PARK["parked-scenarios.json"]:::art
+  EXPAND -->|"citations refused"| FIX["correct once"]:::ai
+  EXPAND & FIX -->|"still unresolved"| PARK["parked-scenarios.json"]:::art
   SCEN --> TRIAGE["candidate triage<br/><i>1 call each</i>"]:::ai
   TRIAGE --> SARIF["findings.sarif"]:::art
 
@@ -130,6 +131,7 @@ Each stage's input and output type, and whether it can spend money.
 | router | `driver` | recon inventory | backlog of `ScenarioRef` | ● |
 | scenarios | `driver` | `RenderedPrompt` | `ScenarioOutcome` | ● |
 | expansion | `expansion` | `missing_context[]` | supplied files, refusals | ● |
+| correction | `expansion` | the recorder's integrity complaint | a re-answered scenario | ● |
 | triage | `driver` | candidate | decision | ● |
 | export | `workspace` | recorded findings | `findings.sarif` | — |
 | parse | `backbone` | SARIF | `Finding[]` + `IngestError[]` | — |
