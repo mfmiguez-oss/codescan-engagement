@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from .expert_scope import filter_agent_registry, require_run_expert_scope
+from .expert_scope import (
+    filter_agent_registry,
+    require_run_expert_scope,
+    scope_constraint_text,
+)
 from .log import emit
 from .paths import root, run_path
 from .router_context import load_inventory, read_jsonl, routing_paths
@@ -161,6 +165,9 @@ def prepare_scenario_router(target: str, run_id: str) -> Path:
         text += _expert_routing_context(experts)
     text += "\n\n## Scenario Router Manifest\n\n"
     text += (root() / "agents" / "orchestration" / "scenario-router.md").read_text()
+    # last, because the manifest it overrides is written for every expert the
+    # methodology defines and a scoped run has excluded some of them
+    text += scope_constraint_text(experts)
     out = path / "scenarios" / "scenario-router-prompt.md"
     out.write_text(text)
     detail = (

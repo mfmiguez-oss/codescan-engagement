@@ -130,3 +130,45 @@ def scope_summary(experts: Sequence[str]) -> str:
 
 def filter_agent_registry(experts: Iterable[str]) -> AgentRegistry:
     return filter_registry(experts)
+
+
+def scope_constraint_text(experts: Sequence[str]) -> str:
+    """The binding statement of scope, for a prompt whose guidance ignores it.
+
+    The router manifest is written for the whole methodology: it says things
+    like "route to `sensitive-information-exposure` when the response leaks
+    secrets", naming every expert the method defines. A scoped run narrows the
+    agent registry and the routing context but appends that manifest verbatim,
+    so the model is *instructed* to route outside the scope — and
+    `record-scenario-backlog` then rejects the backlog for doing what it was
+    told. A live pygoat run scoped to two experts died exactly there, after
+    five router calls had already been paid for.
+
+    Filtering the manifest's prose was the alternative and is worse: the
+    guidance is connected sentences with conditionals, and cutting expert names
+    out of them leaves instructions that mean something else. So the scope is
+    stated instead — plainly, and *after* the manifest, because a constraint
+    that arrives before the guidance it overrides is the one that loses.
+
+    Returns an empty string when the run selects every expert, since there is
+    then nothing to constrain and a redundant warning only dilutes the ones
+    that matter.
+    """
+    selected = list(experts)
+    if not selected or set(selected) >= set(all_expert_ids()):
+        return ""
+    listed = "\n".join(f"- {expert}" for expert in selected)
+    return (
+        "\n\n## Expert Scope (binding — overrides the guidance above)\n\n"
+        "This run is scoped to these experts only:\n\n"
+        f"{listed}\n\n"
+        "Every scenario you emit must name one of them in its `expert` field. "
+        "The routing guidance above describes the whole methodology, including "
+        "experts this run has excluded; where it tells you to route to one that "
+        "is not listed here, emit no scenario for it and move on. Do not "
+        "substitute a listed expert for an unlisted one either — a boundary "
+        "that only an excluded expert covers is out of scope for this run, not "
+        "work to be reassigned.\n\n"
+        "A scenario naming an unlisted expert is rejected, and the rejection "
+        "fails the entire backlog rather than that one scenario.\n"
+    )
